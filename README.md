@@ -122,6 +122,22 @@ python3 test_client.py   # 20 integration tests
 zig build test           # 11 unit tests
 ```
 
+## Benchmark
+
+zs3 vs RustFS (100 iterations, localhost):
+
+| Operation | zs3 | RustFS | Speedup |
+|-----------|-----|--------|---------|
+| PUT 1KB | 0.40ms | 12.58ms | 31x |
+| PUT 4KB | 0.34ms | 13.66ms | 41x |
+| PUT 1MB | 1.32ms | 55.79ms | 42x |
+| GET 1KB | 0.31ms | 9.80ms | 31x |
+| GET 1MB | 0.53ms | 53.31ms | 100x |
+| LIST | 3.01ms | 462ms | 153x |
+| DELETE | 0.35ms | 11.34ms | 32x |
+
+Run your own: `python3 benchmark.py`
+
 ## Limits
 
 | Limit | Value |
