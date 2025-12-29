@@ -1,6 +1,6 @@
 # zs3
 
-S3-compatible storage in ~1K lines of Zig. Zero dependencies.
+S3-compatible storage in ~1.4K lines of Zig. Zero dependencies.
 
 ## Why
 
@@ -8,7 +8,7 @@ Most S3 usage is PUT, GET, DELETE, LIST with basic auth. You don't need 200k lin
 
 | | zs3 | RustFS | MinIO |
 |---|-----|--------|-------|
-| Lines | ~1,200 | ~80,000 | 200,000 |
+| Lines | ~1,400 | ~80,000 | 200,000 |
 | Binary | 250KB | ~50MB | 100MB |
 | RAM idle | 2MB | ~100MB | 200MB+ |
 | Dependencies | 0 | ~200 crates | many |
@@ -17,6 +17,7 @@ Most S3 usage is PUT, GET, DELETE, LIST with basic auth. You don't need 200k lin
 
 - Full AWS SigV4 authentication (works with aws-cli, boto3, any SDK)
 - PUT, GET, DELETE, HEAD, LIST (v2)
+- DeleteObjects batch operation
 - Multipart uploads for large files
 - Range requests for streaming/seeking
 - ~250KB static binary
