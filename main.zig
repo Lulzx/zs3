@@ -1,11 +1,14 @@
 const std = @import("std");
 const net = std.net;
+const posix = std.posix;
 const Allocator = std.mem.Allocator;
+const builtin = @import("builtin");
 
 const MAX_HEADER_SIZE = 8 * 1024;
-const MAX_BODY_SIZE = 5 * 1024 * 1024 * 1024; // 5GB per S3 spec
+const MAX_BODY_SIZE = 5 * 1024 * 1024 * 1024;
 const MAX_KEY_LENGTH = 1024;
 const MAX_BUCKET_LENGTH = 63;
+const MAX_CONNECTIONS = 1024;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -30,23 +33,84 @@ pub fn main() !void {
         .secret_key = "minioadmin",
     };
 
-    while (true) {
-        var conn = server.accept() catch continue;
-
-        const thread = std.Thread.spawn(.{}, handleConnectionThread, .{ allocator, &ctx, conn.stream }) catch {
-            conn.stream.close();
-            continue;
-        };
-        thread.detach();
+    if (builtin.os.tag == .linux) {
+        try eventLoopEpoll(allocator, &ctx, &server);
+    } else {
+        try eventLoopPoll(allocator, &ctx, &server);
     }
 }
 
-fn handleConnectionThread(allocator: Allocator, ctx: *const S3Context, stream: net.Stream) void {
-    defer stream.close();
+fn eventLoopEpoll(allocator: Allocator, ctx: *const S3Context, server: *net.Server) !void {
+    const linux = std.os.linux;
+    const epfd = linux.epoll_create1(linux.EPOLL.CLOEXEC);
+    if (@as(isize, @bitCast(epfd)) < 0) return error.EpollCreate;
+    defer _ = linux.close(@intCast(epfd));
 
-    handleConnectionWithStream(allocator, ctx, stream) catch |err| {
-        std.log.err("Connection error: {}", .{err});
-    };
+    var ev = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .fd = server.stream.handle } };
+    if (@as(isize, @bitCast(linux.epoll_ctl(@intCast(epfd), linux.EPOLL.CTL_ADD, server.stream.handle, &ev))) < 0)
+        return error.EpollCtl;
+
+    var events: [MAX_CONNECTIONS]linux.epoll_event = undefined;
+
+    while (true) {
+        const n = linux.epoll_wait(@intCast(epfd), &events, MAX_CONNECTIONS, -1);
+        if (@as(isize, @bitCast(n)) < 0) continue;
+
+        for (events[0..n]) |event| {
+            if (event.data.fd == server.stream.handle) {
+                while (true) {
+                    const conn = server.accept() catch break;
+                    var cev = linux.epoll_event{ .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT, .data = .{ .fd = conn.stream.handle } };
+                    _ = linux.epoll_ctl(@intCast(epfd), linux.EPOLL.CTL_ADD, conn.stream.handle, &cev);
+                }
+            } else {
+                const stream = net.Stream{ .handle = event.data.fd };
+                handleConnectionWithStream(allocator, ctx, stream) catch {};
+                _ = linux.epoll_ctl(@intCast(epfd), linux.EPOLL.CTL_DEL, event.data.fd, null);
+                stream.close();
+            }
+        }
+    }
+}
+
+fn setNonBlocking(fd: posix.fd_t) void {
+    const O_NONBLOCK: usize = if (builtin.os.tag == .macos) 0x0004 else 0x800;
+    const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return;
+    _ = posix.fcntl(fd, posix.F.SETFL, flags | O_NONBLOCK) catch {};
+}
+
+fn eventLoopPoll(allocator: Allocator, ctx: *const S3Context, server: *net.Server) !void {
+    var fds: [MAX_CONNECTIONS + 1]posix.pollfd = undefined;
+    var nfds: usize = 1;
+
+    setNonBlocking(server.stream.handle);
+    fds[0] = .{ .fd = server.stream.handle, .events = posix.POLL.IN, .revents = 0 };
+
+    while (true) {
+        const ready = posix.poll(fds[0..nfds], -1) catch continue;
+        if (ready == 0) continue;
+
+        if (fds[0].revents & posix.POLL.IN != 0) {
+            while (nfds <= MAX_CONNECTIONS) {
+                const conn = server.accept() catch break;
+                fds[nfds] = .{ .fd = conn.stream.handle, .events = posix.POLL.IN, .revents = 0 };
+                nfds += 1;
+            }
+        }
+
+        var i: usize = 1;
+        while (i < nfds) {
+            if (fds[i].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) {
+                const stream = net.Stream{ .handle = fds[i].fd };
+                handleConnectionWithStream(allocator, ctx, stream) catch {};
+                stream.close();
+                fds[i] = fds[nfds - 1];
+                nfds -= 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
 const S3Context = struct {
