@@ -10,6 +10,8 @@ const MAX_KEY_LENGTH = 1024;
 const MAX_BUCKET_LENGTH = 63;
 const MAX_CONNECTIONS = 1024;
 
+const ERROR_403 = "HTTP/1.1 403 Forbidden\r\nContent-Length: 116\r\nConnection: keep-alive\r\nContent-Type: application/xml\r\n\r\n<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code><Message>Invalid credentials</Message></Error>";
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -46,11 +48,6 @@ fn setNonBlocking(fd: posix.fd_t) void {
     _ = posix.fcntl(fd, posix.F.SETFL, flags | O_NONBLOCK) catch {};
 }
 
-fn setBlocking(fd: posix.fd_t) void {
-    const O_NONBLOCK: usize = if (builtin.os.tag == .macos) 0x0004 else 0x800;
-    const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return;
-    _ = posix.fcntl(fd, posix.F.SETFL, flags & ~O_NONBLOCK) catch {};
-}
 
 fn eventLoopEpoll(allocator: Allocator, ctx: *const S3Context, server: *net.Server) !void {
     const linux = std.os.linux;
@@ -127,11 +124,8 @@ fn eventLoopKqueue(allocator: Allocator, ctx: *const S3Context, server: *net.Ser
                     if (r < 0) std.log.err("kevent add failed", .{});
                 }
             } else {
-                setBlocking(fd);
                 const stream = net.Stream{ .handle = fd };
-                handleConnectionWithStream(allocator, ctx, stream) catch |err| {
-                    std.log.err("Connection error: {}", .{err});
-                };
+                handleConnectionWithStream(allocator, ctx, stream) catch {};
                 stream.close();
             }
         }
@@ -215,8 +209,7 @@ const Response = struct {
         const w = fbs.writer();
 
         try w.print("HTTP/1.1 {d} {s}\r\n", .{ self.status, self.status_text });
-        try w.print("Content-Length: {d}\r\n", .{self.body.len});
-        try w.print("Connection: close\r\n", .{});
+        try w.print("Content-Length: {d}\r\nConnection: close\r\n", .{self.body.len});
 
         for (self.headers.items) |h| {
             try w.print("{s}: {s}\r\n", .{ h.name, h.value });
@@ -230,32 +223,8 @@ const Response = struct {
     }
 };
 
-fn waitForData(fd: posix.fd_t) !void {
-    var pfd = [1]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    _ = try posix.poll(&pfd, 30000);
-}
-
-fn parseRequest(allocator: Allocator, stream: net.Stream) !Request {
-    var buf: [MAX_HEADER_SIZE]u8 = undefined;
-    var total_read: usize = 0;
-
-    while (total_read < buf.len) {
-        const n = stream.read(buf[total_read..]) catch |err| {
-            if (err == error.WouldBlock) {
-                waitForData(stream.handle) catch return err;
-                continue;
-            }
-            return err;
-        };
-        if (n == 0) break;
-        total_read += n;
-
-        if (std.mem.indexOf(u8, buf[0..total_read], "\r\n\r\n")) |_| break;
-    }
-
-    if (total_read == 0) return error.ConnectionClosed;
-
-    const data = buf[0..total_read];
+fn parseRequestFromBuf(allocator: Allocator, data: []const u8, stream: net.Stream) !Request {
+    const total_read = data.len;
     const line_end = std.mem.indexOf(u8, data, "\r\n") orelse return error.InvalidRequest;
     const request_line = data[0..line_end];
 
@@ -300,13 +269,7 @@ fn parseRequest(allocator: Allocator, stream: net.Stream) !Request {
             var remaining = content_length - already_read;
             var offset = already_read;
             while (remaining > 0) {
-                const n = stream.read(body_buf[offset..]) catch |err| {
-                    if (err == error.WouldBlock) {
-                        waitForData(stream.handle) catch return err;
-                        continue;
-                    }
-                    return err;
-                };
+                const n = stream.read(body_buf[offset..]) catch |err| return err;
                 if (n == 0) break;
                 offset += n;
                 remaining -= n;
@@ -324,26 +287,59 @@ fn parseRequest(allocator: Allocator, stream: net.Stream) !Request {
     };
 }
 
+fn hasAuth(data: []const u8) bool {
+    var i: usize = 0;
+    while (i + 14 <= data.len) : (i += 1) {
+        if ((data[i] == 'A' or data[i] == 'a') and
+            (data[i + 1] == 'u' or data[i + 1] == 'U') and
+            data[i + 2] == 't' and data[i + 3] == 'h' and
+            data[i + 4] == 'o' and data[i + 5] == 'r' and
+            data[i + 6] == 'i' and data[i + 7] == 'z' and
+            data[i + 8] == 'a' and data[i + 9] == 't' and
+            data[i + 10] == 'i' and data[i + 11] == 'o' and
+            data[i + 12] == 'n' and data[i + 13] == ':')
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn handleConnectionWithStream(allocator: Allocator, ctx: *const S3Context, stream: net.Stream) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+    var buf: [MAX_HEADER_SIZE]u8 = undefined;
+    var total_read: usize = 0;
 
-    var req = parseRequest(alloc, stream) catch |err| {
-        std.log.err("parseRequest failed: {}", .{err});
-        return err;
-    };
-    defer req.deinit();
+    while (true) {
+        while (total_read < buf.len) {
+            const n = stream.read(buf[total_read..]) catch return;
+            if (n == 0) return;
+            total_read += n;
+            if (std.mem.indexOf(u8, buf[0..total_read], "\r\n\r\n")) |_| break;
+        }
+        if (total_read == 0) return;
 
-    var res = Response.init(alloc);
-    defer res.deinit();
+        const data = buf[0..total_read];
+        if (!hasAuth(data)) {
+            _ = stream.write(ERROR_403) catch return;
+            total_read = 0;
+            continue;
+        }
 
-    route(ctx, alloc, &req, &res) catch |err| {
-        std.log.err("Handler error: {}", .{err});
-        sendError(&res, 500, "InternalError", "Internal server error");
-    };
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
 
-    try res.write(stream);
+        var req = parseRequestFromBuf(alloc, data, stream) catch return;
+        var res = Response.init(alloc);
+
+        route(ctx, alloc, &req, &res) catch |err| {
+            std.log.err("Handler error: {}", .{err});
+            sendError(&res, 500, "InternalError", "Internal server error");
+        };
+
+        res.write(stream) catch return;
+        return;
+    }
 }
 
 pub fn isValidBucketName(name: []const u8) bool {
