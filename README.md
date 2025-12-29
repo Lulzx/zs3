@@ -124,14 +124,6 @@ zig build test           # 11 unit tests
 
 ## Benchmark
 
-### Raw Performance (ab -n 100000 -c 100 -k)
-
-| Server | Requests/sec | Latency | Notes |
-|--------|--------------|---------|-------|
-| **zs3** | **199,323** | **5µs** | Zig, kqueue, single-threaded |
-| C (kqueue) | 206,115 | 5µs | Raw C, kqueue, single-threaded |
-| Ratio | **96.7%** | Same | Near-C performance |
-
 ### vs RustFS (100 iterations)
 
 | Operation | zs3 | RustFS | Speedup |

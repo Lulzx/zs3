@@ -184,6 +184,9 @@ const Response = struct {
     status_text: []const u8 = "OK",
     headers: std.ArrayListUnmanaged(Header) = .empty,
     body: []const u8 = "",
+    send_file: ?std.fs.File = null,
+    send_file_size: usize = 0,
+    send_file_offset: usize = 0,
     allocator: Allocator,
 
     const Header = struct { name: []const u8, value: []const u8 };
@@ -196,6 +199,7 @@ const Response = struct {
 
     fn deinit(self: *Response) void {
         self.headers.deinit(self.allocator);
+        if (self.send_file) |f| f.close();
     }
 
     fn setHeader(self: *Response, name: []const u8, value: []const u8) void {
@@ -217,13 +221,20 @@ const Response = struct {
         self.body = body;
     }
 
+    fn setSendFile(self: *Response, file: std.fs.File, size: usize, offset: usize) void {
+        self.send_file = file;
+        self.send_file_size = size;
+        self.send_file_offset = offset;
+    }
+
     fn write(self: *Response, stream: net.Stream) !void {
         var buf: [4096]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
         const w = fbs.writer();
 
+        const content_len = if (self.send_file != null) self.send_file_size else self.body.len;
         try w.print("HTTP/1.1 {d} {s}\r\n", .{ self.status, self.status_text });
-        try w.print("Content-Length: {d}\r\nConnection: close\r\n", .{self.body.len});
+        try w.print("Content-Length: {d}\r\nConnection: close\r\n", .{content_len});
 
         for (self.headers.items) |h| {
             try w.print("{s}: {s}\r\n", .{ h.name, h.value });
@@ -231,7 +242,29 @@ const Response = struct {
         try w.writeAll("\r\n");
 
         try stream.writeAll(fbs.getWritten());
-        if (self.body.len > 0) {
+
+        if (self.send_file) |file| {
+            // Use sendfile for zero-copy transfer
+            if (builtin.os.tag == .macos) {
+                var offset: i64 = @intCast(self.send_file_offset);
+                var len: i64 = @intCast(self.send_file_size);
+                while (len > 0) {
+                    const rc = std.c.sendfile(file.handle, stream.handle, offset, &len, null, 0);
+                    if (rc == -1) break;
+                    offset += len;
+                    len = @intCast(self.send_file_size - @as(usize, @intCast(offset - @as(i64, @intCast(self.send_file_offset)))));
+                }
+            } else if (builtin.os.tag == .linux) {
+                var offset: i64 = @intCast(self.send_file_offset);
+                var remaining: usize = self.send_file_size;
+                while (remaining > 0) {
+                    const rc = std.os.linux.sendfile(stream.handle, file.handle, &offset, remaining);
+                    const sent = @as(isize, @bitCast(rc));
+                    if (sent <= 0) break;
+                    remaining -= @intCast(sent);
+                }
+            }
+        } else if (self.body.len > 0) {
             try stream.writeAll(self.body);
         }
     }
@@ -721,30 +754,21 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     const path = try ctx.objectPath(allocator, bucket, key);
     defer allocator.free(path);
 
-    var file = std.fs.cwd().openFile(path, .{}) catch {
+    const file = std.fs.cwd().openFile(path, .{}) catch {
         sendError(res, 404, "NoSuchKey", "Object not found");
         return;
     };
-    defer file.close();
+    // File will be closed by Response.deinit()
 
     const stat = file.stat() catch {
+        file.close();
         sendError(res, 500, "InternalError", "Stat failed");
         return;
     };
 
     if (req.header("range")) |range_header| {
         if (parseRange(range_header, stat.size)) |range| {
-            file.seekTo(range.start) catch {};
             const len = range.end - range.start + 1;
-
-            const data = allocator.alloc(u8, len) catch {
-                sendError(res, 500, "InternalError", "Alloc failed");
-                return;
-            };
-            _ = file.read(data) catch {
-                sendError(res, 500, "InternalError", "Read failed");
-                return;
-            };
 
             var range_buf: [64]u8 = undefined;
             const content_range = std.fmt.bufPrint(&range_buf, "bytes {d}-{d}/{d}", .{ range.start, range.end, stat.size }) catch unreachable;
@@ -753,23 +777,14 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
             res.status_text = "Partial Content";
             res.setHeader("Content-Range", content_range);
             res.setHeader("Accept-Ranges", "bytes");
-            res.body = data;
+            res.setSendFile(file, len, range.start);
             return;
         }
     }
 
-    const data = allocator.alloc(u8, stat.size) catch {
-        sendError(res, 500, "InternalError", "Alloc failed");
-        return;
-    };
-    _ = file.readAll(data) catch {
-        sendError(res, 500, "InternalError", "Read failed");
-        return;
-    };
-
     res.ok();
     res.setHeader("Accept-Ranges", "bytes");
-    res.body = data;
+    res.setSendFile(file, stat.size, 0);
 }
 
 fn handleDeleteObject(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, key: []const u8) !void {
