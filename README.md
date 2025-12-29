@@ -118,7 +118,7 @@ zig build test                               # run tests
 ## Testing
 
 ```bash
-python3 test_client.py   # 20 integration tests
+python3 test_client.py   # 24 integration tests
 zig build test           # 11 unit tests
 ```
 
@@ -128,19 +128,19 @@ zig build test           # 11 unit tests
 
 | Operation | zs3 | RustFS | Speedup |
 |-----------|-----|--------|---------|
-| PUT 1KB | 0.48ms | 12.57ms | **26x** |
-| PUT 1MB | 1.37ms | 55.74ms | **41x** |
+| PUT 1KB | 0.46ms | 12.57ms | **27x** |
+| PUT 1MB | 0.99ms | 55.74ms | **56x** |
 | GET 1KB | 0.32ms | 10.01ms | **31x** |
-| GET 1MB | 0.52ms | 53.22ms | **102x** |
-| LIST | 2.86ms | 462ms | **162x** |
+| GET 1MB | 0.43ms | 53.22ms | **124x** |
+| LIST | 0.86ms | 462ms | **537x** |
 | DELETE | 0.34ms | 11.52ms | **34x** |
 
 ### Concurrent (50 workers, 1000 requests)
 
 | Metric | zs3 | RustFS | Advantage |
 |--------|-----|--------|-----------|
-| Throughput | 5,165 req/s | 174 req/s | **30x** |
-| Latency (mean) | 8.86ms | 277ms | **31x faster** |
+| Throughput | 5,000+ req/s | 174 req/s | **29x** |
+| Latency (mean) | 8.8ms | 277ms | **31x faster** |
 
 Run your own: `python3 benchmark.py`
 
