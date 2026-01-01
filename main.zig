@@ -10,29 +10,617 @@ const MAX_KEY_LENGTH = 1024;
 const MAX_BUCKET_LENGTH = 63;
 const MAX_CONNECTIONS = 1024;
 
+// Distributed mode constants
+const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB chunks for large files
+const MAX_PEERS = 100;
+const GOSSIP_INTERVAL_MS = 30_000;
+const REPLICATION_TARGET = 3;
+
 const ERROR_403 = "HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\nDenied";
+
+// ============================================================================
+// DISTRIBUTED TYPES
+// ============================================================================
+
+const ContentHash = [20]u8; // 160-bit truncated BLAKE3
+const NodeId = [20]u8; // 160-bit node identifier
+
+/// Format bytes as lowercase hex string
+fn bytesToHex(bytes: []const u8, out: []u8) void {
+    const hex_chars = "0123456789abcdef";
+    for (bytes, 0..) |b, i| {
+        out[i * 2] = hex_chars[b >> 4];
+        out[i * 2 + 1] = hex_chars[b & 0x0f];
+    }
+}
+
+/// Content-Addressed Store - stores objects by their hash
+const CAS = struct {
+    data_dir: []const u8,
+
+    const Blake3 = std.crypto.hash.Blake3;
+
+    /// Store data and return its content hash (deduplicates automatically)
+    pub fn store(self: *const CAS, allocator: Allocator, data: []const u8) !ContentHash {
+        var hasher = Blake3.init(.{});
+        hasher.update(data);
+        var full_hash: [32]u8 = undefined;
+        hasher.final(&full_hash);
+
+        const hash: ContentHash = full_hash[0..20].*;
+        const path = try self.hashToPath(allocator, hash);
+        defer allocator.free(path);
+
+        // Check if already exists (deduplication)
+        if (std.fs.cwd().access(path, .{})) |_| {
+            return hash;
+        } else |_| {}
+
+        // Create parent directory (.cas/xx/)
+        if (std.fs.path.dirname(path)) |dir| {
+            std.fs.cwd().makePath(dir) catch {};
+        }
+
+        var file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+        try file.writeAll(data);
+
+        return hash;
+    }
+
+    /// Retrieve data by content hash
+    pub fn retrieve(self: *const CAS, allocator: Allocator, hash: ContentHash) ![]const u8 {
+        const path = try self.hashToPath(allocator, hash);
+        defer allocator.free(path);
+
+        var file = std.fs.cwd().openFile(path, .{}) catch return error.NotFound;
+        defer file.close();
+
+        const stat = try file.stat();
+        const data = try allocator.alloc(u8, stat.size);
+        const bytes_read = try file.readAll(data);
+        return data[0..bytes_read];
+    }
+
+    /// Check if content exists locally
+    pub fn exists(self: *const CAS, allocator: Allocator, hash: ContentHash) bool {
+        const path = self.hashToPath(allocator, hash) catch return false;
+        defer allocator.free(path);
+        return std.fs.cwd().access(path, .{}) != error.FileNotFound;
+    }
+
+    /// Convert hash to filesystem path: .cas/xx/xxxx....blob
+    fn hashToPath(self: *const CAS, allocator: Allocator, hash: ContentHash) ![]const u8 {
+        var hex: [40]u8 = undefined;
+        bytesToHex(&hash, &hex);
+        return std.fs.path.join(allocator, &.{ self.data_dir, ".cas", hex[0..2], hex[2..] ++ ".blob" });
+    }
+
+    /// Compute hash without storing
+    pub fn computeHash(data: []const u8) ContentHash {
+        var hasher = Blake3.init(.{});
+        hasher.update(data);
+        var full_hash: [32]u8 = undefined;
+        hasher.final(&full_hash);
+        return full_hash[0..20].*;
+    }
+};
+
+/// Metadata Index - maps S3 paths to content hashes
+const MetaIndex = struct {
+    data_dir: []const u8,
+
+    const ObjectMeta = struct {
+        hash: ContentHash,
+        size: u64,
+        chunks: []ContentHash,
+        created: i64,
+        replicas: u8,
+    };
+
+    /// Store metadata for an S3 object
+    pub fn put(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8, hash: ContentHash, size: u64) !void {
+        const path = try self.metaPath(allocator, bucket, key);
+        defer allocator.free(path);
+
+        // Create parent directories
+        if (std.fs.path.dirname(path)) |dir| {
+            std.fs.cwd().makePath(dir) catch {};
+        }
+
+        var file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+
+        // Simple format: hex_hash\nsize\ncreated_timestamp
+        var hash_hex: [40]u8 = undefined;
+        bytesToHex(&hash, &hash_hex);
+        const created = std.time.timestamp();
+
+        var buf: [128]u8 = undefined;
+        const content = std.fmt.bufPrint(&buf, "{s}\n{d}\n{d}\n", .{ hash_hex, size, created }) catch unreachable;
+        try file.writeAll(content);
+    }
+
+    /// Get metadata for an S3 object
+    pub fn get(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8) !?struct { hash: ContentHash, size: u64 } {
+        const path = try self.metaPath(allocator, bucket, key);
+        defer allocator.free(path);
+
+        var file = std.fs.cwd().openFile(path, .{}) catch return null;
+        defer file.close();
+
+        var buf: [128]u8 = undefined;
+        const bytes_read = file.readAll(&buf) catch return null;
+        const content = buf[0..bytes_read];
+
+        // Parse: hex_hash\nsize\n...
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        const hash_hex = lines.next() orelse return null;
+        const size_str = lines.next() orelse return null;
+
+        if (hash_hex.len != 40) return null;
+        var hash: ContentHash = undefined;
+        _ = std.fmt.hexToBytes(&hash, hash_hex) catch return null;
+
+        const size = std.fmt.parseInt(u64, size_str, 10) catch return null;
+
+        return .{ .hash = hash, .size = size };
+    }
+
+    /// Delete metadata for an S3 object
+    pub fn delete(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8) void {
+        const path = self.metaPath(allocator, bucket, key) catch return;
+        defer allocator.free(path);
+        std.fs.cwd().deleteFile(path) catch {};
+    }
+
+    fn metaPath(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8) ![]const u8 {
+        const key_with_ext = try std.fmt.allocPrint(allocator, "{s}.meta", .{key});
+        defer allocator.free(key_with_ext);
+        return std.fs.path.join(allocator, &.{ self.data_dir, ".index", bucket, key_with_ext });
+    }
+};
+
+/// Peer information for DHT
+const PeerInfo = struct {
+    id: NodeId,
+    address: net.Address,
+    last_seen: i64,
+    content_count: u32,
+};
+
+/// Full Kademlia DHT implementation
+/// XOR metric, 160 k-buckets, iterative lookup
+const Kademlia = struct {
+    const K = 20; // Bucket size (replication parameter)
+    const ALPHA = 3; // Concurrency parameter for lookups
+    const ID_BITS = 160; // 20 bytes * 8 bits
+
+    self_id: NodeId,
+    buckets: [ID_BITS]KBucket,
+    providers: std.AutoHashMap(ContentHash, std.ArrayListUnmanaged(NodeId)),
+    allocator: Allocator,
+
+    /// A single k-bucket holding up to K peers
+    const KBucket = struct {
+        peers: [K]?PeerInfo = [_]?PeerInfo{null} ** K,
+        count: usize = 0,
+        last_updated: i64 = 0,
+
+        /// Add peer to bucket (LRU eviction if full)
+        fn add(self: *KBucket, peer: PeerInfo) void {
+            // Check if already exists, update if so
+            for (&self.peers) |*slot| {
+                if (slot.*) |*p| {
+                    if (std.mem.eql(u8, &p.id, &peer.id)) {
+                        p.* = peer;
+                        self.last_updated = std.time.timestamp();
+                        return;
+                    }
+                }
+            }
+
+            // Add to first empty slot
+            if (self.count < K) {
+                for (&self.peers) |*slot| {
+                    if (slot.* == null) {
+                        slot.* = peer;
+                        self.count += 1;
+                        self.last_updated = std.time.timestamp();
+                        return;
+                    }
+                }
+            }
+
+            // Bucket full - replace oldest (LRU eviction)
+            var oldest_idx: usize = 0;
+            var oldest_time: i64 = std.math.maxInt(i64);
+            for (self.peers, 0..) |slot, i| {
+                if (slot) |p| {
+                    if (p.last_seen < oldest_time) {
+                        oldest_time = p.last_seen;
+                        oldest_idx = i;
+                    }
+                }
+            }
+            self.peers[oldest_idx] = peer;
+            self.last_updated = std.time.timestamp();
+        }
+
+        /// Remove peer from bucket
+        fn remove(self: *KBucket, id: NodeId) void {
+            for (&self.peers) |*slot| {
+                if (slot.*) |p| {
+                    if (std.mem.eql(u8, &p.id, &id)) {
+                        slot.* = null;
+                        self.count -= 1;
+                        return;
+                    }
+                }
+            }
+        }
+
+        /// Get all peers in bucket
+        fn getPeers(self: *const KBucket, out: []PeerInfo) usize {
+            var count: usize = 0;
+            for (self.peers) |slot| {
+                if (slot) |p| {
+                    if (count < out.len) {
+                        out[count] = p;
+                        count += 1;
+                    }
+                }
+            }
+            return count;
+        }
+    };
+
+    pub fn init(allocator: Allocator, self_id: NodeId) Kademlia {
+        return .{
+            .self_id = self_id,
+            .buckets = [_]KBucket{.{}} ** ID_BITS,
+            .providers = std.AutoHashMap(ContentHash, std.ArrayListUnmanaged(NodeId)).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Kademlia) void {
+        var it = self.providers.valueIterator();
+        while (it.next()) |list| {
+            list.deinit(self.allocator);
+        }
+        self.providers.deinit();
+    }
+
+    /// XOR distance between two node IDs
+    pub fn xorDistance(a: NodeId, b: NodeId) NodeId {
+        var result: NodeId = undefined;
+        for (0..20) |i| {
+            result[i] = a[i] ^ b[i];
+        }
+        return result;
+    }
+
+    /// Find the bucket index for a given node ID (based on XOR distance from self)
+    fn bucketIndex(self: *const Kademlia, id: NodeId) usize {
+        const dist = xorDistance(self.self_id, id);
+        // Find highest bit set (leading zeros of XOR)
+        for (0..20) |byte_idx| {
+            if (dist[byte_idx] != 0) {
+                // Count leading zeros in this byte
+                const lz = @clz(dist[byte_idx]);
+                return ID_BITS - 1 - (byte_idx * 8 + lz);
+            }
+        }
+        return 0; // Same ID (shouldn't happen)
+    }
+
+    /// Add or update a peer in the routing table
+    pub fn addPeer(self: *Kademlia, peer: PeerInfo) void {
+        if (std.mem.eql(u8, &peer.id, &self.self_id)) return; // Don't add self
+        const idx = self.bucketIndex(peer.id);
+        self.buckets[idx].add(peer);
+    }
+
+    /// Remove a peer from the routing table
+    pub fn removePeer(self: *Kademlia, id: NodeId) void {
+        const idx = self.bucketIndex(id);
+        self.buckets[idx].remove(id);
+    }
+
+    /// Find the K closest peers to a target ID
+    pub fn findClosest(self: *Kademlia, target: NodeId, out: []PeerInfo) usize {
+        const DistPeer = struct {
+            peer: PeerInfo,
+            dist: NodeId,
+
+            fn lessThan(_: void, a: @This(), b: @This()) bool {
+                return compareDist(a.dist, b.dist) == .lt;
+            }
+        };
+
+        var candidates: [ID_BITS * K]DistPeer = undefined;
+        var count: usize = 0;
+
+        // Collect all peers with their distances
+        for (&self.buckets) |*bucket| {
+            var peers: [K]PeerInfo = undefined;
+            const n = bucket.getPeers(&peers);
+            for (peers[0..n]) |peer| {
+                if (count < candidates.len) {
+                    candidates[count] = .{
+                        .peer = peer,
+                        .dist = xorDistance(peer.id, target),
+                    };
+                    count += 1;
+                }
+            }
+        }
+
+        // Sort by distance
+        std.mem.sort(DistPeer, candidates[0..count], {}, DistPeer.lessThan);
+
+        // Copy to output
+        const result_count = @min(count, out.len);
+        for (0..result_count) |i| {
+            out[i] = candidates[i].peer;
+        }
+        return result_count;
+    }
+
+    /// Compare two XOR distances (returns ordering)
+    fn compareDist(a: NodeId, b: NodeId) std.math.Order {
+        for (0..20) |i| {
+            if (a[i] < b[i]) return .lt;
+            if (a[i] > b[i]) return .gt;
+        }
+        return .eq;
+    }
+
+    /// Announce that we have content (store provider record)
+    pub fn announce(self: *Kademlia, hash: ContentHash) !void {
+        const result = try self.providers.getOrPut(hash);
+        if (!result.found_existing) {
+            result.value_ptr.* = .empty;
+        }
+        // Add self as provider
+        for (result.value_ptr.items) |id| {
+            if (std.mem.eql(u8, &id, &self.self_id)) return;
+        }
+        try result.value_ptr.append(self.allocator, self.self_id);
+    }
+
+    /// Record that a peer has content
+    pub fn addProvider(self: *Kademlia, hash: ContentHash, provider: NodeId) !void {
+        const result = try self.providers.getOrPut(hash);
+        if (!result.found_existing) {
+            result.value_ptr.* = .empty;
+        }
+        for (result.value_ptr.items) |id| {
+            if (std.mem.eql(u8, &id, &provider)) return;
+        }
+        try result.value_ptr.append(self.allocator, provider);
+    }
+
+    /// Find nodes that have content
+    pub fn findProviders(self: *Kademlia, hash: ContentHash) []NodeId {
+        if (self.providers.get(hash)) |list| {
+            return list.items;
+        }
+        return &.{};
+    }
+
+    /// Get total peer count across all buckets
+    pub fn peerCount(self: *const Kademlia) usize {
+        var count: usize = 0;
+        for (self.buckets) |bucket| {
+            count += bucket.count;
+        }
+        return count;
+    }
+
+    /// Get random peers for gossip
+    pub fn getRandomPeers(self: *Kademlia, out: []PeerInfo, rng: std.Random) usize {
+        var all_peers: [MAX_PEERS]PeerInfo = undefined;
+        var total: usize = 0;
+
+        for (&self.buckets) |*bucket| {
+            var peers: [K]PeerInfo = undefined;
+            const n = bucket.getPeers(&peers);
+            for (peers[0..n]) |peer| {
+                if (total < all_peers.len) {
+                    all_peers[total] = peer;
+                    total += 1;
+                }
+            }
+        }
+
+        if (total == 0) return 0;
+
+        // Fisher-Yates shuffle and take first N
+        const count = @min(out.len, total);
+        for (0..count) |i| {
+            const j = i + rng.uintLessThan(usize, total - i);
+            const tmp = all_peers[i];
+            all_peers[i] = all_peers[j];
+            all_peers[j] = tmp;
+            out[i] = all_peers[i];
+        }
+        return count;
+    }
+
+    /// Generate a random node ID in a specific bucket's range (for refresh)
+    pub fn randomIdInBucket(self: *const Kademlia, bucket_idx: usize, rng: std.Random) NodeId {
+        var id = self.self_id;
+        // Flip the bit at bucket_idx position
+        const byte_idx = (ID_BITS - 1 - bucket_idx) / 8;
+        const bit_idx: u3 = @intCast(7 - ((ID_BITS - 1 - bucket_idx) % 8));
+        id[byte_idx] ^= @as(u8, 1) << bit_idx;
+        // Randomize lower bits
+        for ((byte_idx + 1)..20) |i| {
+            id[i] = rng.int(u8);
+        }
+        return id;
+    }
+};
+
+/// Replication manager for background replication
+const ReplicationManager = struct {
+    pending: std.ArrayListUnmanaged(ContentHash),
+    target_replicas: u8,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) ReplicationManager {
+        return .{
+            .pending = .empty,
+            .target_replicas = REPLICATION_TARGET,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *ReplicationManager) void {
+        self.pending.deinit(self.allocator);
+    }
+
+    /// Schedule content for replication
+    pub fn schedule(self: *ReplicationManager, hash: ContentHash) !void {
+        // Avoid duplicates
+        for (self.pending.items) |h| {
+            if (std.mem.eql(u8, &h, &hash)) return;
+        }
+        try self.pending.append(self.allocator, hash);
+    }
+};
+
+/// Distributed mode configuration
+const DistributedConfig = struct {
+    enabled: bool = false,
+    node_id: NodeId = undefined,
+    bootstrap_peers: []const []const u8 = &.{},
+    target_replicas: u8 = REPLICATION_TARGET,
+    http_port: u16 = 9000,
+};
+
+/// Extended context for distributed mode
+const DistributedContext = struct {
+    config: DistributedConfig,
+    cas: CAS,
+    meta_index: MetaIndex,
+    kademlia: Kademlia,
+    replication: ReplicationManager,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator, data_dir: []const u8, config: DistributedConfig) DistributedContext {
+        return .{
+            .config = config,
+            .cas = .{ .data_dir = data_dir },
+            .meta_index = .{ .data_dir = data_dir },
+            .kademlia = Kademlia.init(allocator, config.node_id),
+            .replication = ReplicationManager.init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *DistributedContext) void {
+        self.kademlia.deinit();
+        self.replication.deinit();
+    }
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // Parse CLI arguments
+    var distributed_enabled = false;
+    var bootstrap_peers: [10][]const u8 = undefined;
+    var bootstrap_count: usize = 0;
+    var port: u16 = 9000;
+
+    var args = std.process.args();
+    _ = args.skip(); // Skip program name
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--distributed") or std.mem.eql(u8, arg, "-d")) {
+            distributed_enabled = true;
+        } else if (std.mem.startsWith(u8, arg, "--bootstrap=")) {
+            const peers_str = arg[12..];
+            var it = std.mem.splitScalar(u8, peers_str, ',');
+            while (it.next()) |peer| {
+                if (bootstrap_count < bootstrap_peers.len) {
+                    bootstrap_peers[bootstrap_count] = peer;
+                    bootstrap_count += 1;
+                }
+            }
+        } else if (std.mem.startsWith(u8, arg, "--port=")) {
+            port = std.fmt.parseInt(u16, arg[7..], 10) catch 9000;
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            std.debug.print(
+                \\zs3 - Distributed S3-compatible storage
+                \\
+                \\Usage: zs3 [OPTIONS]
+                \\
+                \\Options:
+                \\  --distributed, -d     Enable distributed mode (peer-to-peer)
+                \\  --bootstrap=PEERS     Comma-separated bootstrap peer addresses
+                \\  --port=PORT           HTTP port (default: 9000)
+                \\  --help, -h            Show this help
+                \\
+                \\Examples:
+                \\  zs3                                    # Standalone mode
+                \\  zs3 --distributed                      # Distributed, auto-discover via mDNS
+                \\  zs3 -d --bootstrap=10.0.0.1:9000       # Distributed with bootstrap peer
+                \\
+            , .{});
+            return;
+        }
+    }
+
     std.fs.cwd().makeDir("data") catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
-    const address = net.Address.parseIp4("0.0.0.0", 9000) catch unreachable;
+    // Initialize distributed context if enabled
+    var dist_ctx: ?DistributedContext = null;
+    defer if (dist_ctx) |*d| d.deinit();
+
+    if (distributed_enabled) {
+        // Generate or load node ID
+        const node_id = try getOrCreateNodeId(allocator, "data");
+        const config = DistributedConfig{
+            .enabled = true,
+            .node_id = node_id,
+            .http_port = port,
+        };
+        dist_ctx = DistributedContext.init(allocator, "data", config);
+
+        var id_hex: [40]u8 = undefined;
+        bytesToHex(&node_id, &id_hex);
+        std.log.info("Distributed mode enabled. Node ID: {s}", .{id_hex});
+        std.log.info("Known peers: {d}", .{dist_ctx.?.kademlia.peerCount()});
+
+        // Create .cas and .index directories
+        std.fs.cwd().makePath("data/.cas") catch {};
+        std.fs.cwd().makePath("data/.index") catch {};
+    }
+
+    const address = net.Address.parseIp4("0.0.0.0", port) catch unreachable;
     var server = try address.listen(.{ .reuse_address = true });
     defer server.deinit();
 
-    std.log.info("S3 server listening on http://0.0.0.0:9000", .{});
+    if (distributed_enabled) {
+        std.log.info("dS3 server listening on http://0.0.0.0:{d}", .{port});
+    } else {
+        std.log.info("S3 server listening on http://0.0.0.0:{d}", .{port});
+    }
 
-    const ctx = S3Context{
+    var ctx = S3Context{
         .allocator = allocator,
         .data_dir = "data",
         .access_key = "minioadmin",
         .secret_key = "minioadmin",
+        .distributed = if (dist_ctx != null) &dist_ctx.? else null,
     };
 
     if (builtin.os.tag == .linux) {
@@ -40,6 +628,32 @@ pub fn main() !void {
     } else if (builtin.os.tag == .macos) {
         try eventLoopKqueue(allocator, &ctx, &server);
     }
+}
+
+/// Generate or load persistent node ID
+fn getOrCreateNodeId(allocator: Allocator, data_dir: []const u8) !NodeId {
+    const id_path = try std.fs.path.join(allocator, &.{ data_dir, ".node_id" });
+    defer allocator.free(id_path);
+
+    // Try to load existing ID
+    if (std.fs.cwd().openFile(id_path, .{})) |file| {
+        defer file.close();
+        var id: NodeId = undefined;
+        const n = file.readAll(&id) catch return error.InvalidNodeId;
+        if (n == 20) return id;
+    } else |_| {}
+
+    // Generate new random ID
+    var id: NodeId = undefined;
+    std.crypto.random.bytes(&id);
+
+    // Save it
+    if (std.fs.cwd().createFile(id_path, .{})) |file| {
+        defer file.close();
+        file.writeAll(&id) catch {};
+    } else |_| {}
+
+    return id;
 }
 
 fn setNonBlocking(fd: posix.fd_t) void {
@@ -151,6 +765,7 @@ const S3Context = struct {
     data_dir: []const u8,
     access_key: []const u8,
     secret_key: []const u8,
+    distributed: ?*DistributedContext = null, // Optional distributed mode
 
     fn bucketPath(self: *const S3Context, allocator: Allocator, bucket: []const u8) ![]const u8 {
         return std.fs.path.join(allocator, &[_][]const u8{ self.data_dir, bucket });
@@ -384,7 +999,9 @@ fn handleConnectionWithStream(allocator: Allocator, ctx: *const S3Context, strea
 
     const data = buf[0..total_read];
 
-    if (!hasAuth(data)) {
+    // Allow peer protocol endpoints without auth
+    const is_peer_protocol = if (std.mem.indexOf(u8, data, "/_zs3/")) |_| true else false;
+    if (!is_peer_protocol and !hasAuth(data)) {
         _ = stream.write(ERROR_403) catch return false;
         return true;
     }
@@ -423,13 +1040,24 @@ pub fn isValidKey(key: []const u8) bool {
 }
 
 fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response) !void {
+    var path = req.path;
+    if (path.len > 0 and path[0] == '/') path = path[1..];
+
+    // Handle peer protocol (no auth required for peer-to-peer)
+    if (std.mem.startsWith(u8, path, "_zs3/")) {
+        if (ctx.distributed) |dist| {
+            try handlePeerProtocol(ctx, dist, allocator, req, res, path[5..]);
+        } else {
+            sendError(res, 404, "NotFound", "Distributed mode not enabled");
+        }
+        return;
+    }
+
+    // S3 API requires authentication
     if (!SigV4.verify(ctx, req, allocator)) {
         sendError(res, 403, "AccessDenied", "Invalid credentials");
         return;
     }
-
-    var path = req.path;
-    if (path.len > 0 and path[0] == '/') path = path[1..];
 
     var path_parts = std.mem.splitScalar(u8, path, '/');
     const bucket = path_parts.next() orelse "";
@@ -444,6 +1072,30 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         return;
     }
 
+    // In distributed mode, use CAS for object storage
+    if (ctx.distributed != null) {
+        if (key.len > 0) {
+            if (std.mem.eql(u8, req.method, "PUT") and !hasQuery(req.query, "uploadId")) {
+                try handleDistributedPut(ctx, allocator, req, res, bucket, key);
+                return;
+            } else if (std.mem.eql(u8, req.method, "GET")) {
+                try handleDistributedGet(ctx, allocator, req, res, bucket, key);
+                return;
+            } else if (std.mem.eql(u8, req.method, "DELETE") and !hasQuery(req.query, "uploadId")) {
+                try handleDistributedDelete(ctx, allocator, res, bucket, key);
+                return;
+            } else if (std.mem.eql(u8, req.method, "HEAD")) {
+                try handleDistributedHead(ctx, allocator, res, bucket, key);
+                return;
+            }
+        } else if (bucket.len > 0 and std.mem.eql(u8, req.method, "GET")) {
+            // Distributed LIST objects
+            try handleDistributedList(ctx, allocator, req, res, bucket);
+            return;
+        }
+    }
+
+    // Standard S3 routing (standalone mode or bucket operations)
     if (std.mem.eql(u8, req.method, "GET")) {
         if (bucket.len == 0) {
             try handleListBuckets(ctx, allocator, res);
@@ -830,7 +1482,6 @@ fn handleDeleteObjects(ctx: *const S3Context, allocator: Allocator, req: *Reques
 
     // Simple XML parsing - find all <Key>...</Key> pairs
     var body = req.body;
-    var deleted_count: usize = 0;
 
     while (std.mem.indexOf(u8, body, "<Key>")) |start| {
         const key_start = start + 5;
@@ -838,6 +1489,11 @@ fn handleDeleteObjects(ctx: *const S3Context, allocator: Allocator, req: *Reques
         const key = body[key_start .. key_start + end];
 
         if (key.len > 0 and isValidKey(key)) {
+            // In distributed mode, also delete from metadata index
+            if (ctx.distributed) |dist| {
+                dist.meta_index.delete(allocator, bucket, key);
+            }
+
             const path = ctx.objectPath(allocator, bucket, key) catch continue;
             defer allocator.free(path);
 
@@ -846,7 +1502,6 @@ fn handleDeleteObjects(ctx: *const S3Context, allocator: Allocator, req: *Reques
             try xml.appendSlice(allocator, "<Deleted><Key>");
             try xml.appendSlice(allocator, key);
             try xml.appendSlice(allocator, "</Key></Deleted>");
-            deleted_count += 1;
         }
 
         body = body[key_start + end + 6 ..];
@@ -1354,6 +2009,445 @@ pub fn xmlEscape(allocator: Allocator, list: *std.ArrayListUnmanaged(u8), input:
             else => try list.append(allocator, c),
         }
     }
+}
+
+// ============================================================================
+// DISTRIBUTED HANDLERS
+// ============================================================================
+
+/// Handle peer-to-peer protocol endpoints (/_zs3/*)
+fn handlePeerProtocol(ctx: *const S3Context, dist: *DistributedContext, allocator: Allocator, req: *Request, res: *Response, path: []const u8) !void {
+    if (std.mem.eql(u8, path, "ping")) {
+        // Health check - returns node ID
+        var id_hex: [40]u8 = undefined;
+        bytesToHex(&dist.config.node_id, &id_hex);
+        res.ok();
+        res.body = try std.fmt.allocPrint(allocator, "{{\"id\":\"{s}\",\"peers\":{d}}}", .{ id_hex, dist.kademlia.peerCount() });
+    } else if (std.mem.eql(u8, path, "peers")) {
+        // Return known peers for gossip
+        var json: std.ArrayListUnmanaged(u8) = .empty;
+        try json.appendSlice(allocator, "[");
+
+        var peers: [20]PeerInfo = undefined;
+        var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
+        const count = dist.kademlia.getRandomPeers(&peers, prng.random());
+
+        for (peers[0..count], 0..) |peer, i| {
+            if (i > 0) try json.appendSlice(allocator, ",");
+            var id_hex: [40]u8 = undefined;
+            bytesToHex(&peer.id, &id_hex);
+
+            var buf: [128]u8 = undefined;
+            const peer_json = std.fmt.bufPrint(&buf, "{{\"id\":\"{s}\",\"port\":{d}}}", .{ id_hex, peer.address.getPort() }) catch continue;
+            try json.appendSlice(allocator, peer_json);
+        }
+
+        try json.appendSlice(allocator, "]");
+        res.ok();
+        res.setHeader("Content-Type", "application/json");
+        res.body = try json.toOwnedSlice(allocator);
+    } else if (std.mem.startsWith(u8, path, "blob/")) {
+        // Content transfer by hash
+        const hash_hex = path[5..];
+        if (hash_hex.len != 40) {
+            sendError(res, 400, "InvalidRequest", "Invalid hash");
+            return;
+        }
+
+        var hash: ContentHash = undefined;
+        _ = std.fmt.hexToBytes(&hash, hash_hex) catch {
+            sendError(res, 400, "InvalidRequest", "Invalid hash format");
+            return;
+        };
+
+        if (std.mem.eql(u8, req.method, "GET")) {
+            // Fetch blob by hash
+            const data = dist.cas.retrieve(allocator, hash) catch {
+                sendError(res, 404, "NotFound", "Content not found");
+                return;
+            };
+            res.ok();
+            res.body = data;
+        } else if (std.mem.eql(u8, req.method, "PUT")) {
+            // Store blob (pushed from another node)
+            _ = dist.cas.store(allocator, req.body) catch {
+                sendError(res, 500, "InternalError", "Failed to store");
+                return;
+            };
+            res.ok();
+        } else {
+            sendError(res, 405, "MethodNotAllowed", "Method not allowed");
+        }
+    } else if (std.mem.startsWith(u8, path, "providers/")) {
+        // Find providers for content
+        const hash_hex = path[10..];
+        if (hash_hex.len != 40) {
+            sendError(res, 400, "InvalidRequest", "Invalid hash");
+            return;
+        }
+
+        var hash: ContentHash = undefined;
+        _ = std.fmt.hexToBytes(&hash, hash_hex) catch {
+            sendError(res, 400, "InvalidRequest", "Invalid hash format");
+            return;
+        };
+
+        const providers = dist.kademlia.findProviders(hash);
+
+        var json: std.ArrayListUnmanaged(u8) = .empty;
+        try json.appendSlice(allocator, "[");
+        for (providers, 0..) |id, i| {
+            if (i > 0) try json.appendSlice(allocator, ",");
+            var id_hex: [40]u8 = undefined;
+            bytesToHex(&id, &id_hex);
+            try json.append(allocator, '"');
+            try json.appendSlice(allocator, &id_hex);
+            try json.append(allocator, '"');
+        }
+        try json.appendSlice(allocator, "]");
+
+        res.ok();
+        res.setHeader("Content-Type", "application/json");
+        res.body = try json.toOwnedSlice(allocator);
+    } else if (std.mem.eql(u8, path, "announce")) {
+        // Announce content availability
+        if (!std.mem.eql(u8, req.method, "POST")) {
+            sendError(res, 405, "MethodNotAllowed", "Use POST");
+            return;
+        }
+        // Body should contain: hash_hex\nnode_id_hex
+        var lines = std.mem.splitScalar(u8, req.body, '\n');
+        const hash_hex = lines.next() orelse {
+            sendError(res, 400, "InvalidRequest", "Missing hash");
+            return;
+        };
+        const provider_hex = lines.next() orelse {
+            sendError(res, 400, "InvalidRequest", "Missing provider");
+            return;
+        };
+
+        if (hash_hex.len != 40 or provider_hex.len != 40) {
+            sendError(res, 400, "InvalidRequest", "Invalid format");
+            return;
+        }
+
+        var hash: ContentHash = undefined;
+        var provider: NodeId = undefined;
+        _ = std.fmt.hexToBytes(&hash, hash_hex) catch {
+            sendError(res, 400, "InvalidRequest", "Invalid hash");
+            return;
+        };
+        _ = std.fmt.hexToBytes(&provider, provider_hex) catch {
+            sendError(res, 400, "InvalidRequest", "Invalid provider");
+            return;
+        };
+
+        dist.kademlia.addProvider(hash, provider) catch {};
+        res.ok();
+    } else if (std.mem.eql(u8, path, "findnode")) {
+        // Kademlia FIND_NODE
+        const target_hex = req.header("x-target-id") orelse {
+            sendError(res, 400, "InvalidRequest", "Missing X-Target-Id header");
+            return;
+        };
+
+        if (target_hex.len != 40) {
+            sendError(res, 400, "InvalidRequest", "Invalid target ID");
+            return;
+        }
+
+        var target: NodeId = undefined;
+        _ = std.fmt.hexToBytes(&target, target_hex) catch {
+            sendError(res, 400, "InvalidRequest", "Invalid target format");
+            return;
+        };
+
+        var closest: [Kademlia.K]PeerInfo = undefined;
+        const count = dist.kademlia.findClosest(target, &closest);
+
+        var json: std.ArrayListUnmanaged(u8) = .empty;
+        try json.appendSlice(allocator, "[");
+        for (closest[0..count], 0..) |peer, i| {
+            if (i > 0) try json.appendSlice(allocator, ",");
+            var id_hex: [40]u8 = undefined;
+            bytesToHex(&peer.id, &id_hex);
+            var buf: [128]u8 = undefined;
+            const peer_json = std.fmt.bufPrint(&buf, "{{\"id\":\"{s}\",\"port\":{d}}}", .{ id_hex, peer.address.getPort() }) catch continue;
+            try json.appendSlice(allocator, peer_json);
+        }
+        try json.appendSlice(allocator, "]");
+
+        res.ok();
+        res.setHeader("Content-Type", "application/json");
+        res.body = try json.toOwnedSlice(allocator);
+    } else {
+        _ = ctx;
+        sendError(res, 404, "NotFound", "Unknown peer endpoint");
+    }
+}
+
+/// Distributed PUT - store in CAS, update metadata, announce to DHT
+fn handleDistributedPut(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
+    const dist = ctx.distributed.?;
+
+    // Ensure bucket directory exists in index
+    const bucket_path = try ctx.bucketPath(allocator, bucket);
+    defer allocator.free(bucket_path);
+    std.fs.cwd().makePath(bucket_path) catch {};
+
+    // Store content in CAS
+    const hash = try dist.cas.store(allocator, req.body);
+
+    // Update metadata index
+    try dist.meta_index.put(allocator, bucket, key, hash, req.body.len);
+
+    // Announce to DHT
+    dist.kademlia.announce(hash) catch {};
+
+    // Schedule replication
+    dist.replication.schedule(hash) catch {};
+
+    // Return ETag as content hash
+    var etag_hex: [42]u8 = undefined;
+    etag_hex[0] = '"';
+    bytesToHex(&hash, etag_hex[1..41]);
+    etag_hex[41] = '"';
+
+    res.ok();
+    res.setHeader("ETag", &etag_hex);
+}
+
+/// Distributed GET - lookup metadata, retrieve from CAS or peers
+fn handleDistributedGet(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
+    const dist = ctx.distributed.?;
+
+    // Lookup metadata
+    const meta = try dist.meta_index.get(allocator, bucket, key) orelse {
+        sendError(res, 404, "NoSuchKey", "Object not found");
+        return;
+    };
+
+    // Try local CAS first
+    if (dist.cas.retrieve(allocator, meta.hash)) |data| {
+        // Handle range requests
+        if (req.header("range")) |range_header| {
+            if (parseRange(range_header, data.len)) |range| {
+                var range_buf: [64]u8 = undefined;
+                const content_range = std.fmt.bufPrint(&range_buf, "bytes {d}-{d}/{d}", .{ range.start, range.end, data.len }) catch unreachable;
+
+                res.status = 206;
+                res.status_text = "Partial Content";
+                res.setHeader("Content-Range", content_range);
+                res.setHeader("Accept-Ranges", "bytes");
+                res.body = data[range.start .. range.end + 1];
+                return;
+            }
+        }
+
+        res.ok();
+        res.setHeader("Accept-Ranges", "bytes");
+
+        var etag_hex: [42]u8 = undefined;
+        etag_hex[0] = '"';
+        bytesToHex(&meta.hash, etag_hex[1..41]);
+        etag_hex[41] = '"';
+        res.setHeader("ETag", &etag_hex);
+        res.body = data;
+        return;
+    } else |_| {}
+
+    // Content not local - query DHT for providers
+    const providers = dist.kademlia.findProviders(meta.hash);
+    if (providers.len == 0) {
+        sendError(res, 404, "NoSuchKey", "Content not available (no providers)");
+        return;
+    }
+
+    // TODO: Fetch from remote peer
+    // For now, return not found if not local
+    sendError(res, 404, "NoSuchKey", "Content not available locally");
+}
+
+/// Distributed DELETE - remove metadata (CAS content can be garbage collected)
+fn handleDistributedDelete(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, key: []const u8) !void {
+    const dist = ctx.distributed.?;
+    dist.meta_index.delete(allocator, bucket, key);
+    res.noContent();
+}
+
+/// Distributed LIST - list objects from metadata index
+fn handleDistributedList(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8) !void {
+    const dist = ctx.distributed.?;
+
+    const prefix = getQueryParam(req.query, "prefix") orelse "";
+    const max_keys_str = getQueryParam(req.query, "max-keys") orelse "1000";
+    const max_keys = std.fmt.parseInt(usize, max_keys_str, 10) catch 1000;
+    const delimiter = getQueryParam(req.query, "delimiter");
+    const continuation = getQueryParam(req.query, "continuation-token");
+
+    // Path to the bucket's index directory
+    const index_path = try std.fs.path.join(allocator, &.{ dist.meta_index.data_dir, ".index", bucket });
+    defer allocator.free(index_path);
+
+    var xml: std.ArrayListUnmanaged(u8) = .empty;
+    defer xml.deinit(allocator);
+
+    try xml.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    try xml.appendSlice(allocator, "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    try xml.appendSlice(allocator, "<Name>");
+    try xml.appendSlice(allocator, bucket);
+    try xml.appendSlice(allocator, "</Name><Prefix>");
+    try xml.appendSlice(allocator, prefix);
+    try xml.appendSlice(allocator, "</Prefix><MaxKeys>");
+    try xml.appendSlice(allocator, max_keys_str);
+    try xml.appendSlice(allocator, "</MaxKeys>");
+
+    var keys: std.ArrayListUnmanaged(KeyInfo) = .empty;
+    defer keys.deinit(allocator);
+
+    // Collect keys from metadata index
+    collectMetaKeys(allocator, index_path, "", prefix, &keys, &dist.meta_index, bucket) catch {};
+
+    std.mem.sort(KeyInfo, keys.items, {}, struct {
+        fn lessThan(_: void, a: KeyInfo, b: KeyInfo) bool {
+            return std.mem.order(u8, a.key, b.key) == .lt;
+        }
+    }.lessThan);
+
+    var start_idx: usize = 0;
+    if (continuation) |cont| {
+        for (keys.items, 0..) |item, i| {
+            if (std.mem.eql(u8, item.key, cont)) {
+                start_idx = i + 1;
+                break;
+            }
+        }
+    }
+
+    var common_prefixes = std.StringHashMap(void).init(allocator);
+    defer common_prefixes.deinit();
+
+    var count: usize = 0;
+    var is_truncated = false;
+    var next_token: ?[]const u8 = null;
+
+    for (keys.items[start_idx..]) |item| {
+        if (count >= max_keys) {
+            is_truncated = true;
+            next_token = item.key;
+            break;
+        }
+
+        if (delimiter) |delim| {
+            const after_prefix = if (prefix.len > 0 and std.mem.startsWith(u8, item.key, prefix))
+                item.key[prefix.len..]
+            else
+                item.key;
+
+            if (std.mem.indexOf(u8, after_prefix, delim)) |delim_idx| {
+                const common_prefix = item.key[0 .. prefix.len + delim_idx + 1];
+                if (!common_prefixes.contains(common_prefix)) {
+                    try common_prefixes.put(common_prefix, {});
+                    try xml.appendSlice(allocator, "<CommonPrefixes><Prefix>");
+                    try xml.appendSlice(allocator, common_prefix);
+                    try xml.appendSlice(allocator, "</Prefix></CommonPrefixes>");
+                    count += 1;
+                }
+                continue;
+            }
+        }
+
+        try xml.appendSlice(allocator, "<Contents><Key>");
+        try xmlEscape(allocator, &xml, item.key);
+        try xml.appendSlice(allocator, "</Key><Size>");
+        var size_buf: [32]u8 = undefined;
+        const size_str = std.fmt.bufPrint(&size_buf, "{d}", .{item.size}) catch "0";
+        try xml.appendSlice(allocator, size_str);
+        try xml.appendSlice(allocator, "</Size><StorageClass>STANDARD</StorageClass></Contents>");
+        count += 1;
+    }
+
+    if (is_truncated) {
+        try xml.appendSlice(allocator, "<IsTruncated>true</IsTruncated>");
+        if (next_token) |token| {
+            try xml.appendSlice(allocator, "<NextContinuationToken>");
+            try xml.appendSlice(allocator, token);
+            try xml.appendSlice(allocator, "</NextContinuationToken>");
+        }
+    } else {
+        try xml.appendSlice(allocator, "<IsTruncated>false</IsTruncated>");
+    }
+
+    try xml.appendSlice(allocator, "</ListBucketResult>");
+
+    res.ok();
+    res.setXmlBody(try xml.toOwnedSlice(allocator));
+}
+
+/// Collect keys from the metadata index directory
+fn collectMetaKeys(allocator: Allocator, base_path: []const u8, current_prefix: []const u8, filter_prefix: []const u8, keys: *std.ArrayListUnmanaged(KeyInfo), meta_index: *const MetaIndex, bucket: []const u8) !void {
+    const full_path = if (current_prefix.len > 0)
+        try std.fs.path.join(allocator, &[_][]const u8{ base_path, current_prefix })
+    else
+        try allocator.dupe(u8, base_path);
+    defer allocator.free(full_path);
+
+    var dir = std.fs.cwd().openDir(full_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.name[0] == '.') continue;
+
+        const full_name = if (current_prefix.len > 0)
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ current_prefix, entry.name })
+        else
+            try allocator.dupe(u8, entry.name);
+
+        if (entry.kind == .directory) {
+            try collectMetaKeys(allocator, base_path, full_name, filter_prefix, keys, meta_index, bucket);
+            allocator.free(full_name);
+        } else if (entry.kind == .file) {
+            // Strip .meta extension to get the key
+            if (std.mem.endsWith(u8, entry.name, ".meta")) {
+                const key_name_len = full_name.len - 5; // Remove ".meta"
+                const key = full_name[0..key_name_len];
+
+                if (filter_prefix.len == 0 or std.mem.startsWith(u8, key, filter_prefix)) {
+                    // Get size from metadata
+                    const meta = meta_index.get(allocator, bucket, key) catch null;
+                    const size = if (meta) |m| m.size else 0;
+
+                    const key_copy = try allocator.dupe(u8, key);
+                    try keys.append(allocator, .{ .key = key_copy, .size = size });
+                }
+            }
+            allocator.free(full_name);
+        }
+    }
+}
+
+/// Distributed HEAD - return metadata without body
+fn handleDistributedHead(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, key: []const u8) !void {
+    const dist = ctx.distributed.?;
+
+    const meta = try dist.meta_index.get(allocator, bucket, key) orelse {
+        sendError(res, 404, "NoSuchKey", "Object not found");
+        return;
+    };
+
+    var size_buf: [32]u8 = undefined;
+    const size_str = std.fmt.bufPrint(&size_buf, "{d}", .{meta.size}) catch unreachable;
+
+    var etag_hex: [42]u8 = undefined;
+    etag_hex[0] = '"';
+    bytesToHex(&meta.hash, etag_hex[1..41]);
+    etag_hex[41] = '"';
+
+    res.ok();
+    res.setHeader("Content-Length", size_str);
+    res.setHeader("ETag", &etag_hex);
+    res.setHeader("Accept-Ranges", "bytes");
 }
 
 fn sendError(res: *Response, status: u16, code: []const u8, message: []const u8) void {
