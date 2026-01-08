@@ -1006,7 +1006,6 @@ fn setNonBlocking(fd: posix.fd_t) void {
     _ = posix.fcntl(fd, posix.F.SETFL, flags | O_NONBLOCK) catch {};
 }
 
-
 fn eventLoopEpoll(allocator: Allocator, ctx: *const S3Context, server: *net.Server) !void {
     const linux = std.os.linux;
     const epfd = linux.epoll_create1(linux.EPOLL.CLOEXEC);
@@ -1033,7 +1032,7 @@ fn eventLoopEpoll(allocator: Allocator, ctx: *const S3Context, server: *net.Serv
                 }
             } else {
                 const stream = net.Stream{ .handle = event.data.fd };
-                handleConnectionWithStream(allocator, ctx, stream) catch {};
+                _ = handleConnectionWithStream(allocator, ctx, stream) catch {};
                 _ = linux.epoll_ctl(@intCast(epfd), linux.EPOLL.CTL_DEL, event.data.fd, null);
                 stream.close();
             }
@@ -3016,4 +3015,3 @@ fn sendError(res: *Response, status: u16, code: []const u8, message: []const u8)
 
     res.body = std.fmt.allocPrint(res.allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{s}</Code><Message>{s}</Message></Error>", .{ code, message }) catch return;
 }
-
