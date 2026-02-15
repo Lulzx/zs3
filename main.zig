@@ -24,6 +24,8 @@ const ERROR_403 = "HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: ke
 
 /// Format a Unix timestamp (seconds) as an HTTP date (RFC 7231).
 /// Returns a 29-byte string like "Mon, 02 Jan 2006 15:04:05 GMT".
+/// When using with Response.setHeader, the returned slice must outlive
+/// the response — use allocHttpDate to get a heap-allocated copy.
 pub fn formatHttpDate(buf: *[29]u8, timestamp: i64) void {
     const secs: u64 = if (timestamp > 0) @intCast(timestamp) else 0;
     const es = std.time.epoch.EpochSeconds{ .secs = secs };
@@ -66,6 +68,13 @@ pub fn formatIso8601(buf: *[20]u8, timestamp: i64) void {
         ds.getMinutesIntoHour(),
         ds.getSecondsIntoMinute(),
     }) catch unreachable;
+}
+
+/// Heap-allocate an RFC 7231 date string suitable for Response.setHeader.
+fn allocHttpDate(allocator: Allocator, timestamp: i64) ![]const u8 {
+    var buf: [29]u8 = undefined;
+    formatHttpDate(&buf, timestamp);
+    return allocator.dupe(u8, &buf);
 }
 
 // ============================================================================
@@ -1890,22 +1899,28 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
         return;
     };
 
-    var date_buf: [29]u8 = undefined;
-    formatHttpDate(&date_buf, @intCast(@divFloor(stat.mtime, std.time.ns_per_s)));
+    const last_modified = allocHttpDate(allocator, @intCast(@divFloor(stat.mtime, std.time.ns_per_s))) catch {
+        file.close();
+        sendError(res, 500, "InternalError", "Date format failed");
+        return;
+    };
 
     // For range requests, use sendFile without ETag (efficient for large files)
     if (req.header("range")) |range_header| {
         if (parseRange(range_header, stat.size)) |range| {
             const len = range.end - range.start + 1;
 
-            var range_buf: [64]u8 = undefined;
-            const content_range = std.fmt.bufPrint(&range_buf, "bytes {d}-{d}/{d}", .{ range.start, range.end, stat.size }) catch unreachable;
+            const content_range = std.fmt.allocPrint(allocator, "bytes {d}-{d}/{d}", .{ range.start, range.end, stat.size }) catch {
+                file.close();
+                sendError(res, 500, "InternalError", "Range format failed");
+                return;
+            };
 
             res.status = 206;
             res.status_text = "Partial Content";
             res.setHeader("Content-Range", content_range);
             res.setHeader("Accept-Ranges", "bytes");
-            res.setHeader("Last-Modified", &date_buf);
+            res.setHeader("Last-Modified", last_modified);
             res.setSendFile(file, len, range.start);
             return;
         }
@@ -1928,7 +1943,7 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     res.ok();
     res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("ETag", etag);
-    res.setHeader("Last-Modified", &date_buf);
+    res.setHeader("Last-Modified", last_modified);
     res.body = content;
 }
 
@@ -2032,14 +2047,16 @@ fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, res: *Response,
         return;
     };
 
-    var date_buf: [29]u8 = undefined;
-    formatHttpDate(&date_buf, @intCast(@divFloor(stat.mtime, std.time.ns_per_s)));
+    const last_modified = allocHttpDate(allocator, @intCast(@divFloor(stat.mtime, std.time.ns_per_s))) catch {
+        sendError(res, 500, "InternalError", "Date format failed");
+        return;
+    };
 
     res.ok();
     res.setHeader("Content-Length", len_str);
     res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("ETag", etag);
-    res.setHeader("Last-Modified", &date_buf);
+    res.setHeader("Last-Modified", last_modified);
 }
 
 fn handleListObjects(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8) !void {
@@ -2761,12 +2778,12 @@ fn handleDistributedGet(ctx: *const S3Context, allocator: Allocator, req: *Reque
 
     // Check for inline data first (small objects stored in metadata)
     if (meta.inline_data) |data| {
-        return serveContent(req, res, data, &meta.hash, meta.created);
+        return serveContent(allocator, req, res, data, &meta.hash, meta.created);
     }
 
     // Try local CAS
     if (dist.cas.retrieve(allocator, meta.hash)) |data| {
-        return serveContent(req, res, data, &meta.hash, meta.created);
+        return serveContent(allocator, req, res, data, &meta.hash, meta.created);
     } else |_| {}
 
     // Content not local - query DHT for providers and use quorum reads
@@ -2790,7 +2807,7 @@ fn handleDistributedGet(ctx: *const S3Context, allocator: Allocator, req: *Reque
             if (std.mem.eql(u8, &fetched_hash, &meta.hash)) {
                 // Cache locally for future reads
                 _ = dist.cas.store(allocator, data) catch {};
-                return serveContent(req, res, data, &meta.hash, meta.created);
+                return serveContent(allocator, req, res, data, &meta.hash, meta.created);
             }
             allocator.free(data);
         } else |_| {}
@@ -2800,21 +2817,25 @@ fn handleDistributedGet(ctx: *const S3Context, allocator: Allocator, req: *Reque
 }
 
 /// Serve content with range request support
-fn serveContent(req: *Request, res: *Response, data: []const u8, hash: *const ContentHash, created: i64) void {
-    var date_buf: [29]u8 = undefined;
-    formatHttpDate(&date_buf, created);
+fn serveContent(allocator: Allocator, req: *Request, res: *Response, data: []const u8, hash: *const ContentHash, created: i64) void {
+    const last_modified = allocHttpDate(allocator, created) catch {
+        sendError(res, 500, "InternalError", "Date format failed");
+        return;
+    };
 
     // Handle range requests
     if (req.header("range")) |range_header| {
         if (parseRange(range_header, data.len)) |range| {
-            var range_buf: [64]u8 = undefined;
-            const content_range = std.fmt.bufPrint(&range_buf, "bytes {d}-{d}/{d}", .{ range.start, range.end, data.len }) catch unreachable;
+            const content_range = std.fmt.allocPrint(allocator, "bytes {d}-{d}/{d}", .{ range.start, range.end, data.len }) catch {
+                sendError(res, 500, "InternalError", "Range format failed");
+                return;
+            };
 
             res.status = 206;
             res.status_text = "Partial Content";
             res.setHeader("Content-Range", content_range);
             res.setHeader("Accept-Ranges", "bytes");
-            res.setHeader("Last-Modified", &date_buf);
+            res.setHeader("Last-Modified", last_modified);
             res.body = data[range.start .. range.end + 1];
             return;
         }
@@ -2823,12 +2844,12 @@ fn serveContent(req: *Request, res: *Response, data: []const u8, hash: *const Co
     res.ok();
     res.setHeader("Accept-Ranges", "bytes");
 
-    var etag_hex: [42]u8 = undefined;
-    etag_hex[0] = '"';
-    bytesToHex(hash, etag_hex[1..41]);
-    etag_hex[41] = '"';
-    res.setHeader("ETag", &etag_hex);
-    res.setHeader("Last-Modified", &date_buf);
+    const etag = std.fmt.allocPrint(allocator, "\"{x}\"", .{hash.*}) catch {
+        sendError(res, 500, "InternalError", "ETag failed");
+        return;
+    };
+    res.setHeader("ETag", etag);
+    res.setHeader("Last-Modified", last_modified);
     res.body = data;
 }
 
@@ -3057,22 +3078,24 @@ fn handleDistributedHead(ctx: *const S3Context, allocator: Allocator, res: *Resp
     };
     if (meta.inline_data) |data| allocator.free(data);
 
-    var size_buf: [32]u8 = undefined;
-    const size_str = std.fmt.bufPrint(&size_buf, "{d}", .{meta.size}) catch unreachable;
-
-    var etag_hex: [42]u8 = undefined;
-    etag_hex[0] = '"';
-    bytesToHex(&meta.hash, etag_hex[1..41]);
-    etag_hex[41] = '"';
-
-    var date_buf: [29]u8 = undefined;
-    formatHttpDate(&date_buf, meta.created);
+    const size_str = std.fmt.allocPrint(allocator, "{d}", .{meta.size}) catch {
+        sendError(res, 500, "InternalError", "Format failed");
+        return;
+    };
+    const etag = std.fmt.allocPrint(allocator, "\"{x}\"", .{meta.hash}) catch {
+        sendError(res, 500, "InternalError", "ETag failed");
+        return;
+    };
+    const last_modified = allocHttpDate(allocator, meta.created) catch {
+        sendError(res, 500, "InternalError", "Date format failed");
+        return;
+    };
 
     res.ok();
     res.setHeader("Content-Length", size_str);
-    res.setHeader("ETag", &etag_hex);
+    res.setHeader("ETag", etag);
     res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader("Last-Modified", &date_buf);
+    res.setHeader("Last-Modified", last_modified);
 }
 
 fn sendError(res: *Response, status: u16, code: []const u8, message: []const u8) void {
