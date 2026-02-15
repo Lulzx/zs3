@@ -2583,6 +2583,29 @@ fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Re
         std.log.warn("failed to cleanup upload dir: {}", .{err});
     };
 
+    // In distributed mode, index the assembled file so distributed GET can find it
+    if (ctx.distributed) |dist| {
+        const assembled = blk: {
+            var f = std.fs.cwd().openFile(final_path, .{}) catch break :blk null;
+            defer f.close();
+            const stat = f.stat() catch break :blk null;
+            const data = allocator.alloc(u8, stat.size) catch break :blk null;
+            const n = f.readAll(data) catch break :blk null;
+            break :blk data[0..n];
+        };
+        if (assembled) |data| {
+            const content_hash = CAS.computeHash(data);
+            if (data.len <= INLINE_THRESHOLD) {
+                dist.meta_index.putWithData(allocator, bucket, key, content_hash, data.len, data) catch {};
+            } else {
+                _ = dist.cas.store(allocator, data) catch {};
+                dist.meta_index.put(allocator, bucket, key, content_hash, data.len) catch {};
+                dist.kademlia.announce(content_hash) catch {};
+                dist.replication.schedule(content_hash) catch {};
+            }
+        }
+    }
+
     var final_hash: [16]u8 = undefined;
     hasher.final(&final_hash);
 
@@ -2909,6 +2932,11 @@ fn handleDistributedGet(ctx: *const S3Context, allocator: Allocator, req: *Reque
     // Check for inline data first (small objects stored in metadata)
     if (meta.inline_data) |data| {
         return serveContent(allocator, req, res, data, &meta.hash, meta.created);
+    }
+
+    // Empty objects have no inline data and no CAS entry
+    if (meta.size == 0) {
+        return serveContent(allocator, req, res, "", &meta.hash, meta.created);
     }
 
     // Try local CAS
