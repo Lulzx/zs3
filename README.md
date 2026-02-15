@@ -21,8 +21,9 @@ Most S3 usage is PUT, GET, DELETE, LIST with basic auth. You don't need 200k lin
 - HeadBucket for bucket existence checks
 - DeleteObjects batch operation
 - Multipart uploads for large files
-- Range requests for streaming/seeking
+- Range requests for streaming/seeking (RFC 7233 compliant suffix ranges)
 - HTTP 100-continue support (boto3 compatible)
+- AWS chunked transfer encoding support
 - ~360KB static binary
 
 **Distributed Mode (IPFS-like):**
@@ -166,10 +167,12 @@ zig build test                               # run tests
 ## Testing
 
 ```bash
-python3 test_client.py          # 24 integration tests
-python3 test_comprehensive.py   # boto3 comprehensive tests (requires: pip install boto3)
-zig build test                  # 11 unit tests
+zig build test                  # ~30 unit tests
+python3 test_client.py          # 24 integration tests (stdlib only)
+python3 test_comprehensive.py   # 66 boto3 tests (standalone) / 71 (distributed)
 ```
+
+Requires `pip install boto3` for comprehensive tests.
 
 ## Benchmark
 
@@ -204,11 +207,14 @@ Run your own: `python3 benchmark.py`
 
 ## Security
 
-- Full SigV4 signature verification
+- Full SigV4 signature verification (case-insensitive header matching)
 - Input validation on bucket names and object keys
-- Path traversal protection (blocks `..` in keys)
-- Request size limits
+- Path traversal protection (blocks `..` in keys, rejects absolute paths)
+- XML escaping on all user-supplied values in responses
+- Query parameter boundary checking (no substring false positives)
+- Request size limits (8KB headers, 5GB body, 1024-byte keys)
 - No shell commands, no eval, no external network calls
+- Runtime safety checks enabled on all network-facing code
 - Single file, easy to audit
 
 TLS not included. Use a reverse proxy (nginx, caddy) for HTTPS.
