@@ -3,6 +3,17 @@ const net = std.net;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
+const build_options = @import("build_options");
+const acl = @import("acl.zig");
+
+const HTTP_METHOD = enum {
+    GET,
+    POST,
+    PUT,
+    DELETE,
+    HEAD,
+    OPTIONS,
+};
 
 const MAX_HEADER_SIZE = 8 * 1024;
 const MAX_BODY_SIZE = 5 * 1024 * 1024 * 1024;
@@ -969,6 +980,9 @@ pub fn main() !void {
     var bootstrap_count: usize = 0;
     var port: u16 = 9000;
 
+    const access_control_list = try acl.parseCredentials(allocator, build_options.acl_list);
+    defer allocator.free(access_control_list);
+
     var args = std.process.args();
     _ = args.skip(); // Skip program name
     while (args.next()) |arg| {
@@ -1036,6 +1050,14 @@ pub fn main() !void {
         std.fs.cwd().makePath("data/.index") catch {};
     }
 
+    // Use StringHashMap(V) where V is your value type
+    var access_control_map = std.StringHashMap(acl.Credential).init(allocator);
+
+    for (access_control_list) |credential| {
+        // The key is the slice contents, not the pointer address
+        try access_control_map.put(credential.access_key, credential);
+    }
+
     const address = net.Address.parseIp4("0.0.0.0", port) catch unreachable;
     var server = try address.listen(.{ .reuse_address = true });
     defer server.deinit();
@@ -1049,8 +1071,7 @@ pub fn main() !void {
     var ctx = S3Context{
         .allocator = allocator,
         .data_dir = "data",
-        .access_key = "minioadmin",
-        .secret_key = "minioadmin",
+        .access_control_map = access_control_map,
         .distributed = if (dist_ctx != null) &dist_ctx.? else null,
     };
 
@@ -1192,8 +1213,7 @@ fn eventLoopKqueue(allocator: Allocator, ctx: *const S3Context, server: *net.Ser
 const S3Context = struct {
     allocator: Allocator,
     data_dir: []const u8,
-    access_key: []const u8,
-    secret_key: []const u8,
+    access_control_map: std.StringHashMap(acl.Credential),
     distributed: ?*DistributedContext = null, // Optional distributed mode
 
     fn bucketPath(self: *const S3Context, allocator: Allocator, bucket: []const u8) ![]const u8 {
@@ -1202,6 +1222,10 @@ const S3Context = struct {
 
     fn objectPath(self: *const S3Context, allocator: Allocator, bucket: []const u8, key: []const u8) ![]const u8 {
         return std.fs.path.join(allocator, &[_][]const u8{ self.data_dir, bucket, key });
+    }
+
+    pub fn deinit(self: *S3Context) void {
+        self.access_control_map.deinit();
     }
 };
 
@@ -1553,8 +1577,10 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         return;
     }
 
+    const acl_ctx = SigV4.verify(ctx, req, allocator);
+
     // S3 API requires authentication
-    if (!SigV4.verify(ctx, req, allocator)) {
+    if (!acl_ctx.allow) {
         sendError(res, 403, "AccessDenied", "Invalid credentials");
         return;
     }
@@ -1575,20 +1601,20 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
     // In distributed mode, use CAS for object storage
     if (ctx.distributed != null) {
         if (key.len > 0) {
-            if (std.mem.eql(u8, req.method, "PUT") and !hasQuery(req.query, "uploadId")) {
+            if (std.mem.eql(u8, req.method, "PUT") and !hasQuery(req.query, "uploadId") and acl_ctx.allowed("PUT")) {
                 try handleDistributedPut(ctx, allocator, req, res, bucket, key);
                 return;
-            } else if (std.mem.eql(u8, req.method, "GET")) {
+            } else if (std.mem.eql(u8, req.method, "GET") and acl_ctx.allowed("GET")) {
                 try handleDistributedGet(ctx, allocator, req, res, bucket, key);
                 return;
-            } else if (std.mem.eql(u8, req.method, "DELETE") and !hasQuery(req.query, "uploadId")) {
+            } else if (std.mem.eql(u8, req.method, "DELETE") and !hasQuery(req.query, "uploadId") and acl_ctx.allowed("DELETE")) {
                 try handleDistributedDelete(ctx, allocator, res, bucket, key);
                 return;
-            } else if (std.mem.eql(u8, req.method, "HEAD")) {
+            } else if (std.mem.eql(u8, req.method, "HEAD") and acl_ctx.allowed("HEAD")) {
                 try handleDistributedHead(ctx, allocator, res, bucket, key);
                 return;
             }
-        } else if (bucket.len > 0 and std.mem.eql(u8, req.method, "GET")) {
+        } else if (bucket.len > 0 and std.mem.eql(u8, req.method, "GET") and acl_ctx.allowed("GET")) {
             // Distributed LIST objects
             try handleDistributedList(ctx, allocator, req, res, bucket);
             return;
@@ -1596,7 +1622,7 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
     }
 
     // Standard S3 routing (standalone mode or bucket operations)
-    if (std.mem.eql(u8, req.method, "GET")) {
+    if (std.mem.eql(u8, req.method, "GET") and acl_ctx.allowed("GET")) {
         if (bucket.len == 0) {
             try handleListBuckets(ctx, allocator, res);
         } else if (key.len == 0) {
@@ -1604,7 +1630,7 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         } else {
             try handleGetObject(ctx, allocator, req, res, bucket, key);
         }
-    } else if (std.mem.eql(u8, req.method, "PUT")) {
+    } else if (std.mem.eql(u8, req.method, "PUT") and acl_ctx.allowed("PUT")) {
         if (key.len == 0) {
             try handleCreateBucket(ctx, allocator, res, bucket);
         } else if (hasQuery(req.query, "uploadId")) {
@@ -1612,7 +1638,7 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         } else {
             try handlePutObject(ctx, allocator, req, res, bucket, key);
         }
-    } else if (std.mem.eql(u8, req.method, "DELETE")) {
+    } else if (std.mem.eql(u8, req.method, "DELETE") and acl_ctx.allowed("DELETE")) {
         if (key.len == 0) {
             try handleDeleteBucket(ctx, allocator, res, bucket);
         } else if (hasQuery(req.query, "uploadId")) {
@@ -1620,13 +1646,13 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         } else {
             try handleDeleteObject(ctx, allocator, res, bucket, key);
         }
-    } else if (std.mem.eql(u8, req.method, "HEAD")) {
+    } else if (std.mem.eql(u8, req.method, "HEAD") and acl_ctx.allowed("HEAD")) {
         if (key.len == 0) {
             try handleHeadBucket(ctx, allocator, res, bucket);
         } else {
             try handleHeadObject(ctx, allocator, res, bucket, key);
         }
-    } else if (std.mem.eql(u8, req.method, "POST")) {
+    } else if (std.mem.eql(u8, req.method, "POST") and acl_ctx.allowed("POST")) {
         if (hasQuery(req.query, "delete")) {
             try handleDeleteObjects(ctx, allocator, req, res, bucket);
         } else if (hasQuery(req.query, "uploads")) {
@@ -1654,21 +1680,68 @@ pub const SigV4 = struct {
         signature: []const u8,
     };
 
-    fn verify(ctx: *const S3Context, req: *const Request, allocator: Allocator) bool {
-        const auth_header = req.header("authorization") orelse return false;
-        const x_amz_date = req.header("x-amz-date") orelse return false;
+    const ACLCtx = struct {
+        allow: bool,
+        role: acl.Role,
+
+        // Change return type to !bool to allow returning errors
+        fn allowed(self: *const ACLCtx, method: []const u8) bool {
+            switch (self.role) {
+                acl.Role.Admin => {
+                    return true;
+                },
+                acl.Role.Reader => {
+                    const http_method = std.meta.stringToEnum(HTTP_METHOD, method) orelse {
+                        return false;
+                    };
+
+                    switch (http_method) {
+                        .GET => return true,
+                        .HEAD => return true,
+                        .OPTIONS => return true,
+                        else => return false,
+                    }
+                },
+                acl.Role.Writer => {
+                    const http_method = std.meta.stringToEnum(HTTP_METHOD, method) orelse {
+                        return false;
+                    };
+
+                    switch (http_method) {
+                        .PUT => return true,
+                        .POST => return true,
+                        .HEAD => return true,
+                        .OPTIONS => return true,
+                        else => return false,
+                    }
+                },
+            }
+        }
+    };
+
+    fn verify(ctx: *const S3Context, req: *const Request, allocator: Allocator) ACLCtx {
+        var acl_ctx = ACLCtx{
+            .allow = false,
+            .role = undefined,
+        };
+
+        const auth_header = req.header("authorization") orelse return acl_ctx;
+        const x_amz_date = req.header("x-amz-date") orelse return acl_ctx;
         const x_amz_content_sha256 = req.header("x-amz-content-sha256") orelse "UNSIGNED-PAYLOAD";
 
-        const parsed = parseAuthHeader(auth_header) orelse return false;
+        const parsed = parseAuthHeader(auth_header) orelse return acl_ctx;
+        const credential = ctx.access_control_map.get(parsed.access_key);
 
-        if (!std.mem.eql(u8, parsed.access_key, ctx.access_key)) return false;
+        if (credential == null) {
+            return acl_ctx;
+        }
 
         const canonical = buildCanonicalRequest(
             allocator,
             req,
             parsed.signed_headers,
             x_amz_content_sha256,
-        ) catch return false;
+        ) catch return acl_ctx;
         defer allocator.free(canonical);
 
         const string_to_sign = buildStringToSign(
@@ -1678,20 +1751,23 @@ pub const SigV4 = struct {
             parsed.region,
             parsed.service,
             canonical,
-        ) catch return false;
+        ) catch return acl_ctx;
         defer allocator.free(string_to_sign);
 
         const calculated_sig = calculateSignature(
             allocator,
-            ctx.secret_key,
+            credential.?.secret_key,
             parsed.date,
             parsed.region,
             parsed.service,
             string_to_sign,
-        ) catch return false;
+        ) catch return acl_ctx;
         defer allocator.free(calculated_sig);
 
-        return std.mem.eql(u8, calculated_sig, parsed.signature);
+        acl_ctx.allow = std.mem.eql(u8, calculated_sig, parsed.signature);
+        acl_ctx.role = credential.?.role;
+
+        return acl_ctx;
     }
 
     pub fn parseAuthHeader(header: []const u8) ?ParsedAuth {
