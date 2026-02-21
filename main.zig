@@ -1050,10 +1050,19 @@ pub fn main() !void {
         std.fs.cwd().makePath("data/.index") catch {};
     }
 
-    // Use StringHashMap(V) where V is your value type
     var access_control_map = std.StringHashMap(acl.Credential).init(allocator);
 
     for (access_control_list) |credential| {
+        if (credential.secret_key.len > 252) {
+            std.log.err("ACL credential '{s}' has a secret key exceeding 252 bytes; skipping", .{credential.secret_key});
+            continue;
+        }
+
+        if (credential.access_key.len > 252) {
+            std.log.err("ACL credential '{s}' has a access key exceeding 252 bytes; skipping", .{credential.access_key});
+            continue;
+        }
+
         // The key is the slice contents, not the pointer address
         try access_control_map.put(credential.access_key, credential);
     }
@@ -1816,8 +1825,10 @@ pub const SigV4 = struct {
         ) catch return acl_ctx;
         defer allocator.free(calculated_sig);
 
-        acl_ctx.allow = std.mem.eql(u8, calculated_sig, parsed.signature);
-        acl_ctx.role = credential.?.role;
+        if (std.mem.eql(u8, calculated_sig, parsed.signature)) {
+            acl_ctx.allow = true;
+            acl_ctx.role = credential.?.role;
+        }
 
         return acl_ctx;
     }
