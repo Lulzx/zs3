@@ -29,9 +29,10 @@ def sign_request(method, path, query="", headers=None, payload=b""):
     signed_headers = ";".join(sorted(k.lower() for k in headers))
     canonical_headers = "".join(f"{k.lower()}:{v}\n" for k, v in sorted(headers.items(), key=lambda x: x[0].lower()))
 
-    # Sort query string - server doesn't URL-encode, just sorts raw pairs
+    # Sort query string - normalize bare params (e.g. "delete") to "delete="
+    # to match server's sortQueryString behavior (required by SigV4)
     if query:
-        pairs = query.split("&")
+        pairs = [p if "=" in p else p + "=" for p in query.split("&")]
         pairs.sort()
         canonical_query = "&".join(pairs)
     else:
