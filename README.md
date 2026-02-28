@@ -48,7 +48,7 @@ If you need these, use MinIO or AWS.
 ## Quick Start
 
 ```bash
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast -Dacl-list="admin:minioadmin:minioadmin"
 ./zig-out/bin/zs3
 ```
 
@@ -146,8 +146,6 @@ Edit `main.zig`:
 const ctx = S3Context{
     .allocator = allocator,
     .data_dir = "data",
-    .access_key = "minioadmin",
-    .secret_key = "minioadmin",
 };
 
 const address = net.Address.parseIp4("0.0.0.0", 9000)
