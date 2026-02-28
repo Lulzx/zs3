@@ -1527,6 +1527,14 @@ pub fn isValidBucketName(name: []const u8) bool {
     return true;
 }
 
+fn isValidUploadId(id: []const u8) bool {
+    if (id.len == 0 or id.len > 64) return false;
+    for (id) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return false;
+    }
+    return true;
+}
+
 pub fn isValidKey(key: []const u8) bool {
     if (key.len == 0 or key.len > MAX_KEY_LENGTH) return false;
     for (key) |c| {
@@ -2017,7 +2025,7 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     }
 
     // For full file, read content to compute ETag
-    const content = file.readToEndAlloc(allocator, 1024 * 1024 * 1024) catch {
+    const content = file.readToEndAlloc(allocator, MAX_BODY_SIZE) catch {
         file.close();
         sendError(res, 500, "InternalError", "Read failed");
         return;
@@ -2130,7 +2138,7 @@ fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, res: *Response,
     };
 
     // Compute ETag from file content (same as PUT uses)
-    const content = file.readToEndAlloc(allocator, 1024 * 1024 * 1024) catch {
+    const content = file.readToEndAlloc(allocator, MAX_BODY_SIZE) catch {
         sendError(res, 500, "InternalError", "Read failed");
         return;
     };
@@ -2196,7 +2204,9 @@ fn handleListObjects(ctx: *const S3Context, allocator: Allocator, req: *Request,
     try xml.appendSlice(allocator, "</Name><Prefix>");
     try xmlEscape(allocator, &xml, prefix);
     try xml.appendSlice(allocator, "</Prefix><MaxKeys>");
-    try xml.appendSlice(allocator, max_keys_str);
+    var max_keys_num_buf: [32]u8 = undefined;
+    const max_keys_num_str = std.fmt.bufPrint(&max_keys_num_buf, "{d}", .{max_keys}) catch "1000";
+    try xml.appendSlice(allocator, max_keys_num_str);
     try xml.appendSlice(allocator, "</MaxKeys>");
 
     var keys: std.ArrayListUnmanaged(KeyInfo) = .empty;
@@ -2245,7 +2255,7 @@ fn handleListObjects(ctx: *const S3Context, allocator: Allocator, req: *Request,
                 if (!common_prefixes.contains(common_prefix)) {
                     try common_prefixes.put(common_prefix, {});
                     try xml.appendSlice(allocator, "<CommonPrefixes><Prefix>");
-                    try xml.appendSlice(allocator, common_prefix);
+                    try xmlEscape(allocator, &xml, common_prefix);
                     try xml.appendSlice(allocator, "</Prefix></CommonPrefixes>");
                     count += 1;
                 }
@@ -2277,7 +2287,7 @@ fn handleListObjects(ctx: *const S3Context, allocator: Allocator, req: *Request,
         try xml.appendSlice(allocator, "<IsTruncated>true</IsTruncated>");
         if (next_token) |token| {
             try xml.appendSlice(allocator, "<NextContinuationToken>");
-            try xml.appendSlice(allocator, token);
+            try xmlEscape(allocator, &xml, token);
             try xml.appendSlice(allocator, "</NextContinuationToken>");
         }
     } else {
@@ -2473,8 +2483,16 @@ fn handleUploadPart(ctx: *const S3Context, allocator: Allocator, req: *Request, 
         sendError(res, 400, "InvalidRequest", "Missing uploadId");
         return;
     };
+    if (!isValidUploadId(upload_id)) {
+        sendError(res, 400, "InvalidArgument", "Invalid uploadId");
+        return;
+    }
     const part_number = getQueryParam(req.query, "partNumber") orelse {
         sendError(res, 400, "InvalidRequest", "Missing partNumber");
+        return;
+    };
+    _ = std.fmt.parseInt(u32, part_number, 10) catch {
+        sendError(res, 400, "InvalidArgument", "Invalid partNumber");
         return;
     };
 
@@ -2504,6 +2522,10 @@ fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Re
         sendError(res, 400, "InvalidRequest", "Missing uploadId");
         return;
     };
+    if (!isValidUploadId(upload_id)) {
+        sendError(res, 400, "InvalidArgument", "Invalid uploadId");
+        return;
+    }
 
     const parts_dir = std.fmt.allocPrint(allocator, "{s}/.uploads/{s}", .{ ctx.data_dir, upload_id }) catch {
         sendError(res, 500, "InternalError", "Allocation failed");
@@ -2619,7 +2641,7 @@ fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Re
     try xml.appendSlice(allocator, "</Bucket><Key>");
     try xmlEscape(allocator, &xml, key);
 
-    var etag_buf: [48]u8 = undefined;
+    var etag_buf: [72]u8 = undefined;
     const etag = std.fmt.bufPrint(&etag_buf, "</Key><ETag>\"{x}-{d}\"</ETag>", .{ final_hash, parts_assembled }) catch "</Key><ETag>\"\"</ETag>";
     try xml.appendSlice(allocator, etag);
     try xml.appendSlice(allocator, "</CompleteMultipartUploadResult>");
@@ -2633,6 +2655,10 @@ fn handleAbortMultipart(ctx: *const S3Context, allocator: Allocator, req: *Reque
         sendError(res, 400, "InvalidRequest", "Missing uploadId");
         return;
     };
+    if (!isValidUploadId(upload_id)) {
+        sendError(res, 400, "InvalidArgument", "Invalid uploadId");
+        return;
+    }
 
     const parts_dir = std.fmt.allocPrint(allocator, "{s}/.uploads/{s}", .{ ctx.data_dir, upload_id }) catch {
         sendError(res, 500, "InternalError", "Allocation failed");
@@ -2665,6 +2691,7 @@ pub fn parseRange(header: []const u8, file_size: u64) ?Range {
         return .{ .start = file_size - actual, .end = file_size - 1 };
     }
 
+    if (file_size == 0) return null;
     const start = if (start_str.len > 0) std.fmt.parseInt(u64, start_str, 10) catch return null else 0;
     const end = if (end_str.len > 0) std.fmt.parseInt(u64, end_str, 10) catch return null else file_size - 1;
 
@@ -3093,7 +3120,9 @@ fn handleDistributedList(ctx: *const S3Context, allocator: Allocator, req: *Requ
     try xml.appendSlice(allocator, "</Name><Prefix>");
     try xmlEscape(allocator, &xml, prefix);
     try xml.appendSlice(allocator, "</Prefix><MaxKeys>");
-    try xml.appendSlice(allocator, max_keys_str);
+    var dist_max_keys_num_buf: [32]u8 = undefined;
+    const dist_max_keys_num_str = std.fmt.bufPrint(&dist_max_keys_num_buf, "{d}", .{max_keys}) catch "1000";
+    try xml.appendSlice(allocator, dist_max_keys_num_str);
     try xml.appendSlice(allocator, "</MaxKeys>");
 
     var keys: std.ArrayListUnmanaged(KeyInfo) = .empty;
@@ -3143,7 +3172,7 @@ fn handleDistributedList(ctx: *const S3Context, allocator: Allocator, req: *Requ
                 if (!common_prefixes.contains(common_prefix)) {
                     try common_prefixes.put(common_prefix, {});
                     try xml.appendSlice(allocator, "<CommonPrefixes><Prefix>");
-                    try xml.appendSlice(allocator, common_prefix);
+                    try xmlEscape(allocator, &xml, common_prefix);
                     try xml.appendSlice(allocator, "</Prefix></CommonPrefixes>");
                     count += 1;
                 }
@@ -3175,7 +3204,7 @@ fn handleDistributedList(ctx: *const S3Context, allocator: Allocator, req: *Requ
         try xml.appendSlice(allocator, "<IsTruncated>true</IsTruncated>");
         if (next_token) |token| {
             try xml.appendSlice(allocator, "<NextContinuationToken>");
-            try xml.appendSlice(allocator, token);
+            try xmlEscape(allocator, &xml, token);
             try xml.appendSlice(allocator, "</NextContinuationToken>");
         }
     } else {
