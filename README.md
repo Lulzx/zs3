@@ -208,9 +208,9 @@ Run your own: `python3 benchmark.py`
 ## Security
 
 - Full SigV4 signature verification (case-insensitive header matching)
-- Input validation on bucket names and object keys
-- Path traversal protection (blocks `..` in keys, rejects absolute paths)
-- XML escaping on all user-supplied values in responses
+- Input validation on bucket names, object keys, and upload IDs
+- Path traversal protection (blocks `..` in keys, rejects absolute paths, validates multipart upload IDs)
+- XML escaping on all user-supplied values in responses (keys, prefixes, continuation tokens, max-keys)
 - Query parameter boundary checking (no substring false positives)
 - Request size limits (8KB headers, 5GB body, 1024-byte keys)
 - No shell commands, no eval, no external network calls
