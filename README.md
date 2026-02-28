@@ -168,8 +168,10 @@ zig build test                               # run tests
 
 ```bash
 zig build test                  # ~30 unit tests
-python3 test_client.py          # 24 integration tests (stdlib only)
-python3 test_comprehensive.py   # 66 boto3 tests (standalone) / 71 (distributed)
+python3 test_client.py          # 24/24 integration tests (stdlib only)
+python3 test_comprehensive.py   # 66/66 boto3 tests (standalone)
+./zs3 --distributed && \
+python3 test_comprehensive.py   # 71/71 boto3 tests (distributed)
 ```
 
 Requires `pip install boto3` for comprehensive tests.
