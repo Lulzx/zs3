@@ -979,15 +979,19 @@ pub fn main() !void {
     var bootstrap_peers: [10][]const u8 = undefined;
     var bootstrap_count: usize = 0;
     var port: u16 = 9000;
-
-    const access_control_list = try acl.parseCredentials(allocator, build_options.acl_list);
-    defer allocator.free(access_control_list);
+    var data_dir: []const u8 = build_options.data_dir;
+    var raw_acl_list: []const u8 = build_options.acl_list;
+    var show_help: bool = false;
 
     var args = std.process.args();
     _ = args.skip(); // Skip program name
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--distributed") or std.mem.eql(u8, arg, "-d")) {
             distributed_enabled = true;
+        } else if (std.mem.startsWith(u8, arg, "--data-dir=")) {
+            data_dir = arg[11..];
+        } else if (std.mem.startsWith(u8, arg, "--acl=")) {
+            raw_acl_list = arg[6..];
         } else if (std.mem.startsWith(u8, arg, "--bootstrap=")) {
             const peers_str = arg[12..];
             var it = std.mem.splitScalar(u8, peers_str, ',');
@@ -1000,28 +1004,48 @@ pub fn main() !void {
         } else if (std.mem.startsWith(u8, arg, "--port=")) {
             port = std.fmt.parseInt(u16, arg[7..], 10) catch 9000;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            std.debug.print(
-                \\zs3 - Distributed S3-compatible storage
-                \\
-                \\Usage: zs3 [OPTIONS]
-                \\
-                \\Options:
-                \\  --distributed, -d     Enable distributed mode (peer-to-peer)
-                \\  --bootstrap=PEERS     Comma-separated bootstrap peer addresses
-                \\  --port=PORT           HTTP port (default: 9000)
-                \\  --help, -h            Show this help
-                \\
-                \\Examples:
-                \\  zs3                                    # Standalone mode
-                \\  zs3 --distributed                      # Distributed, auto-discover via mDNS
-                \\  zs3 -d --bootstrap=10.0.0.1:9000       # Distributed with bootstrap peer
-                \\
-            , .{});
-            return;
+            show_help = true;
         }
     }
 
-    std.fs.cwd().makeDir(build_options.data_dir) catch |err| switch (err) {
+    if (show_help) {
+        std.debug.print(
+            \\zs3 - Distributed S3-compatible storage
+            \\
+            \\Usage: zs3 [OPTIONS]
+            \\
+            \\Options:
+            \\  --distributed, -d
+            \\      Enable distributed mode (peer-to-peer)
+            \\
+            \\  --bootstrap=PEERS
+            \\      Comma-separated bootstrap peer addresses
+            \\
+            \\  --port={d}
+            \\      HTTP port to listen on
+            \\
+            \\  --data-dir={s}
+            \\      The directory to store bucket data under
+            \\
+            \\  --acl={s}
+            \\      The credentials for access
+            \\
+            \\  --help, -h
+            \\      Show this help
+            \\
+            \\Examples:
+            \\  zs3                                    # Standalone mode
+            \\  zs3 --distributed                      # Distributed, auto-discover via mDNS
+            \\  zs3 -d --bootstrap=10.0.0.1:9000       # Distributed with bootstrap peer
+            \\
+        , .{ port, data_dir, raw_acl_list });
+        return;
+    }
+
+    const access_control_list = try acl.parseCredentials(allocator, raw_acl_list);
+    defer allocator.free(access_control_list);
+
+    std.fs.cwd().makeDir(data_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -1032,13 +1056,13 @@ pub fn main() !void {
 
     if (distributed_enabled) {
         // Generate or load node ID
-        const node_id = try getOrCreateNodeId(allocator, build_options.data_dir);
+        const node_id = try getOrCreateNodeId(allocator, data_dir);
         const config = DistributedConfig{
             .enabled = true,
             .node_id = node_id,
             .http_port = port,
         };
-        dist_ctx = DistributedContext.init(allocator, build_options.data_dir, config);
+        dist_ctx = DistributedContext.init(allocator, data_dir, config);
 
         var id_hex: [40]u8 = undefined;
         bytesToHex(&node_id, &id_hex);
@@ -1046,7 +1070,7 @@ pub fn main() !void {
         std.log.info("Known peers: {d}", .{dist_ctx.?.kademlia.peerCount()});
 
         // Create .cas and .index directories
-        const dot_cas_path = try std.fs.path.join(allocator, &[_][]const u8{ build_options.data_dir, ".cas" });
+        const dot_cas_path = try std.fs.path.join(allocator, &[_][]const u8{ data_dir, ".cas" });
         defer allocator.free(dot_cas_path);
 
         std.fs.cwd().makeDir(dot_cas_path) catch |err| switch (err) {
@@ -1056,7 +1080,7 @@ pub fn main() !void {
             },
         };
 
-        const dot_index_path = try std.fs.path.join(allocator, &[_][]const u8{ build_options.data_dir, ".index" });
+        const dot_index_path = try std.fs.path.join(allocator, &[_][]const u8{ data_dir, ".index" });
         defer allocator.free(dot_index_path);
 
         std.fs.cwd().makeDir(dot_index_path) catch |err| switch (err) {
@@ -1068,29 +1092,29 @@ pub fn main() !void {
     }
 
     var access_control_map = std.StringHashMap(acl.Credential).init(allocator);
+    errdefer access_control_map.deinit();
 
     for (access_control_list) |credential| {
-        if (credential.secret_key.len > 252) {
+        if (credential.secret_key.len > 252) { // 252 due to k_secret_buf.len and prefix of `AWS4`
             // Never log the secret_key itself...
             std.log.err("ACL credential '{s}' has a secret key exceeding 252 bytes; skipping", .{credential.access_key});
             continue;
         }
 
-        if (credential.access_key.len > 252) {
+        if (credential.access_key.len > 252) { // 252 to match secret_key.len
             std.log.err("ACL credential '{s}' has an access key exceeding 252 bytes; skipping", .{credential.access_key});
             continue;
         }
 
         // The key is the slice contents, not the pointer address
         access_control_map.put(credential.access_key, credential) catch |err| {
-            access_control_map.deinit();
             return err;
         };
     }
 
     var ctx = S3Context{
         .allocator = allocator,
-        .data_dir = build_options.data_dir,
+        .data_dir = data_dir,
         .access_control_map = access_control_map,
         .distributed = if (dist_ctx != null) &dist_ctx.? else null,
     };
@@ -1611,8 +1635,12 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
     const acl_ctx = SigV4.verify(ctx, req, allocator);
 
     // S3 API requires authentication
-    if (!acl_ctx.allow) {
+    if (!acl_ctx.authenticated) {
         sendError(res, 403, "AccessDenied", "Invalid credentials");
+        return;
+    }
+    if (!acl_ctx.granted(req.method)) {
+        sendError(res, 403, "AccessDenied", "Insufficient permissions");
         return;
     }
 
@@ -1633,43 +1661,19 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
     if (ctx.distributed != null) {
         if (key.len > 0) {
             if (std.mem.eql(u8, req.method, "PUT") and !hasQuery(req.query, "uploadId")) {
-                if (!acl_ctx.allowed("PUT")) {
-                    sendError(res, 403, "AccessDenied", "Insufficient permissions");
-                    return;
-                }
-
                 try handleDistributedPut(ctx, allocator, req, res, bucket, key);
                 return;
             } else if (std.mem.eql(u8, req.method, "GET")) {
-                if (!acl_ctx.allowed("GET")) {
-                    sendError(res, 403, "AccessDenied", "Insufficient permissions");
-                    return;
-                }
-
                 try handleDistributedGet(ctx, allocator, req, res, bucket, key);
                 return;
             } else if (std.mem.eql(u8, req.method, "DELETE") and !hasQuery(req.query, "uploadId")) {
-                if (!acl_ctx.allowed("DELETE")) {
-                    sendError(res, 403, "AccessDenied", "Insufficient permissions");
-                    return;
-                }
-
                 try handleDistributedDelete(ctx, allocator, res, bucket, key);
                 return;
             } else if (std.mem.eql(u8, req.method, "HEAD")) {
-                if (!acl_ctx.allowed("HEAD")) {
-                    sendError(res, 403, "AccessDenied", "Insufficient permissions");
-                    return;
-                }
-
                 try handleDistributedHead(ctx, allocator, res, bucket, key);
                 return;
             }
         } else if (bucket.len > 0 and std.mem.eql(u8, req.method, "GET")) {
-            if (!acl_ctx.allowed("GET")) {
-                sendError(res, 403, "AccessDenied", "Insufficient permissions");
-                return;
-            }
             // Distributed LIST objects
             try handleDistributedList(ctx, allocator, req, res, bucket);
             return;
@@ -1678,11 +1682,6 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
 
     // Standard S3 routing (standalone mode or bucket operations)
     if (std.mem.eql(u8, req.method, "GET")) {
-        if (!acl_ctx.allowed("GET")) {
-            sendError(res, 403, "AccessDenied", "Insufficient permissions");
-            return;
-        }
-
         if (bucket.len == 0) {
             try handleListBuckets(ctx, allocator, res);
         } else if (key.len == 0) {
@@ -1691,11 +1690,6 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
             try handleGetObject(ctx, allocator, req, res, bucket, key);
         }
     } else if (std.mem.eql(u8, req.method, "PUT")) {
-        if (!acl_ctx.allowed("PUT")) {
-            sendError(res, 403, "AccessDenied", "Insufficient permissions");
-            return;
-        }
-
         if (key.len == 0) {
             try handleCreateBucket(ctx, allocator, res, bucket);
         } else if (hasQuery(req.query, "uploadId")) {
@@ -1704,11 +1698,6 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
             try handlePutObject(ctx, allocator, req, res, bucket, key);
         }
     } else if (std.mem.eql(u8, req.method, "DELETE")) {
-        if (!acl_ctx.allowed("DELETE")) {
-            sendError(res, 403, "AccessDenied", "Insufficient permissions");
-            return;
-        }
-
         if (key.len == 0) {
             try handleDeleteBucket(ctx, allocator, res, bucket);
         } else if (hasQuery(req.query, "uploadId")) {
@@ -1717,22 +1706,12 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
             try handleDeleteObject(ctx, allocator, res, bucket, key);
         }
     } else if (std.mem.eql(u8, req.method, "HEAD")) {
-        if (!acl_ctx.allowed("HEAD")) {
-            sendError(res, 403, "AccessDenied", "Insufficient permissions");
-            return;
-        }
-
         if (key.len == 0) {
             try handleHeadBucket(ctx, allocator, res, bucket);
         } else {
             try handleHeadObject(ctx, allocator, res, bucket, key);
         }
     } else if (std.mem.eql(u8, req.method, "POST")) {
-        if (!acl_ctx.allowed("POST")) {
-            sendError(res, 403, "AccessDenied", "Insufficient permissions");
-            return;
-        }
-
         if (hasQuery(req.query, "delete")) {
             try handleDeleteObjects(ctx, allocator, req, res, bucket);
         } else if (hasQuery(req.query, "uploads")) {
@@ -1761,10 +1740,10 @@ pub const SigV4 = struct {
     };
 
     const ACLCtx = struct {
-        allow: bool,
+        authenticated: bool,
         role: acl.Role,
 
-        fn allowed(self: *const ACLCtx, method: []const u8) bool {
+        fn granted(self: *const ACLCtx, method: []const u8) bool {
             switch (self.role) {
                 acl.Role.Admin => {
                     return true;
@@ -1803,7 +1782,7 @@ pub const SigV4 = struct {
 
     fn verify(ctx: *const S3Context, req: *const Request, allocator: Allocator) ACLCtx {
         var acl_ctx = ACLCtx{
-            .allow = false,
+            .authenticated = false,
             .role = acl.Role.Unknown,
         };
 
@@ -1847,7 +1826,7 @@ pub const SigV4 = struct {
         defer allocator.free(calculated_sig);
 
         if (std.mem.eql(u8, calculated_sig, parsed.signature)) {
-            acl_ctx.allow = true;
+            acl_ctx.authenticated = true;
             acl_ctx.role = credential.?.role;
         }
 
