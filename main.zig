@@ -1,10 +1,11 @@
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const acl = @import("acl.zig");
+var app_io: std.Io = undefined;
 
 const MAX_HEADER_SIZE = 8 * 1024;
 const MAX_BODY_SIZE = 5 * 1024 * 1024 * 1024;
@@ -145,18 +146,18 @@ const CAS = struct {
         defer allocator.free(path);
 
         // Check if already exists (deduplication)
-        if (std.fs.cwd().access(path, .{})) |_| {
+        if (std.Io.Dir.cwd().access(app_io, path, .{})) |_| {
             return hash;
         } else |_| {}
 
         // Create parent directory (.cas/xx/)
         if (std.fs.path.dirname(path)) |dir| {
-            std.fs.cwd().makePath(dir) catch {};
+            std.Io.Dir.cwd().createDirPath(app_io, dir) catch {};
         }
 
-        var file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
-        try file.writeAll(data);
+        var file = try std.Io.Dir.cwd().createFile(app_io, path, .{});
+        defer file.close(app_io);
+        try file.writeStreamingAll(app_io, data);
 
         return hash;
     }
@@ -166,12 +167,12 @@ const CAS = struct {
         const path = try self.hashToPath(allocator, hash);
         defer allocator.free(path);
 
-        var file = std.fs.cwd().openFile(path, .{}) catch return error.NotFound;
-        defer file.close();
+        var file = std.Io.Dir.cwd().openFile(app_io, path, .{}) catch return error.NotFound;
+        defer file.close(app_io);
 
-        const stat = try file.stat();
+        const stat = try file.stat(app_io);
         const data = try allocator.alloc(u8, stat.size);
-        const bytes_read = try file.readAll(data);
+        const bytes_read = try file.readPositionalAll(app_io, data, 0);
         return data[0..bytes_read];
     }
 
@@ -179,7 +180,7 @@ const CAS = struct {
     pub fn exists(self: *const CAS, allocator: Allocator, hash: ContentHash) bool {
         const path = self.hashToPath(allocator, hash) catch return false;
         defer allocator.free(path);
-        return if (std.fs.cwd().access(path, .{})) |_| true else |_| false;
+        return if (std.Io.Dir.cwd().access(app_io, path, .{})) |_| true else |_| false;
     }
 
     /// Convert hash to filesystem path: .cas/xx/xxxx....blob
@@ -208,13 +209,13 @@ const CAS = struct {
         const index_path = try std.fs.path.join(allocator, &.{ meta_index.data_dir, ".index" });
         defer allocator.free(index_path);
 
-        var index_dir = std.fs.cwd().openDir(index_path, .{ .iterate = true }) catch {
+        var index_dir = std.Io.Dir.cwd().openDir(app_io, index_path, .{ .iterate = true }) catch {
             return .{ .scanned = 0, .deleted = 0 };
         };
-        defer index_dir.close();
+        defer index_dir.close(app_io);
 
         var bucket_iter = index_dir.iterate();
-        while (try bucket_iter.next()) |bucket_entry| {
+        while (try bucket_iter.next(app_io)) |bucket_entry| {
             if (bucket_entry.kind == .directory) {
                 try self.collectReferencedHashes(allocator, meta_index, bucket_entry.name, &referenced);
             }
@@ -224,26 +225,26 @@ const CAS = struct {
         const cas_path = try std.fs.path.join(allocator, &.{ self.data_dir, ".cas" });
         defer allocator.free(cas_path);
 
-        var cas_dir = std.fs.cwd().openDir(cas_path, .{ .iterate = true }) catch {
+        var cas_dir = std.Io.Dir.cwd().openDir(app_io, cas_path, .{ .iterate = true }) catch {
             return .{ .scanned = 0, .deleted = 0 };
         };
-        defer cas_dir.close();
+        defer cas_dir.close(app_io);
 
         var scanned: usize = 0;
         var deleted: usize = 0;
-        const now = std.time.timestamp();
+        const now = std.Io.Clock.real.now(app_io).toSeconds();
 
         var prefix_iter = cas_dir.iterate();
-        while (try prefix_iter.next()) |prefix_entry| {
+        while (try prefix_iter.next(app_io)) |prefix_entry| {
             if (prefix_entry.kind == .directory and prefix_entry.name.len == 2) {
                 const prefix_path = try std.fs.path.join(allocator, &.{ cas_path, prefix_entry.name });
                 defer allocator.free(prefix_path);
 
-                var blob_dir = std.fs.cwd().openDir(prefix_path, .{ .iterate = true }) catch continue;
-                defer blob_dir.close();
+                var blob_dir = std.Io.Dir.cwd().openDir(app_io, prefix_path, .{ .iterate = true }) catch continue;
+                defer blob_dir.close(app_io);
 
                 var blob_iter = blob_dir.iterate();
-                while (try blob_iter.next()) |blob_entry| {
+                while (try blob_iter.next(app_io)) |blob_entry| {
                     if (blob_entry.kind == .file and std.mem.endsWith(u8, blob_entry.name, ".blob")) {
                         scanned += 1;
 
@@ -264,18 +265,18 @@ const CAS = struct {
                             const blob_path = try std.fs.path.join(allocator, &.{ prefix_path, blob_entry.name });
                             defer allocator.free(blob_path);
 
-                            const file = std.fs.cwd().openFile(blob_path, .{}) catch continue;
-                            const stat = file.stat() catch {
-                                file.close();
+                            const file = std.Io.Dir.cwd().openFile(app_io, blob_path, .{}) catch continue;
+                            const stat = file.stat(app_io) catch {
+                                file.close(app_io);
                                 continue;
                             };
-                            file.close();
+                            file.close(app_io);
 
-                            const mtime_secs = @divFloor(stat.mtime, std.time.ns_per_s);
+                            const mtime_secs = stat.mtime.toSeconds();
                             const age = now - mtime_secs;
 
                             if (age > GC_GRACE_PERIOD_SECS) {
-                                std.fs.cwd().deleteFile(blob_path) catch continue;
+                                std.Io.Dir.cwd().deleteFile(app_io, blob_path) catch continue;
                                 deleted += 1;
                             }
                         }
@@ -298,11 +299,11 @@ const CAS = struct {
 
 /// Recursively collect hashes from metadata directory for GC reference counting
 fn collectHashesFromDir(allocator: Allocator, dir_path: []const u8, bucket: []const u8, prefix: []const u8, meta_index: *const MetaIndex, referenced: *std.AutoHashMap(ContentHash, void)) !void {
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+    var dir = std.Io.Dir.cwd().openDir(app_io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(app_io);
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(app_io)) |entry| {
         const full_name = if (prefix.len > 0)
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name })
         else
@@ -319,11 +320,11 @@ fn collectHashesFromDir(allocator: Allocator, dir_path: []const u8, bucket: []co
             const path = try meta_index.metaPath(allocator, bucket, key);
             defer allocator.free(path);
 
-            var file = std.fs.cwd().openFile(path, .{}) catch continue;
-            defer file.close();
+            var file = std.Io.Dir.cwd().openFile(app_io, path, .{}) catch continue;
+            defer file.close(app_io);
 
             var buf: [128]u8 = undefined;
-            const bytes_read = file.readAll(&buf) catch continue;
+            const bytes_read = file.readPositionalAll(app_io, &buf, 0) catch continue;
             const content = buf[0..bytes_read];
 
             var lines = std.mem.splitScalar(u8, content, '\n');
@@ -363,24 +364,24 @@ const MetaIndex = struct {
 
         // Create parent directories
         if (std.fs.path.dirname(path)) |dir| {
-            std.fs.cwd().makePath(dir) catch {};
+            std.Io.Dir.cwd().createDirPath(app_io, dir) catch {};
         }
 
-        var file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+        var file = try std.Io.Dir.cwd().createFile(app_io, path, .{});
+        defer file.close(app_io);
 
         // Format: hex_hash\nsize\ncreated\ndeleted\n[inline_data_base64]
         var hash_hex: [40]u8 = undefined;
         bytesToHex(&hash, &hash_hex);
-        const created = std.time.timestamp();
+        const created = std.Io.Clock.real.now(app_io).toSeconds();
 
         var buf: [128]u8 = undefined;
         const header = std.fmt.bufPrint(&buf, "{s}\n{d}\n{d}\n0\n", .{ hash_hex, size, created }) catch unreachable;
-        try file.writeAll(header);
+        try file.writeStreamingAll(app_io, header);
 
         // Write inline data if provided
         if (inline_data) |data| {
-            try file.writeAll(data);
+            try file.writeStreamingAll(app_io, data);
         }
     }
 
@@ -396,13 +397,13 @@ const MetaIndex = struct {
         const path = try self.metaPath(allocator, bucket, key);
         defer allocator.free(path);
 
-        var file = std.fs.cwd().openFile(path, .{}) catch return null;
-        defer file.close();
+        var file = std.Io.Dir.cwd().openFile(app_io, path, .{}) catch return null;
+        defer file.close(app_io);
 
-        const stat = try file.stat();
+        const stat = try file.stat(app_io);
         const content = try allocator.alloc(u8, stat.size);
         defer allocator.free(content);
-        _ = try file.readAll(content);
+        _ = try file.readPositionalAll(app_io, content, 0);
 
         // Parse: hex_hash\nsize\ncreated\ndeleted\n[inline_data]
         var lines = std.mem.splitScalar(u8, content, '\n');
@@ -455,7 +456,7 @@ const MetaIndex = struct {
             // Fallback: just delete the file if tombstone fails
             const path = self.metaPath(allocator, bucket, key) catch return;
             defer allocator.free(path);
-            std.fs.cwd().deleteFile(path) catch {};
+            std.Io.Dir.cwd().deleteFile(app_io, path) catch {};
         };
     }
 
@@ -465,10 +466,10 @@ const MetaIndex = struct {
         defer allocator.free(path);
 
         // Read existing metadata to preserve hash
-        var file = std.fs.cwd().openFile(path, .{}) catch return;
+        var file = std.Io.Dir.cwd().openFile(app_io, path, .{}) catch return;
         var buf: [128]u8 = undefined;
-        const bytes_read = file.readAll(&buf) catch return;
-        file.close();
+        const bytes_read = file.readPositionalAll(app_io, &buf, 0) catch return;
+        file.close(app_io);
         const content = buf[0..bytes_read];
 
         var lines = std.mem.splitScalar(u8, content, '\n');
@@ -477,13 +478,13 @@ const MetaIndex = struct {
         const created_str = lines.next() orelse return;
 
         // Rewrite with tombstone timestamp
-        var out_file = try std.fs.cwd().createFile(path, .{});
-        defer out_file.close();
+        var out_file = try std.Io.Dir.cwd().createFile(app_io, path, .{});
+        defer out_file.close(app_io);
 
-        const deleted = std.time.timestamp();
+        const deleted = std.Io.Clock.real.now(app_io).toSeconds();
         var out_buf: [128]u8 = undefined;
         const new_content = std.fmt.bufPrint(&out_buf, "{s}\n{s}\n{s}\n{d}\n", .{ hash_hex, size_str, created_str, deleted }) catch unreachable;
-        try out_file.writeAll(new_content);
+        try out_file.writeStreamingAll(app_io, new_content);
     }
 
     /// Check if entry is a tombstone (for cleanup)
@@ -491,11 +492,11 @@ const MetaIndex = struct {
         const path = self.metaPath(allocator, bucket, key) catch return false;
         defer allocator.free(path);
 
-        var file = std.fs.cwd().openFile(path, .{}) catch return false;
-        defer file.close();
+        var file = std.Io.Dir.cwd().openFile(app_io, path, .{}) catch return false;
+        defer file.close(app_io);
 
         var buf: [128]u8 = undefined;
-        const bytes_read = file.readAll(&buf) catch return false;
+        const bytes_read = file.readPositionalAll(app_io, &buf, 0) catch return false;
         const content = buf[0..bytes_read];
 
         var lines = std.mem.splitScalar(u8, content, '\n');
@@ -510,15 +511,15 @@ const MetaIndex = struct {
 
     /// Cleanup expired tombstones
     pub fn cleanupTombstones(self: *const MetaIndex, allocator: Allocator) !void {
-        const now = std.time.timestamp();
+        const now = std.Io.Clock.real.now(app_io).toSeconds();
         const index_path = try std.fs.path.join(allocator, &.{ self.data_dir, ".index" });
         defer allocator.free(index_path);
 
-        var dir = std.fs.cwd().openDir(index_path, .{ .iterate = true }) catch return;
-        defer dir.close();
+        var dir = std.Io.Dir.cwd().openDir(app_io, index_path, .{ .iterate = true }) catch return;
+        defer dir.close(app_io);
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(app_io)) |entry| {
             if (entry.kind == .directory) {
                 try self.cleanupBucketTombstones(allocator, entry.name, now);
             }
@@ -533,11 +534,11 @@ const MetaIndex = struct {
     }
 
     fn cleanupDirTombstones(self: *const MetaIndex, allocator: Allocator, dir_path: []const u8, bucket: []const u8, prefix: []const u8, now: i64) !void {
-        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-        defer dir.close();
+        var dir = std.Io.Dir.cwd().openDir(app_io, dir_path, .{ .iterate = true }) catch return;
+        defer dir.close(app_io);
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(app_io)) |entry| {
             const full_name = if (prefix.len > 0)
                 try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name })
             else
@@ -555,7 +556,7 @@ const MetaIndex = struct {
                     if (age > TOMBSTONE_TTL_SECS) {
                         const path = try self.metaPath(allocator, bucket, key);
                         defer allocator.free(path);
-                        std.fs.cwd().deleteFile(path) catch {};
+                        std.Io.Dir.cwd().deleteFile(app_io, path) catch {};
                     }
                 }
             }
@@ -566,11 +567,11 @@ const MetaIndex = struct {
         const path = self.metaPath(allocator, bucket, key) catch return null;
         defer allocator.free(path);
 
-        var file = std.fs.cwd().openFile(path, .{}) catch return null;
-        defer file.close();
+        var file = std.Io.Dir.cwd().openFile(app_io, path, .{}) catch return null;
+        defer file.close(app_io);
 
         var buf: [128]u8 = undefined;
-        const bytes_read = file.readAll(&buf) catch return null;
+        const bytes_read = file.readPositionalAll(app_io, &buf, 0) catch return null;
         const content = buf[0..bytes_read];
 
         var lines = std.mem.splitScalar(u8, content, '\n');
@@ -594,7 +595,7 @@ const MetaIndex = struct {
 /// Peer information for DHT
 const PeerInfo = struct {
     id: NodeId,
-    address: net.Address,
+    address: net.IpAddress,
     last_seen: i64,
     content_count: u32,
 };
@@ -624,7 +625,7 @@ const Kademlia = struct {
                 if (slot.*) |*p| {
                     if (std.mem.eql(u8, &p.id, &peer.id)) {
                         p.* = peer;
-                        self.last_updated = std.time.timestamp();
+                        self.last_updated = std.Io.Clock.real.now(app_io).toSeconds();
                         return;
                     }
                 }
@@ -636,7 +637,7 @@ const Kademlia = struct {
                     if (slot.* == null) {
                         slot.* = peer;
                         self.count += 1;
-                        self.last_updated = std.time.timestamp();
+                        self.last_updated = std.Io.Clock.real.now(app_io).toSeconds();
                         return;
                     }
                 }
@@ -654,7 +655,7 @@ const Kademlia = struct {
                 }
             }
             self.peers[oldest_idx] = peer;
-            self.last_updated = std.time.timestamp();
+            self.last_updated = std.Io.Clock.real.now(app_io).toSeconds();
         }
 
         /// Remove peer from bucket
@@ -960,10 +961,9 @@ const DistributedContext = struct {
     }
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    app_io = init.io;
+    const allocator = init.gpa;
 
     // Parse CLI arguments
     var distributed_enabled = false;
@@ -974,7 +974,8 @@ pub fn main() !void {
     var raw_acl_list: []const u8 = build_options.acl_list;
     var show_help: bool = false;
 
-    var args = std.process.args();
+    var args = try init.minimal.args.iterateAllocator(allocator);
+    defer args.deinit();
     _ = args.skip(); // Skip program name
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--distributed") or std.mem.eql(u8, arg, "-d")) {
@@ -1043,7 +1044,7 @@ pub fn main() !void {
         std.log.warn("Using built-in default credentials (admin:minioadmin:minioadmin) — DO NOT USE IN PRODUCTION", .{});
     }
 
-    std.fs.cwd().makeDir(data_dir) catch |err| switch (err) {
+    std.Io.Dir.cwd().createDir(app_io, data_dir, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -1071,7 +1072,7 @@ pub fn main() !void {
         const dot_cas_path = try std.fs.path.join(allocator, &[_][]const u8{ data_dir, ".cas" });
         defer allocator.free(dot_cas_path);
 
-        std.fs.cwd().makeDir(dot_cas_path) catch |err| switch (err) {
+        std.Io.Dir.cwd().createDir(app_io, dot_cas_path, .default_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => {
                 return error.FailedDataDirDotCasCreation;
@@ -1081,7 +1082,7 @@ pub fn main() !void {
         const dot_index_path = try std.fs.path.join(allocator, &[_][]const u8{ data_dir, ".index" });
         defer allocator.free(dot_index_path);
 
-        std.fs.cwd().makeDir(dot_index_path) catch |err| switch (err) {
+        std.Io.Dir.cwd().createDir(app_io, dot_index_path, .default_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => {
                 return error.FailedDataDirDotIndexCreation;
@@ -1111,9 +1112,9 @@ pub fn main() !void {
     };
     defer ctx.deinit();
 
-    const address = net.Address.parseIp4("0.0.0.0", port) catch unreachable;
-    var server = try address.listen(.{ .reuse_address = true });
-    defer server.deinit();
+    const address = net.IpAddress.parseIp4("0.0.0.0", port) catch unreachable;
+    var server = try address.listen(app_io, .{ .reuse_address = true });
+    defer server.deinit(app_io);
 
     if (distributed_enabled) {
         std.log.info("dS3 server listening on http://0.0.0.0:{d}", .{port});
@@ -1134,30 +1135,50 @@ fn getOrCreateNodeId(allocator: Allocator, data_dir: []const u8) !NodeId {
     defer allocator.free(id_path);
 
     // Try to load existing ID
-    if (std.fs.cwd().openFile(id_path, .{})) |file| {
-        defer file.close();
+    if (std.Io.Dir.cwd().openFile(app_io, id_path, .{})) |file| {
+        defer file.close(app_io);
         var id: NodeId = undefined;
-        const n = file.readAll(&id) catch return error.InvalidNodeId;
+        const n = file.readPositionalAll(app_io, &id, 0) catch return error.InvalidNodeId;
         if (n == 20) return id;
     } else |_| {}
 
     // Generate new random ID
     var id: NodeId = undefined;
-    std.crypto.random.bytes(&id);
+    try app_io.randomSecure(&id);
 
     // Save it
-    if (std.fs.cwd().createFile(id_path, .{})) |file| {
-        defer file.close();
-        file.writeAll(&id) catch {};
+    if (std.Io.Dir.cwd().createFile(app_io, id_path, .{})) |file| {
+        defer file.close(app_io);
+        file.writeStreamingAll(app_io, &id) catch {};
     } else |_| {}
 
     return id;
 }
 
-fn setNonBlocking(fd: posix.fd_t) void {
-    const O_NONBLOCK: usize = if (builtin.os.tag == .macos) 0x0004 else 0x800;
-    const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return;
-    _ = posix.fcntl(fd, posix.F.SETFL, flags | O_NONBLOCK) catch {};
+fn streamRead(stream: net.Stream, buffer: []u8) !usize {
+    var buffers = [1][]u8{buffer};
+    return app_io.vtable.netRead(app_io.userdata, stream.socket.handle, &buffers);
+}
+
+fn streamWriteAll(stream: net.Stream, bytes: []const u8) !void {
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const data = [1][]const u8{bytes[written..]};
+        const n = try app_io.vtable.netWrite(
+            app_io.userdata,
+            stream.socket.handle,
+            "",
+            &data,
+            1,
+        );
+        if (n == 0) return error.ConnectionResetByPeer;
+        written += n;
+    }
+}
+
+fn readToEndAlloc(file: std.Io.File, allocator: Allocator, max_size: usize) ![]u8 {
+    var file_reader = file.reader(app_io, &.{});
+    return file_reader.interface.allocRemaining(allocator, .limited(max_size));
 }
 
 fn eventLoopEpoll(allocator: Allocator, ctx: *const S3Context, server: *net.Server) !void {
@@ -1166,9 +1187,8 @@ fn eventLoopEpoll(allocator: Allocator, ctx: *const S3Context, server: *net.Serv
     if (@as(isize, @bitCast(epfd)) < 0) return error.EpollCreate;
     defer _ = linux.close(@intCast(epfd));
 
-    setNonBlocking(server.stream.handle);
-    var ev = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .fd = server.stream.handle } };
-    if (@as(isize, @bitCast(linux.epoll_ctl(@intCast(epfd), linux.EPOLL.CTL_ADD, server.stream.handle, &ev))) < 0)
+    var ev = linux.epoll_event{ .events = linux.EPOLL.IN, .data = .{ .fd = server.socket.handle } };
+    if (@as(isize, @bitCast(linux.epoll_ctl(@intCast(epfd), linux.EPOLL.CTL_ADD, server.socket.handle, &ev))) < 0)
         return error.EpollCtl;
 
     var events: [MAX_CONNECTIONS]linux.epoll_event = undefined;
@@ -1178,17 +1198,15 @@ fn eventLoopEpoll(allocator: Allocator, ctx: *const S3Context, server: *net.Serv
         if (@as(isize, @bitCast(n)) < 0) continue;
 
         for (events[0..n]) |event| {
-            if (event.data.fd == server.stream.handle) {
-                while (true) {
-                    const conn = server.accept() catch break;
-                    var cev = linux.epoll_event{ .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT, .data = .{ .fd = conn.stream.handle } };
-                    _ = linux.epoll_ctl(@intCast(epfd), linux.EPOLL.CTL_ADD, conn.stream.handle, &cev);
-                }
+            if (event.data.fd == server.socket.handle) {
+                const conn = server.accept(app_io) catch continue;
+                var cev = linux.epoll_event{ .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT, .data = .{ .fd = conn.socket.handle } };
+                _ = linux.epoll_ctl(@intCast(epfd), linux.EPOLL.CTL_ADD, conn.socket.handle, &cev);
             } else {
-                const stream = net.Stream{ .handle = event.data.fd };
+                const stream = net.Stream{ .socket = .{ .handle = event.data.fd, .address = .{ .ip4 = .unspecified(0) } } };
                 _ = handleConnectionWithStream(allocator, ctx, stream) catch {};
                 _ = linux.epoll_ctl(@intCast(epfd), linux.EPOLL.CTL_DEL, event.data.fd, null);
-                stream.close();
+                stream.close(app_io);
             }
         }
     }
@@ -1200,9 +1218,7 @@ fn eventLoopKqueue(allocator: Allocator, ctx: *const S3Context, server: *net.Ser
     if (kq < 0) return error.Kqueue;
     defer _ = c.close(kq);
 
-    const server_fd = server.stream.handle;
-    setNonBlocking(server_fd);
-
+    const server_fd = server.socket.handle;
     var changes: [1]c.Kevent = .{.{
         .ident = @intCast(server_fd),
         .filter = c.EVFILT.READ,
@@ -1221,22 +1237,19 @@ fn eventLoopKqueue(allocator: Allocator, ctx: *const S3Context, server: *net.Ser
         for (events[0..@intCast(nev)]) |ev| {
             const fd: posix.fd_t = @intCast(ev.ident);
             if (fd == server_fd) {
-                while (true) {
-                    const conn = server.accept() catch break;
-                    var add: [1]c.Kevent = .{.{
-                        .ident = @intCast(conn.stream.handle),
-                        .filter = c.EVFILT.READ,
-                        .flags = c.EV.ADD | c.EV.ONESHOT,
-                        .fflags = 0,
-                        .data = 0,
-                        .udata = 0,
-                    }};
-                    const r = c.kevent(kq, &add, 1, &events, 0, null);
-                    if (r < 0) std.log.err("kevent add failed", .{});
-                }
+                const conn = server.accept(app_io) catch continue;
+                var add: [1]c.Kevent = .{.{
+                    .ident = @intCast(conn.socket.handle),
+                    .filter = c.EVFILT.READ,
+                    .flags = c.EV.ADD | c.EV.ONESHOT,
+                    .fflags = 0,
+                    .data = 0,
+                    .udata = 0,
+                }};
+                const r = c.kevent(kq, &add, 1, &events, 0, null);
+                if (r < 0) std.log.err("kevent add failed", .{});
             } else {
-                setNonBlocking(fd);
-                const stream = net.Stream{ .handle = fd };
+                const stream = net.Stream{ .socket = .{ .handle = fd, .address = .{ .ip4 = .unspecified(0) } } };
                 const keep = handleConnectionWithStream(allocator, ctx, stream) catch false;
                 if (keep) {
                     var add: [1]c.Kevent = .{.{
@@ -1249,7 +1262,7 @@ fn eventLoopKqueue(allocator: Allocator, ctx: *const S3Context, server: *net.Ser
                     }};
                     _ = c.kevent(kq, &add, 1, &events, 0, null);
                 } else {
-                    stream.close();
+                    stream.close(app_io);
                 }
             }
         }
@@ -1298,7 +1311,7 @@ const Response = struct {
     status_text: []const u8 = "OK",
     headers: std.ArrayListUnmanaged(Header) = .empty,
     body: []const u8 = "",
-    send_file: ?std.fs.File = null,
+    send_file: ?std.Io.File = null,
     send_file_size: usize = 0,
     send_file_offset: usize = 0,
     allocator: Allocator,
@@ -1313,7 +1326,7 @@ const Response = struct {
 
     fn deinit(self: *Response) void {
         self.headers.deinit(self.allocator);
-        if (self.send_file) |f| f.close();
+        if (self.send_file) |f| f.close(app_io);
     }
 
     fn setHeader(self: *Response, name: []const u8, value: []const u8) void {
@@ -1335,7 +1348,7 @@ const Response = struct {
         self.body = body;
     }
 
-    fn setSendFile(self: *Response, file: std.fs.File, size: usize, offset: usize) void {
+    fn setSendFile(self: *Response, file: std.Io.File, size: usize, offset: usize) void {
         self.send_file = file;
         self.send_file_size = size;
         self.send_file_offset = offset;
@@ -1343,8 +1356,7 @@ const Response = struct {
 
     fn write(self: *Response, stream: net.Stream) !void {
         var buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(&buf);
 
         try w.print("HTTP/1.1 {d} {s}\r\n", .{ self.status, self.status_text });
 
@@ -1369,7 +1381,7 @@ const Response = struct {
         }
         try w.writeAll("\r\n");
 
-        try stream.writeAll(fbs.getWritten());
+        try streamWriteAll(stream, w.buffered());
 
         if (self.send_file) |file| {
             // Use sendfile for zero-copy transfer
@@ -1378,7 +1390,7 @@ const Response = struct {
                 var remaining: usize = self.send_file_size;
                 while (remaining > 0) {
                     var len: i64 = @intCast(remaining);
-                    const rc = std.c.sendfile(file.handle, stream.handle, offset, &len, null, 0);
+                    const rc = std.c.sendfile(file.handle, stream.socket.handle, offset, &len, null, 0);
                     if (len > 0) {
                         offset += len;
                         remaining -= @intCast(len);
@@ -1386,7 +1398,7 @@ const Response = struct {
                     if (rc == -1) {
                         const e = std.c._errno().*;
                         if (e == @intFromEnum(std.posix.E.AGAIN) or e == @intFromEnum(std.posix.E.INTR)) {
-                            std.Thread.sleep(1_000_000); // 1ms
+                            app_io.sleep(.fromMilliseconds(1), .awake) catch {}; // 1ms
                             continue;
                         }
                         break;
@@ -1396,26 +1408,14 @@ const Response = struct {
                 var offset: i64 = @intCast(self.send_file_offset);
                 var remaining: usize = self.send_file_size;
                 while (remaining > 0) {
-                    const rc = std.os.linux.sendfile(stream.handle, file.handle, &offset, remaining);
+                    const rc = std.os.linux.sendfile(stream.socket.handle, file.handle, &offset, remaining);
                     const sent = @as(isize, @bitCast(rc));
                     if (sent <= 0) break;
                     remaining -= @intCast(sent);
                 }
             }
         } else if (self.body.len > 0) {
-            // Custom write loop to handle WouldBlock on non-blocking sockets
-            var written: usize = 0;
-            while (written < self.body.len) {
-                const n = posix.write(stream.handle, self.body[written..]) catch |err| switch (err) {
-                    error.WouldBlock => {
-                        std.Thread.sleep(1_000_000); // 1ms
-                        continue;
-                    },
-                    else => return err,
-                };
-                if (n == 0) return error.ConnectionResetByPeer;
-                written += n;
-            }
+            try streamWriteAll(stream, self.body);
         }
     }
 };
@@ -1458,7 +1458,7 @@ fn parseRequestFromBuf(allocator: Allocator, data: []const u8, stream: net.Strea
             // Handle Expect: 100-continue - send 100 Continue before reading body
             if (headers.get("expect")) |expect| {
                 if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
-                    stream.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch {};
+                    streamWriteAll(stream, "HTTP/1.1 100 Continue\r\n\r\n") catch {};
                 }
             }
 
@@ -1476,10 +1476,10 @@ fn parseRequestFromBuf(allocator: Allocator, data: []const u8, stream: net.Strea
             var remaining = content_length - bytes_to_copy;
             var offset = bytes_to_copy;
             while (remaining > 0) {
-                const n = stream.read(body_buf[offset..]) catch |err| {
+                const n = streamRead(stream, body_buf[offset..]) catch |err| {
                     // Handle non-blocking sockets - retry on WouldBlock
                     if (err == error.WouldBlock) {
-                        std.Thread.sleep(1_000_000); // 1ms sleep before retry
+                        app_io.sleep(.fromMilliseconds(1), .awake) catch {}; // 1ms sleep before retry
                         continue;
                     }
                     return err;
@@ -1554,7 +1554,7 @@ fn handleConnectionWithStream(allocator: Allocator, ctx: *const S3Context, strea
     var total_read: usize = 0;
 
     while (total_read < buf.len) {
-        const n = stream.read(buf[total_read..]) catch return false;
+        const n = streamRead(stream, buf[total_read..]) catch return false;
         if (n == 0) return false;
         total_read += n;
         if (findHeaderEnd(buf[0..total_read])) |_| break;
@@ -1566,7 +1566,7 @@ fn handleConnectionWithStream(allocator: Allocator, ctx: *const S3Context, strea
     // Allow peer protocol endpoints without auth
     const is_peer_protocol = if (std.mem.indexOf(u8, data, "/_zs3/")) |_| true else false;
     if (!is_peer_protocol and !hasAuth(data)) {
-        _ = stream.write(ERROR_403) catch return false;
+        streamWriteAll(stream, ERROR_403) catch return false;
         return true;
     }
 
@@ -2051,16 +2051,16 @@ fn handlePutObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     defer allocator.free(path);
 
     if (std.fs.path.dirname(path)) |dir| {
-        std.fs.cwd().makePath(dir) catch {};
+        std.Io.Dir.cwd().createDirPath(app_io, dir) catch {};
     }
 
-    var file = std.fs.cwd().createFile(path, .{}) catch {
+    var file = std.Io.Dir.cwd().createFile(app_io, path, .{}) catch {
         sendError(res, 500, "InternalError", "Cannot create file");
         return;
     };
-    defer file.close();
+    defer file.close(app_io);
 
-    file.writeAll(req.body) catch {
+    file.writeStreamingAll(app_io, req.body) catch {
         sendError(res, 500, "InternalError", "Cannot write file");
         return;
     };
@@ -2085,19 +2085,19 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     const path = try ctx.objectPath(allocator, bucket, effective_key);
     defer allocator.free(path);
 
-    var file = std.fs.cwd().openFile(path, .{}) catch {
+    var file = std.Io.Dir.cwd().openFile(app_io, path, .{}) catch {
         sendError(res, 404, "NoSuchKey", "Object not found");
         return;
     };
 
-    const stat = file.stat() catch {
-        file.close();
+    const stat = file.stat(app_io) catch {
+        file.close(app_io);
         sendError(res, 500, "InternalError", "Stat failed");
         return;
     };
 
-    const last_modified = allocHttpDate(allocator, @intCast(@divFloor(stat.mtime, std.time.ns_per_s))) catch {
-        file.close();
+    const last_modified = allocHttpDate(allocator, @intCast(stat.mtime.toSeconds())) catch {
+        file.close(app_io);
         sendError(res, 500, "InternalError", "Date format failed");
         return;
     };
@@ -2108,7 +2108,7 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
             const len = range.end - range.start + 1;
 
             const content_range = std.fmt.allocPrint(allocator, "bytes {d}-{d}/{d}", .{ range.start, range.end, stat.size }) catch {
-                file.close();
+                file.close(app_io);
                 sendError(res, 500, "InternalError", "Range format failed");
                 return;
             };
@@ -2124,12 +2124,12 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     }
 
     // For full file, read content to compute ETag
-    const content = file.readToEndAlloc(allocator, MAX_BODY_SIZE) catch {
-        file.close();
+    const content = readToEndAlloc(file, allocator, MAX_BODY_SIZE) catch {
+        file.close(app_io);
         sendError(res, 500, "InternalError", "Read failed");
         return;
     };
-    file.close();
+    file.close(app_io);
 
     const hash = std.hash.Wyhash.hash(0, content);
     const etag = std.fmt.allocPrint(allocator, "\"{x}\"", .{hash}) catch {
@@ -2158,7 +2158,7 @@ fn handleDeleteObject(ctx: *const S3Context, allocator: Allocator, res: *Respons
 }
 
 fn deleteObjectInternal(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, path: []const u8) void {
-    std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+    std.Io.Dir.cwd().deleteFile(app_io, path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => std.log.warn("delete failed: {}", .{err}),
     };
@@ -2170,7 +2170,7 @@ fn deleteObjectInternal(ctx: *const S3Context, allocator: Allocator, bucket: []c
     var dir_path = std.fs.path.dirname(path);
     while (dir_path) |dp| {
         if (dp.len <= bucket_path.len) break;
-        std.fs.cwd().deleteDir(dp) catch break;
+        std.Io.Dir.cwd().deleteDir(app_io, dp) catch break;
         dir_path = std.fs.path.dirname(dp);
     }
 }
@@ -2225,19 +2225,19 @@ fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, res: *Response,
     const path = try ctx.objectPath(allocator, bucket, effective_key);
     defer allocator.free(path);
 
-    var file = std.fs.cwd().openFile(path, .{}) catch {
+    var file = std.Io.Dir.cwd().openFile(app_io, path, .{}) catch {
         sendError(res, 404, "NoSuchKey", "Object not found");
         return;
     };
-    defer file.close();
+    defer file.close(app_io);
 
-    const stat = file.stat() catch {
+    const stat = file.stat(app_io) catch {
         sendError(res, 500, "InternalError", "Stat failed");
         return;
     };
 
     // Compute ETag from file content (same as PUT uses)
-    const content = file.readToEndAlloc(allocator, MAX_BODY_SIZE) catch {
+    const content = readToEndAlloc(file, allocator, MAX_BODY_SIZE) catch {
         sendError(res, 500, "InternalError", "Read failed");
         return;
     };
@@ -2254,7 +2254,7 @@ fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, res: *Response,
         return;
     };
 
-    const last_modified = allocHttpDate(allocator, @intCast(@divFloor(stat.mtime, std.time.ns_per_s))) catch {
+    const last_modified = allocHttpDate(allocator, @intCast(stat.mtime.toSeconds())) catch {
         sendError(res, 500, "InternalError", "Date format failed");
         return;
     };
@@ -2287,11 +2287,11 @@ fn handleListObjects(ctx: *const S3Context, allocator: Allocator, req: *Request,
     const bucket_path = try ctx.bucketPath(allocator, bucket);
     defer allocator.free(bucket_path);
 
-    var dir = std.fs.cwd().openDir(bucket_path, .{ .iterate = true }) catch {
+    var dir = std.Io.Dir.cwd().openDir(app_io, bucket_path, .{ .iterate = true }) catch {
         sendError(res, 404, "NoSuchBucket", "Bucket not found");
         return;
     };
-    defer dir.close();
+    defer dir.close(app_io);
 
     var xml: std.ArrayListUnmanaged(u8) = .empty;
     defer xml.deinit(allocator);
@@ -2412,11 +2412,11 @@ fn collectKeys(allocator: Allocator, base_path: []const u8, current_prefix: []co
         try allocator.dupe(u8, base_path);
     defer allocator.free(full_path);
 
-    var dir = std.fs.cwd().openDir(full_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+    var dir = std.Io.Dir.cwd().openDir(app_io, full_path, .{ .iterate = true }) catch return;
+    defer dir.close(app_io);
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(app_io)) |entry| {
         if (entry.name[0] == '.') continue;
 
         const full_key = if (current_prefix.len > 0)
@@ -2438,8 +2438,8 @@ fn collectKeys(allocator: Allocator, base_path: []const u8, current_prefix: []co
             if (filter_prefix.len == 0 or std.mem.startsWith(u8, report_key, filter_prefix)) {
                 // Use statFile instead of open+stat+close - much faster
                 const size, const mtime = blk: {
-                    const stat = dir.statFile(entry.name) catch break :blk .{ 0, @as(i64, 0) };
-                    break :blk .{ stat.size, @as(i64, @intCast(@divFloor(stat.mtime, std.time.ns_per_s))) };
+                    const stat = dir.statFile(app_io, entry.name, .{}) catch break :blk .{ 0, @as(i64, 0) };
+                    break :blk .{ stat.size, @as(i64, @intCast(stat.mtime.toSeconds())) };
                 };
                 try keys.append(allocator, .{ .key = report_key, .size = size, .mtime = mtime });
             } else {
@@ -2453,7 +2453,7 @@ fn handleCreateBucket(ctx: *const S3Context, allocator: Allocator, res: *Respons
     const path = try ctx.bucketPath(allocator, bucket);
     defer allocator.free(path);
 
-    std.fs.cwd().makeDir(path) catch |err| switch (err) {
+    std.Io.Dir.cwd().createDir(app_io, path, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
             sendError(res, 500, "InternalError", "Cannot create bucket");
@@ -2468,11 +2468,11 @@ fn handleHeadBucket(ctx: *const S3Context, allocator: Allocator, res: *Response,
     const path = try ctx.bucketPath(allocator, bucket);
     defer allocator.free(path);
 
-    var dir = std.fs.cwd().openDir(path, .{}) catch {
+    var dir = std.Io.Dir.cwd().openDir(app_io, path, .{}) catch {
         sendError(res, 404, "NoSuchBucket", "Bucket not found");
         return;
     };
-    dir.close();
+    dir.close(app_io);
 
     res.ok();
 }
@@ -2481,7 +2481,7 @@ fn handleDeleteBucket(ctx: *const S3Context, allocator: Allocator, res: *Respons
     const path = try ctx.bucketPath(allocator, bucket);
     defer allocator.free(path);
 
-    std.fs.cwd().deleteDir(path) catch |err| switch (err) {
+    std.Io.Dir.cwd().deleteDir(app_io, path) catch |err| switch (err) {
         error.DirNotEmpty => {
             sendError(res, 409, "BucketNotEmpty", "Bucket is not empty");
             return;
@@ -2497,11 +2497,11 @@ fn handleDeleteBucket(ctx: *const S3Context, allocator: Allocator, res: *Respons
 }
 
 fn handleListBuckets(ctx: *const S3Context, allocator: Allocator, res: *Response) !void {
-    var dir = std.fs.cwd().openDir(ctx.data_dir, .{ .iterate = true }) catch {
+    var dir = std.Io.Dir.cwd().openDir(app_io, ctx.data_dir, .{ .iterate = true }) catch {
         sendError(res, 500, "InternalError", "Cannot open data dir");
         return;
     };
-    defer dir.close();
+    defer dir.close(app_io);
 
     var xml: std.ArrayListUnmanaged(u8) = .empty;
     defer xml.deinit(allocator);
@@ -2512,7 +2512,7 @@ fn handleListBuckets(ctx: *const S3Context, allocator: Allocator, res: *Response
     try xml.appendSlice(allocator, "<Buckets>");
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(app_io)) |entry| {
         if (entry.kind != .directory) continue;
         if (entry.name[0] == '.') continue;
 
@@ -2520,8 +2520,8 @@ fn handleListBuckets(ctx: *const S3Context, allocator: Allocator, res: *Response
         try xmlEscape(allocator, &xml, entry.name);
         try xml.appendSlice(allocator, "</Name><CreationDate>");
         const mtime: i64 = blk: {
-            const stat = dir.statFile(entry.name) catch break :blk 0;
-            break :blk @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
+            const stat = dir.statFile(app_io, entry.name, .{}) catch break :blk 0;
+            break :blk @intCast(stat.mtime.toSeconds());
         };
         var iso_buf: [20]u8 = undefined;
         formatIso8601(&iso_buf, mtime);
@@ -2537,25 +2537,25 @@ fn handleListBuckets(ctx: *const S3Context, allocator: Allocator, res: *Response
 
 fn handleInitiateMultipart(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, key: []const u8) !void {
     // Generate unique upload ID using timestamp + random bytes to prevent collision
-    const timestamp: u64 = @intCast(std.time.timestamp());
+    const timestamp: u64 = @intCast(std.Io.Clock.real.now(app_io).toSeconds());
     var random_bytes: [8]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    try app_io.randomSecure(&random_bytes);
     const random_suffix = std.mem.readInt(u64, &random_bytes, .little);
     var upload_id_buf: [32]u8 = undefined;
     const upload_id = std.fmt.bufPrint(&upload_id_buf, "{x}{x}", .{ timestamp, random_suffix }) catch unreachable;
 
     const parts_dir = std.fmt.allocPrint(allocator, "{s}/.uploads/{s}", .{ ctx.data_dir, upload_id }) catch return;
     defer allocator.free(parts_dir);
-    std.fs.cwd().makePath(parts_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(app_io, parts_dir) catch {};
 
     const meta_path = std.fmt.allocPrint(allocator, "{s}/.uploads/{s}/.meta", .{ ctx.data_dir, upload_id }) catch return;
     defer allocator.free(meta_path);
 
-    var meta_file = std.fs.cwd().createFile(meta_path, .{}) catch return;
-    defer meta_file.close();
+    var meta_file = std.Io.Dir.cwd().createFile(app_io, meta_path, .{}) catch return;
+    defer meta_file.close(app_io);
     const meta_content = std.fmt.allocPrint(allocator, "{s}\n{s}", .{ bucket, key }) catch return;
     defer allocator.free(meta_content);
-    meta_file.writeAll(meta_content) catch {};
+    meta_file.writeStreamingAll(app_io, meta_content) catch {};
 
     var xml: std.ArrayListUnmanaged(u8) = .empty;
     defer xml.deinit(allocator);
@@ -2598,13 +2598,13 @@ fn handleUploadPart(ctx: *const S3Context, allocator: Allocator, req: *Request, 
     const part_path = std.fmt.allocPrint(allocator, "{s}/.uploads/{s}/{s}", .{ ctx.data_dir, upload_id, part_number }) catch return;
     defer allocator.free(part_path);
 
-    var file = std.fs.cwd().createFile(part_path, .{}) catch {
+    var file = std.Io.Dir.cwd().createFile(app_io, part_path, .{}) catch {
         sendError(res, 500, "InternalError", "Cannot create part file");
         return;
     };
-    defer file.close();
+    defer file.close(app_io);
 
-    file.writeAll(req.body) catch {
+    file.writeStreamingAll(app_io, req.body) catch {
         sendError(res, 500, "InternalError", "Cannot write part");
         return;
     };
@@ -2636,28 +2636,28 @@ fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Re
     defer allocator.free(final_path);
 
     if (std.fs.path.dirname(final_path)) |dir| {
-        std.fs.cwd().makePath(dir) catch |err| {
+        std.Io.Dir.cwd().createDirPath(app_io, dir) catch |err| {
             std.log.warn("makePath failed: {}", .{err});
         };
     }
 
-    var final_file = std.fs.cwd().createFile(final_path, .{}) catch {
+    var final_file = std.Io.Dir.cwd().createFile(app_io, final_path, .{}) catch {
         sendError(res, 500, "InternalError", "Cannot create final file");
         return;
     };
-    defer final_file.close();
+    defer final_file.close(app_io);
 
-    var dir = std.fs.cwd().openDir(parts_dir, .{ .iterate = true }) catch {
+    var dir = std.Io.Dir.cwd().openDir(app_io, parts_dir, .{ .iterate = true }) catch {
         sendError(res, 404, "NoSuchUpload", "Upload not found");
         return;
     };
-    defer dir.close();
+    defer dir.close(app_io);
 
     var parts: std.ArrayListUnmanaged(u32) = .empty;
     defer parts.deinit(allocator);
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(app_io)) |entry| {
         if (entry.kind == .file and entry.name[0] != '.') {
             const num = std.fmt.parseInt(u32, entry.name, 10) catch continue;
             try parts.append(allocator, num);
@@ -2678,18 +2678,18 @@ fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Re
         };
         defer allocator.free(part_path);
 
-        var part_file = std.fs.cwd().openFile(part_path, .{}) catch |err| {
+        var part_file = std.Io.Dir.cwd().openFile(app_io, part_path, .{}) catch |err| {
             std.log.warn("failed to open part {d}: {}", .{ part_num, err });
             continue;
         };
-        defer part_file.close();
+        defer part_file.close(app_io);
 
-        const stat = part_file.stat() catch continue;
+        const stat = part_file.stat(app_io) catch continue;
         const data = allocator.alloc(u8, stat.size) catch continue;
         defer allocator.free(data);
 
-        const bytes_read = part_file.readAll(data) catch continue;
-        final_file.writeAll(data[0..bytes_read]) catch |err| {
+        const bytes_read = part_file.readPositionalAll(app_io, data, 0) catch continue;
+        final_file.writeStreamingAll(app_io, data[0..bytes_read]) catch |err| {
             std.log.warn("failed to write part {d}: {}", .{ part_num, err });
             continue;
         };
@@ -2700,18 +2700,18 @@ fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Re
         parts_assembled += 1;
     }
 
-    std.fs.cwd().deleteTree(parts_dir) catch |err| {
+    std.Io.Dir.cwd().deleteTree(app_io, parts_dir) catch |err| {
         std.log.warn("failed to cleanup upload dir: {}", .{err});
     };
 
     // In distributed mode, index the assembled file so distributed GET can find it
     if (ctx.distributed) |dist| {
         const assembled = blk: {
-            var f = std.fs.cwd().openFile(final_path, .{}) catch break :blk null;
-            defer f.close();
-            const stat = f.stat() catch break :blk null;
+            var f = std.Io.Dir.cwd().openFile(app_io, final_path, .{}) catch break :blk null;
+            defer f.close(app_io);
+            const stat = f.stat(app_io) catch break :blk null;
             const data = allocator.alloc(u8, stat.size) catch break :blk null;
-            const n = f.readAll(data) catch break :blk null;
+            const n = f.readPositionalAll(app_io, data, 0) catch break :blk null;
             break :blk data[0..n];
         };
         if (assembled) |data| {
@@ -2765,7 +2765,7 @@ fn handleAbortMultipart(ctx: *const S3Context, allocator: Allocator, req: *Reque
     };
     defer allocator.free(parts_dir);
 
-    std.fs.cwd().deleteTree(parts_dir) catch |err| {
+    std.Io.Dir.cwd().deleteTree(app_io, parts_dir) catch |err| {
         std.log.warn("abort multipart cleanup failed: {}", .{err});
     };
 
@@ -2855,7 +2855,10 @@ fn handlePeerProtocol(ctx: *const S3Context, dist: *DistributedContext, allocato
         try json.appendSlice(allocator, "[");
 
         var peers: [20]PeerInfo = undefined;
-        const count = dist.kademlia.getRandomPeers(&peers, std.crypto.random);
+        var seed: u64 = undefined;
+        app_io.random(std.mem.asBytes(&seed));
+        var prng = std.Random.DefaultPrng.init(seed);
+        const count = dist.kademlia.getRandomPeers(&peers, prng.random());
 
         for (peers[0..count], 0..) |peer, i| {
             if (i > 0) try json.appendSlice(allocator, ",");
@@ -3018,7 +3021,7 @@ fn handleDistributedPut(ctx: *const S3Context, allocator: Allocator, req: *Reque
     // Ensure bucket directory exists in index
     const bucket_path = try ctx.bucketPath(allocator, bucket);
     defer allocator.free(bucket_path);
-    std.fs.cwd().makePath(bucket_path) catch {};
+    std.Io.Dir.cwd().createDirPath(app_io, bucket_path) catch {};
 
     // Compute content hash
     const hash = CAS.computeHash(req.body);
@@ -3138,10 +3141,10 @@ fn serveContent(allocator: Allocator, req: *Request, res: *Response, data: []con
 }
 
 /// Fetch content from a remote peer
-fn fetchFromPeer(allocator: Allocator, address: net.Address, hash: ContentHash) ![]const u8 {
+fn fetchFromPeer(allocator: Allocator, address: net.IpAddress, hash: ContentHash) ![]const u8 {
     // Connect to peer
-    var stream = net.tcpConnectToAddress(address) catch return error.ConnectionFailed;
-    defer stream.close();
+    var stream = address.connect(app_io, .{ .mode = .stream }) catch return error.ConnectionFailed;
+    defer stream.close(app_io);
 
     // Build request
     var hash_hex: [40]u8 = undefined;
@@ -3149,7 +3152,7 @@ fn fetchFromPeer(allocator: Allocator, address: net.Address, hash: ContentHash) 
 
     var req_buf: [256]u8 = undefined;
     const request = std.fmt.bufPrint(&req_buf, "GET /_zs3/blob/{s} HTTP/1.1\r\nHost: {any}\r\nConnection: close\r\n\r\n", .{ hash_hex, address }) catch return error.BufferTooSmall;
-    _ = stream.write(request) catch return error.WriteFailed;
+    streamWriteAll(stream, request) catch return error.WriteFailed;
 
     // Read response
     var response_buf = try allocator.alloc(u8, MAX_BODY_SIZE); // match standalone max
@@ -3157,7 +3160,7 @@ fn fetchFromPeer(allocator: Allocator, address: net.Address, hash: ContentHash) 
 
     var total_read: usize = 0;
     while (total_read < response_buf.len) {
-        const bytes = stream.read(response_buf[total_read..]) catch break;
+        const bytes = streamRead(stream, response_buf[total_read..]) catch break;
         if (bytes == 0) break;
         total_read += bytes;
     }
@@ -3324,11 +3327,11 @@ fn collectMetaKeys(allocator: Allocator, base_path: []const u8, current_prefix: 
         try allocator.dupe(u8, base_path);
     defer allocator.free(full_path);
 
-    var dir = std.fs.cwd().openDir(full_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+    var dir = std.Io.Dir.cwd().openDir(app_io, full_path, .{ .iterate = true }) catch return;
+    defer dir.close(app_io);
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(app_io)) |entry| {
         if (entry.name[0] == '.') continue;
 
         const full_name = if (current_prefix.len > 0)

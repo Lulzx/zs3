@@ -68,7 +68,7 @@ pub fn parseCredential(cred_str: []const u8) !Credential {
 pub fn parseCredentials(allocator: std.mem.Allocator, input: []const u8) ![]Credential {
     if (input.len == 0) return error.BadCredentialInputFormat;
 
-    var credentials = std.ArrayListUnmanaged(Credential){};
+    var credentials: std.ArrayListUnmanaged(Credential) = .empty;
     errdefer credentials.deinit(allocator);
 
     var itr = std.mem.splitScalar(u8, input, ',');
