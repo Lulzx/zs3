@@ -186,6 +186,7 @@ zig build test                               # run tests
 
 ```bash
 zig build test                  # ~30 unit tests
+python3 test_bootstrap.py       # two-node bootstrap discovery
 python3 test_client.py          # 24/24 integration tests (stdlib only)
 python3 test_comprehensive.py   # 66/66 boto3 tests (standalone)
 ./zs3 --distributed && \
