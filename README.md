@@ -172,7 +172,8 @@ const address = net.Address.parseIp4("0.0.0.0", 9000)
 
 ## Building
 
-Requires Zig 0.15+.
+Requires Zig 0.16.0. zs3 uses the `std.Io` APIs introduced in Zig 0.16 and
+does not build with Zig 0.15.x.
 
 ```bash
 zig build                                    # debug
