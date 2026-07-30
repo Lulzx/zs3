@@ -1059,6 +1059,7 @@ pub fn main(init: std.process.Init) !void {
         const config = DistributedConfig{
             .enabled = true,
             .node_id = node_id,
+            .bootstrap_peers = bootstrap_peers[0..bootstrap_count],
             .http_port = port,
         };
         dist_ctx = DistributedContext.init(allocator, data_dir, config);
@@ -1118,6 +1119,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (distributed_enabled) {
         std.log.info("dS3 server listening on http://0.0.0.0:{d}", .{port});
+        bootstrapPeers(allocator, &dist_ctx.?);
     } else {
         std.log.info("S3 server listening on http://0.0.0.0:{d}", .{port});
     }
@@ -1153,6 +1155,84 @@ fn getOrCreateNodeId(allocator: Allocator, data_dir: []const u8) !NodeId {
     } else |_| {}
 
     return id;
+}
+
+fn handshakeBootstrapPeer(allocator: Allocator, dist: *const DistributedContext, peer_text: []const u8, address: net.IpAddress) !PeerInfo {
+    var stream = address.connect(app_io, .{ .mode = .stream }) catch return error.ConnectionFailed;
+    defer stream.close(app_io);
+
+    var self_id_hex: [40]u8 = undefined;
+    bytesToHex(&dist.config.node_id, &self_id_hex);
+    var request_buffer: [512]u8 = undefined;
+    const request = std.fmt.bufPrint(
+        &request_buffer,
+        "GET /_zs3/ping HTTP/1.1\r\nHost: {s}\r\nX-Zs3-Node-Id: {s}\r\nX-Zs3-Port: {d}\r\nConnection: close\r\n\r\n",
+        .{ peer_text, self_id_hex, dist.config.http_port },
+    ) catch return error.BufferTooSmall;
+    try streamWriteAll(stream, request);
+
+    var response_buffer = try allocator.alloc(u8, MAX_HEADER_SIZE);
+    defer allocator.free(response_buffer);
+    var total_read: usize = 0;
+    while (total_read < response_buffer.len) {
+        const count = streamRead(stream, response_buffer[total_read..]) catch break;
+        if (count == 0) break;
+        total_read += count;
+    }
+
+    const response = response_buffer[0..total_read];
+    if (!std.mem.startsWith(u8, response, "HTTP/1.1 200")) return error.InvalidBootstrapResponse;
+
+    const id_prefix = "\"id\":\"";
+    const id_start = (std.mem.indexOf(u8, response, id_prefix) orelse return error.InvalidBootstrapResponse) + id_prefix.len;
+    if (response.len < id_start + 40) return error.InvalidBootstrapResponse;
+
+    var id: NodeId = undefined;
+    _ = std.fmt.hexToBytes(&id, response[id_start .. id_start + 40]) catch return error.InvalidBootstrapResponse;
+
+    return .{
+        .id = id,
+        .address = address,
+        .last_seen = std.Io.Clock.real.now(app_io).toSeconds(),
+        .content_count = 0,
+    };
+}
+
+fn connectBootstrapPeer(allocator: Allocator, dist: *const DistributedContext, peer_text: []const u8) !PeerInfo {
+    if (net.IpAddress.parseLiteral(peer_text)) |address| {
+        return handshakeBootstrapPeer(allocator, dist, peer_text, address);
+    } else |_| {}
+
+    const separator = std.mem.lastIndexOfScalar(u8, peer_text, ':') orelse return error.InvalidBootstrapPeer;
+    const host_text = peer_text[0..separator];
+    const port = std.fmt.parseInt(u16, peer_text[separator + 1 ..], 10) catch return error.InvalidBootstrapPeer;
+    const host = net.HostName.init(host_text) catch return error.InvalidBootstrapPeer;
+
+    var lookup_buffer: [16]net.HostName.LookupResult = undefined;
+    var lookup_queue: std.Io.Queue(net.HostName.LookupResult) = .init(&lookup_buffer);
+    try host.lookup(app_io, &lookup_queue, .{ .port = port });
+
+    while (lookup_queue.getOne(app_io)) |result| switch (result) {
+        .address => |address| {
+            return handshakeBootstrapPeer(allocator, dist, peer_text, address) catch continue;
+        },
+        .canonical_name => continue,
+    } else |err| switch (err) {
+        error.Closed => return error.BootstrapPeerNotFound,
+        error.Canceled => return error.Canceled,
+    }
+}
+
+fn bootstrapPeers(allocator: Allocator, dist: *DistributedContext) void {
+    for (dist.config.bootstrap_peers) |peer_text| {
+        const peer = connectBootstrapPeer(allocator, dist, peer_text) catch |err| {
+            std.log.warn("Failed to connect to bootstrap peer {s}: {t}", .{ peer_text, err });
+            continue;
+        };
+        dist.kademlia.addPeer(peer);
+        std.log.info("Connected to bootstrap peer {s}", .{peer_text});
+    }
+    std.log.info("Known peers: {d}", .{dist.kademlia.peerCount()});
 }
 
 fn streamRead(stream: net.Stream, buffer: []u8) !usize {
@@ -1192,6 +1272,8 @@ fn eventLoopEpoll(allocator: Allocator, ctx: *const S3Context, server: *net.Serv
         return error.EpollCtl;
 
     var events: [MAX_CONNECTIONS]linux.epoll_event = undefined;
+    var peer_addresses = std.AutoHashMap(posix.fd_t, net.IpAddress).init(allocator);
+    defer peer_addresses.deinit();
 
     while (true) {
         const n = linux.epoll_wait(@intCast(epfd), &events, MAX_CONNECTIONS, -1);
@@ -1200,10 +1282,16 @@ fn eventLoopEpoll(allocator: Allocator, ctx: *const S3Context, server: *net.Serv
         for (events[0..n]) |event| {
             if (event.data.fd == server.socket.handle) {
                 const conn = server.accept(app_io) catch continue;
+                peer_addresses.put(conn.socket.handle, conn.socket.address) catch {
+                    conn.close(app_io);
+                    continue;
+                };
                 var cev = linux.epoll_event{ .events = linux.EPOLL.IN | linux.EPOLL.ONESHOT, .data = .{ .fd = conn.socket.handle } };
                 _ = linux.epoll_ctl(@intCast(epfd), linux.EPOLL.CTL_ADD, conn.socket.handle, &cev);
             } else {
-                const stream = net.Stream{ .socket = .{ .handle = event.data.fd, .address = .{ .ip4 = .unspecified(0) } } };
+                const remote_address = peer_addresses.get(event.data.fd) orelse net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) };
+                _ = peer_addresses.remove(event.data.fd);
+                const stream = net.Stream{ .socket = .{ .handle = event.data.fd, .address = remote_address } };
                 _ = handleConnectionWithStream(allocator, ctx, stream) catch {};
                 _ = linux.epoll_ctl(@intCast(epfd), linux.EPOLL.CTL_DEL, event.data.fd, null);
                 stream.close(app_io);
@@ -1228,6 +1316,8 @@ fn eventLoopKqueue(allocator: Allocator, ctx: *const S3Context, server: *net.Ser
         .udata = 0,
     }};
     var events: [MAX_CONNECTIONS]c.Kevent = undefined;
+    var peer_addresses = std.AutoHashMap(posix.fd_t, net.IpAddress).init(allocator);
+    defer peer_addresses.deinit();
     if (c.kevent(kq, &changes, 1, &events, 0, null) < 0) return error.Kevent;
 
     while (true) {
@@ -1238,6 +1328,10 @@ fn eventLoopKqueue(allocator: Allocator, ctx: *const S3Context, server: *net.Ser
             const fd: posix.fd_t = @intCast(ev.ident);
             if (fd == server_fd) {
                 const conn = server.accept(app_io) catch continue;
+                peer_addresses.put(conn.socket.handle, conn.socket.address) catch {
+                    conn.close(app_io);
+                    continue;
+                };
                 var add: [1]c.Kevent = .{.{
                     .ident = @intCast(conn.socket.handle),
                     .filter = c.EVFILT.READ,
@@ -1249,9 +1343,15 @@ fn eventLoopKqueue(allocator: Allocator, ctx: *const S3Context, server: *net.Ser
                 const r = c.kevent(kq, &add, 1, &events, 0, null);
                 if (r < 0) std.log.err("kevent add failed", .{});
             } else {
-                const stream = net.Stream{ .socket = .{ .handle = fd, .address = .{ .ip4 = .unspecified(0) } } };
+                const remote_address = peer_addresses.get(fd) orelse net.IpAddress{ .ip4 = net.Ip4Address.unspecified(0) };
+                _ = peer_addresses.remove(fd);
+                const stream = net.Stream{ .socket = .{ .handle = fd, .address = remote_address } };
                 const keep = handleConnectionWithStream(allocator, ctx, stream) catch false;
                 if (keep) {
+                    peer_addresses.put(fd, remote_address) catch {
+                        stream.close(app_io);
+                        continue;
+                    };
                     var add: [1]c.Kevent = .{.{
                         .ident = @intCast(fd),
                         .filter = c.EVFILT.READ,
@@ -1294,6 +1394,7 @@ const Request = struct {
     query: []const u8,
     headers: std.StringHashMap([]const u8),
     body: []const u8,
+    remote_address: net.IpAddress,
 
     fn header(self: *const Request, name: []const u8) ?[]const u8 {
         var lower_buf: [128]u8 = undefined;
@@ -1506,6 +1607,7 @@ fn parseRequestFromBuf(allocator: Allocator, data: []const u8, stream: net.Strea
         .query = try allocator.dupe(u8, query),
         .headers = headers,
         .body = body,
+        .remote_address = stream.socket.address,
     };
 }
 
@@ -2844,6 +2946,26 @@ pub fn xmlEscape(allocator: Allocator, list: *std.ArrayListUnmanaged(u8), input:
 /// Handle peer-to-peer protocol endpoints (/_zs3/*)
 fn handlePeerProtocol(ctx: *const S3Context, dist: *DistributedContext, allocator: Allocator, req: *Request, res: *Response, path: []const u8) !void {
     if (std.mem.eql(u8, path, "ping")) {
+        if (req.header("x-zs3-node-id")) |peer_id_hex| {
+            if (req.header("x-zs3-port")) |peer_port_text| {
+                if (peer_id_hex.len == 40) {
+                    var peer_id: NodeId = undefined;
+                    if (std.fmt.hexToBytes(&peer_id, peer_id_hex)) |_| {
+                        if (std.fmt.parseInt(u16, peer_port_text, 10)) |peer_port| {
+                            var peer_address = req.remote_address;
+                            peer_address.setPort(peer_port);
+                            dist.kademlia.addPeer(.{
+                                .id = peer_id,
+                                .address = peer_address,
+                                .last_seen = std.Io.Clock.real.now(app_io).toSeconds(),
+                                .content_count = 0,
+                            });
+                        } else |_| {}
+                    } else |_| {}
+                }
+            }
+        }
+
         // Health check - returns node ID
         var id_hex: [40]u8 = undefined;
         bytesToHex(&dist.config.node_id, &id_hex);
