@@ -211,6 +211,14 @@ def test_object_operations(s3):
     except Exception as e:
         test("Get nested object", False, str(e))
 
+    # A filesystem directory used by nested keys is not itself an S3 object.
+    try:
+        s3.head_object(Bucket=bucket, Key="folder")
+        test("Head directory prefix is not an object", False, "expected 404")
+    except ClientError as e:
+        status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        test("Head directory prefix is not an object", status == 404, str(e))
+
     # Put empty object
     try:
         s3.put_object(Bucket=bucket, Key="empty.txt", Body=b"")

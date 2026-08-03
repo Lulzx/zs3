@@ -2338,6 +2338,14 @@ fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, res: *Response,
         return;
     };
 
+    // Filesystem directories are implementation details for nested keys, not
+    // S3 objects. Clients such as rclone probe a prefix with HeadObject before
+    // listing it and expect a miss rather than an attempt to read the directory.
+    if (stat.kind != .file) {
+        sendError(res, 404, "NoSuchKey", "Object not found");
+        return;
+    }
+
     // Compute ETag from file content (same as PUT uses)
     const content = readToEndAlloc(file, allocator, MAX_BODY_SIZE) catch {
         sendError(res, 500, "InternalError", "Read failed");
