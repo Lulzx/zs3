@@ -1,22 +1,32 @@
 # zs3
 
-S3-compatible storage in ~3K lines of Zig. Zero dependencies. Optional distributed mode.
+**SQLite for objects.** Local, dev, and edge S3 storage in a static binary under
+360KB.
+
+Run one file, point an existing S3 client at it, and keep the data on disk. zs3
+is standalone by default and adds content-addressed, peer-to-peer storage when
+you ask for distributed mode. No runtime, control plane, or dependency tree.
+
+[Replace MinIO in Docker Compose](docs/replace-minio.md) ·
+[Product direction](docs/vision.md) · [API subset](docs/api.md)
 
 ## Why
 
-Most S3 usage is PUT, GET, DELETE, LIST with basic auth. You don't need 200k lines of code for that.
+Most local object-storage usage is PUT, GET, DELETE, LIST, and SigV4. zs3 owns
+that narrow job instead of pursuing feature parity with a production object
+storage platform.
 
 | | zs3 | RustFS | MinIO |
 |---|-----|--------|-------|
 | Lines | ~3,000 | ~80,000 | 200,000 |
-| Binary | 360KB | ~50MB | 100MB |
+| Binary | <360KB | ~50MB | 100MB |
 | RAM idle | 3MB | ~100MB | 200MB+ |
 | Dependencies | 0 | ~200 crates | many |
 
 ## What it does
 
 **Standalone Mode:**
-- Full AWS SigV4 authentication (works with aws-cli, boto3, any SDK)
+- Full AWS SigV4 authentication (verified with aws-cli, boto3, and rclone)
 - PUT, GET, DELETE, HEAD, LIST (v2)
 - HeadBucket for bucket existence checks
 - DeleteObjects batch operation
@@ -24,7 +34,7 @@ Most S3 usage is PUT, GET, DELETE, LIST with basic auth. You don't need 200k lin
 - Range requests for streaming/seeking (RFC 7233 compliant suffix ranges)
 - HTTP 100-continue support (boto3 compatible)
 - AWS chunked transfer encoding support
-- ~360KB static binary
+- <360KB static Linux binary (`ReleaseSmall`)
 
 **Distributed Mode (IPFS-like):**
 - Content-addressed storage with BLAKE3 hashing
@@ -43,12 +53,13 @@ Most S3 usage is PUT, GET, DELETE, LIST with basic auth. You don't need 200k lin
 - Pre-signed URLs, object tagging, encryption
 - Anything you'd actually need a cloud provider for
 
-If you need these, use MinIO or AWS.
+If you need these, use MinIO or AWS. zs3 wins on size, inspectability, and
+auditability—not feature parity.
 
 ## Quick Start
 
 ```bash
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseSmall
 ./zig-out/bin/zs3
 ```
 
@@ -119,7 +130,9 @@ aws --endpoint-url http://localhost:9000 s3 cp s3://mybucket/file.txt ./
 aws --endpoint-url http://localhost:9000 s3 rm s3://mybucket/file.txt
 ```
 
-Works with any S3 SDK:
+The supported API subset is verified with three real clients. Run
+`./scripts/verify-clients.sh` to reproduce the compatibility check. A boto3
+example:
 
 ```python
 import boto3
@@ -145,10 +158,11 @@ print(s3.get_object(Bucket='test', Key='hello.txt')['Body'].read())
 
 ## When to use this
 
-- Local dev (replacing localstack/minio)
+- Local dev (replacing a MinIO service in Docker Compose)
 - CI artifact storage
+- Agent artifacts and reproducible evidence
 - Self-hosted backups
-- Embedded/appliance storage
+- Edge and embedded appliances
 - Learning how S3 actually works
 
 ## When NOT to use this
@@ -176,9 +190,11 @@ Requires Zig 0.16.0. zs3 uses the `std.Io` APIs introduced in Zig 0.16 and
 does not build with Zig 0.15.x.
 
 ```bash
-zig build                                    # debug
-zig build -Doptimize=ReleaseFast             # release (~360KB)
-zig build -Dtarget=x86_64-linux-musl         # cross-compile
+zig build                                      # debug
+zig build -Doptimize=ReleaseSmall              # smallest native release
+zig build -Dtarget=x86_64-linux-musl \
+  -Dcpu=baseline -Doptimize=ReleaseSmall       # static Linux (<360KB)
+zig build -Doptimize=ReleaseFast               # favor throughput over size
 zig build test                               # run tests
 ```
 
@@ -188,12 +204,18 @@ zig build test                               # run tests
 zig build test                  # ~30 unit tests
 python3 test_bootstrap.py       # two-node bootstrap discovery
 python3 test_client.py          # 24/24 integration tests (stdlib only)
-python3 test_comprehensive.py   # 66/66 boto3 tests (standalone)
+python3 test_comprehensive.py   # 67/67 boto3 tests (standalone)
 ./zs3 --distributed && \
-python3 test_comprehensive.py   # 71/71 boto3 tests (distributed)
+python3 test_comprehensive.py   # 72/72 boto3 tests (distributed)
 ```
 
 Requires `pip install boto3` for comprehensive tests.
+
+Client compatibility smoke test (aws-cli, boto3, and rclone):
+
+```bash
+./scripts/verify-clients.sh
+```
 
 ## Benchmark
 

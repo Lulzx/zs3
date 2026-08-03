@@ -3,10 +3,16 @@
 ## Building for Production
 
 ```bash
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseSmall
 ```
 
-This produces a ~250KB static binary at `zig-out/bin/zs3`.
+This produces a stripped native binary at `zig-out/bin/zs3`. A static
+x86-64 Linux build is under 360KB:
+
+```bash
+zig build -Dtarget=x86_64-linux-musl \
+  -Dcpu=baseline -Doptimize=ReleaseSmall
+```
 
 ## Cross-Compilation
 
@@ -14,10 +20,10 @@ Build for Linux from any platform:
 
 ```bash
 # x86_64
-zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
+zig build -Dtarget=x86_64-linux-musl -Dcpu=baseline -Doptimize=ReleaseSmall
 
 # ARM64
-zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseFast
+zig build -Dtarget=aarch64-linux-musl -Dcpu=baseline -Doptimize=ReleaseSmall
 ```
 
 The binary is statically linked and has no dependencies.
@@ -70,7 +76,7 @@ CMD ["/usr/local/bin/zs3"]
 ```
 
 ```bash
-zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
+zig build -Dtarget=x86_64-linux-musl -Dcpu=baseline -Doptimize=ReleaseSmall
 docker build -t zs3 .
 docker run -p 9000:9000 -v ./data:/data zs3
 ```
