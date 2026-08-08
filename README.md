@@ -99,6 +99,14 @@ Other useful flags: `--port=PORT`, `--data-dir=PATH`, `--help`.
 
 All nodes share the same S3 API. PUT on any node, GET from any node.
 
+How the namespace stays in sync: every PUT/DELETE pushes the bucket/key
+metadata entry (and inline data for small objects) to all known peers,
+larger blobs are replicated to `REPLICATION_TARGET` nodes and announced in
+the DHT, a joining node pulls the full index from its bootstrap peers, and
+a GET for a key the node hasn't seen falls back to asking peers directly.
+Conflicts resolve last-write-wins at second granularity; deletes propagate
+as tombstones.
+
 **Storage Layout (distributed):**
 ```
 data/
@@ -203,6 +211,7 @@ zig build test                               # run tests
 ```bash
 zig build test                  # ~30 unit tests
 python3 test_bootstrap.py       # two-node bootstrap discovery
+python3 test_replication.py     # four-node replication suite (stdlib only)
 python3 test_client.py          # 24/24 integration tests (stdlib only)
 python3 test_comprehensive.py   # 67/67 boto3 tests (standalone)
 ./zs3 --distributed && \

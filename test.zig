@@ -457,3 +457,64 @@ test "decodeAwsChunked - hex size uppercase" {
     defer allocator.free(result);
     try std.testing.expectEqualStrings("0123456789", result);
 }
+
+// ============================================================================
+// Distributed metadata replication helpers
+// ============================================================================
+
+const metaContentTimestamp = main.metaContentTimestamp;
+const isTombstoneContent = main.isTombstoneContent;
+
+const VALID_HASH = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+test "metaContentTimestamp - live entry uses created" {
+    const content = VALID_HASH ++ "\n123\n1700000000\n0\n";
+    try std.testing.expectEqual(@as(?i64, 1700000000), metaContentTimestamp(content));
+}
+
+test "metaContentTimestamp - tombstone uses deleted when newer" {
+    const content = VALID_HASH ++ "\n123\n1700000000\n1700000500\n";
+    try std.testing.expectEqual(@as(?i64, 1700000500), metaContentTimestamp(content));
+}
+
+test "metaContentTimestamp - inline data does not affect parsing" {
+    const content = VALID_HASH ++ "\n5\n1700000001\n0\nhello";
+    try std.testing.expectEqual(@as(?i64, 1700000001), metaContentTimestamp(content));
+}
+
+test "metaContentTimestamp - inline data with newlines and digits" {
+    const content = VALID_HASH ++ "\n10\n1700000002\n0\n123\n456\n78";
+    try std.testing.expectEqual(@as(?i64, 1700000002), metaContentTimestamp(content));
+}
+
+test "metaContentTimestamp - rejects malformed entries" {
+    // Empty / truncated
+    try std.testing.expectEqual(@as(?i64, null), metaContentTimestamp(""));
+    try std.testing.expectEqual(@as(?i64, null), metaContentTimestamp(VALID_HASH));
+    try std.testing.expectEqual(@as(?i64, null), metaContentTimestamp(VALID_HASH ++ "\n123"));
+    try std.testing.expectEqual(@as(?i64, null), metaContentTimestamp(VALID_HASH ++ "\n123\n1700000000"));
+    // Wrong hash length
+    try std.testing.expectEqual(@as(?i64, null), metaContentTimestamp("abc\n1\n2\n0\n"));
+    // Non-hex hash
+    const bad_hash = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+    try std.testing.expectEqual(@as(?i64, null), metaContentTimestamp(bad_hash ++ "\n1\n2\n0\n"));
+    // Non-numeric fields
+    try std.testing.expectEqual(@as(?i64, null), metaContentTimestamp(VALID_HASH ++ "\nabc\n2\n0\n"));
+    try std.testing.expectEqual(@as(?i64, null), metaContentTimestamp(VALID_HASH ++ "\n1\nabc\n0\n"));
+    try std.testing.expectEqual(@as(?i64, null), metaContentTimestamp(VALID_HASH ++ "\n1\n2\nabc\n"));
+    // Negative size is invalid (u64)
+    try std.testing.expectEqual(@as(?i64, null), metaContentTimestamp(VALID_HASH ++ "\n-1\n2\n0\n"));
+}
+
+test "isTombstoneContent" {
+    try std.testing.expect(!isTombstoneContent(VALID_HASH ++ "\n123\n1700000000\n0\n"));
+    try std.testing.expect(isTombstoneContent(VALID_HASH ++ "\n123\n1700000000\n1700000500\n"));
+    try std.testing.expect(isTombstoneContent(VALID_HASH ++ "\n123\n1700000000\n1\n"));
+    // Malformed content is not a tombstone
+    try std.testing.expect(!isTombstoneContent(""));
+    try std.testing.expect(!isTombstoneContent(VALID_HASH));
+    try std.testing.expect(!isTombstoneContent(VALID_HASH ++ "\n123\n1700000000"));
+    try std.testing.expect(!isTombstoneContent(VALID_HASH ++ "\n123\n1700000000\nabc\n"));
+    // Negative deleted timestamp is not a tombstone
+    try std.testing.expect(!isTombstoneContent(VALID_HASH ++ "\n123\n1700000000\n-5\n"));
+}

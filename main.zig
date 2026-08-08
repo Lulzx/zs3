@@ -22,6 +22,10 @@ const TOMBSTONE_TTL_SECS = 24 * 60 * 60; // 24 hours before tombstone cleanup
 const INLINE_THRESHOLD = 4 * 1024; // Objects <= 4KB stored inline in metadata
 const GC_GRACE_PERIOD_SECS = 10 * 60; // 10 min delay before deleting unreferenced blocks
 const QUORUM_SIZE = 2; // Need 2 matching responses for quorum reads
+const MAX_BROADCAST_PEERS = 64; // Max peers a metadata/announce broadcast reaches
+const MAX_META_RESPONSE = 16 * 1024; // Meta entries are small: header + inline data
+const MAX_INDEX_SYNC_SIZE = 256 * 1024 * 1024; // Cap on a full index dump during join sync
+const PEER_IO_TIMEOUT_SECS = 5; // Socket timeout for peer-to-peer requests
 
 const ERROR_403 = "HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\nDenied";
 
@@ -450,6 +454,35 @@ const MetaIndex = struct {
         };
     }
 
+    /// Read the raw meta file content (including tombstones) for replication
+    pub fn readRaw(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8) !?[]u8 {
+        const path = try self.metaPath(allocator, bucket, key);
+        defer allocator.free(path);
+
+        var file = std.Io.Dir.cwd().openFile(app_io, path, .{}) catch return null;
+        defer file.close(app_io);
+
+        const stat = try file.stat(app_io);
+        const content = try allocator.alloc(u8, stat.size);
+        errdefer allocator.free(content);
+        _ = try file.readPositionalAll(app_io, content, 0);
+        return content;
+    }
+
+    /// Write raw meta file content verbatim, preserving origin timestamps
+    pub fn writeRaw(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8, content: []const u8) !void {
+        const path = try self.metaPath(allocator, bucket, key);
+        defer allocator.free(path);
+
+        if (std.fs.path.dirname(path)) |dir| {
+            std.Io.Dir.cwd().createDirPath(app_io, dir) catch {};
+        }
+
+        var file = try std.Io.Dir.cwd().createFile(app_io, path, .{});
+        defer file.close(app_io);
+        try file.writeStreamingAll(app_io, content);
+    }
+
     /// Delete metadata by writing a tombstone (prevents resurrection during sync)
     pub fn delete(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8) void {
         self.writeTombstone(allocator, bucket, key) catch {
@@ -853,6 +886,21 @@ const Kademlia = struct {
         return count;
     }
 
+    /// Collect known peers across all buckets (up to out.len)
+    pub fn collectPeers(self: *const Kademlia, out: []PeerInfo) usize {
+        var count: usize = 0;
+        for (&self.buckets) |*bucket| {
+            for (bucket.peers) |slot| {
+                if (slot) |peer| {
+                    if (count >= out.len) return count;
+                    out[count] = peer;
+                    count += 1;
+                }
+            }
+        }
+        return count;
+    }
+
     /// Get random peers for gossip
     pub fn getRandomPeers(self: *Kademlia, out: []PeerInfo, rng: std.Random) usize {
         var all_peers: [MAX_PEERS]PeerInfo = undefined;
@@ -1119,7 +1167,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (distributed_enabled) {
         std.log.info("dS3 server listening on http://0.0.0.0:{d}", .{port});
-        bootstrapPeers(allocator, &dist_ctx.?);
+        bootstrapPeers(allocator, &ctx, &dist_ctx.?);
     } else {
         std.log.info("S3 server listening on http://0.0.0.0:{d}", .{port});
     }
@@ -1157,17 +1205,20 @@ fn getOrCreateNodeId(allocator: Allocator, data_dir: []const u8) !NodeId {
     return id;
 }
 
-fn handshakeBootstrapPeer(allocator: Allocator, dist: *const DistributedContext, peer_text: []const u8, address: net.IpAddress) !PeerInfo {
+/// Handshake with a peer: exchange node IDs (the peer also learns about us
+/// via the X-Zs3-* headers) and return its PeerInfo
+fn pingPeerAddress(allocator: Allocator, dist: *const DistributedContext, address: net.IpAddress) !PeerInfo {
     var stream = address.connect(app_io, .{ .mode = .stream }) catch return error.ConnectionFailed;
     defer stream.close(app_io);
+    setPeerTimeout(stream);
 
     var self_id_hex: [40]u8 = undefined;
     bytesToHex(&dist.config.node_id, &self_id_hex);
     var request_buffer: [512]u8 = undefined;
     const request = std.fmt.bufPrint(
         &request_buffer,
-        "GET /_zs3/ping HTTP/1.1\r\nHost: {s}\r\nX-Zs3-Node-Id: {s}\r\nX-Zs3-Port: {d}\r\nConnection: close\r\n\r\n",
-        .{ peer_text, self_id_hex, dist.config.http_port },
+        "GET /_zs3/ping HTTP/1.1\r\nHost: {any}\r\nX-Zs3-Node-Id: {s}\r\nX-Zs3-Port: {d}\r\nConnection: close\r\n\r\n",
+        .{ address, self_id_hex, dist.config.http_port },
     ) catch return error.BufferTooSmall;
     try streamWriteAll(stream, request);
 
@@ -1198,9 +1249,39 @@ fn handshakeBootstrapPeer(allocator: Allocator, dist: *const DistributedContext,
     };
 }
 
+/// Learn about a bootstrap peer's peers, handshaking with each discovered
+/// node so the connection graph becomes bidirectional. Discovered peers are
+/// assumed to be reachable at the source's IP (the /peers gossip format only
+/// carries ports).
+fn discoverPeersFrom(allocator: Allocator, dist: *DistributedContext, source: PeerInfo) void {
+    const body = peerRequest(allocator, source.address, "GET", "/_zs3/peers", "", 64 * 1024) catch return;
+    defer allocator.free(body);
+
+    var it = std.mem.splitSequence(u8, body, "\"id\":\"");
+    _ = it.next(); // text before the first match
+    while (it.next()) |chunk| {
+        if (chunk.len < 40) continue;
+        var id: NodeId = undefined;
+        _ = std.fmt.hexToBytes(&id, chunk[0..40]) catch continue;
+        if (std.mem.eql(u8, &id, &dist.config.node_id)) continue;
+        if (dist.kademlia.findPeerById(id) != null) continue;
+
+        const port_key = "\"port\":";
+        const port_idx = std.mem.indexOf(u8, chunk, port_key) orelse continue;
+        var port_end = port_idx + port_key.len;
+        while (port_end < chunk.len and std.ascii.isDigit(chunk[port_end])) port_end += 1;
+        const port = std.fmt.parseInt(u16, chunk[port_idx + port_key.len .. port_end], 10) catch continue;
+
+        var address = source.address;
+        address.setPort(port);
+        const peer = pingPeerAddress(allocator, dist, address) catch continue;
+        dist.kademlia.addPeer(peer);
+    }
+}
+
 fn connectBootstrapPeer(allocator: Allocator, dist: *const DistributedContext, peer_text: []const u8) !PeerInfo {
     if (net.IpAddress.parseLiteral(peer_text)) |address| {
-        return handshakeBootstrapPeer(allocator, dist, peer_text, address);
+        return pingPeerAddress(allocator, dist, address);
     } else |_| {}
 
     const separator = std.mem.lastIndexOfScalar(u8, peer_text, ':') orelse return error.InvalidBootstrapPeer;
@@ -1214,7 +1295,7 @@ fn connectBootstrapPeer(allocator: Allocator, dist: *const DistributedContext, p
 
     while (lookup_queue.getOne(app_io)) |result| switch (result) {
         .address => |address| {
-            return handshakeBootstrapPeer(allocator, dist, peer_text, address) catch continue;
+            return pingPeerAddress(allocator, dist, address) catch continue;
         },
         .canonical_name => continue,
     } else |err| switch (err) {
@@ -1223,7 +1304,7 @@ fn connectBootstrapPeer(allocator: Allocator, dist: *const DistributedContext, p
     }
 }
 
-fn bootstrapPeers(allocator: Allocator, dist: *DistributedContext) void {
+fn bootstrapPeers(allocator: Allocator, ctx: *const S3Context, dist: *DistributedContext) void {
     for (dist.config.bootstrap_peers) |peer_text| {
         const peer = connectBootstrapPeer(allocator, dist, peer_text) catch |err| {
             std.log.warn("Failed to connect to bootstrap peer {s}: {t}", .{ peer_text, err });
@@ -1231,6 +1312,8 @@ fn bootstrapPeers(allocator: Allocator, dist: *DistributedContext) void {
         };
         dist.kademlia.addPeer(peer);
         std.log.info("Connected to bootstrap peer {s}", .{peer_text});
+        discoverPeersFrom(allocator, dist, peer);
+        syncIndexFromPeer(allocator, ctx, peer);
     }
     std.log.info("Known peers: {d}", .{dist.kademlia.peerCount()});
 }
@@ -2571,6 +2654,10 @@ fn handleCreateBucket(ctx: *const S3Context, allocator: Allocator, res: *Respons
         },
     };
 
+    if (ctx.distributed) |dist| {
+        broadcastToPeers(dist, allocator, "POST", "/_zs3/bucket", bucket);
+    }
+
     res.ok();
 }
 
@@ -2602,6 +2689,10 @@ fn handleDeleteBucket(ctx: *const S3Context, allocator: Allocator, res: *Respons
         },
         else => std.log.warn("delete bucket failed: {}", .{err}),
     };
+
+    if (ctx.distributed) |dist| {
+        broadcastToPeers(dist, allocator, "POST", "/_zs3/bucket_delete", bucket);
+    }
 
     res.noContent();
 }
@@ -2834,6 +2925,11 @@ fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Re
                 dist.kademlia.announce(content_hash) catch {};
                 dist.replication.schedule(content_hash) catch {};
             }
+            propagateObjectMeta(ctx, allocator, bucket, key);
+            if (data.len > INLINE_THRESHOLD) {
+                broadcastAnnounce(dist, allocator, content_hash, dist.config.node_id);
+                replicateBlob(dist, allocator, content_hash);
+            }
         }
     }
 
@@ -3027,11 +3123,12 @@ fn handlePeerProtocol(ctx: *const S3Context, dist: *DistributedContext, allocato
             res.ok();
             res.body = data;
         } else if (std.mem.eql(u8, req.method, "PUT")) {
-            // Store blob (pushed from another node)
-            _ = dist.cas.store(allocator, req.body) catch {
+            // Store blob (pushed from another node) and record ourselves as provider
+            const stored_hash = dist.cas.store(allocator, req.body) catch {
                 sendError(res, 500, "InternalError", "Failed to store");
                 return;
             };
+            dist.kademlia.announce(stored_hash) catch {};
             res.ok();
         } else {
             sendError(res, 405, "MethodNotAllowed", "Method not allowed");
@@ -3138,8 +3235,104 @@ fn handlePeerProtocol(ctx: *const S3Context, dist: *DistributedContext, allocato
         res.ok();
         res.setHeader("Content-Type", "application/json");
         res.body = try json.toOwnedSlice(allocator);
+    } else if (std.mem.eql(u8, path, "meta")) {
+        // Replicated metadata entry pushed from a peer
+        // Body: "<bucket>\n<key>\n<raw meta content>"
+        if (!std.mem.eql(u8, req.method, "POST")) {
+            sendError(res, 405, "MethodNotAllowed", "Use POST");
+            return;
+        }
+        const bucket_end = std.mem.indexOfScalar(u8, req.body, '\n') orelse {
+            sendError(res, 400, "InvalidRequest", "Missing bucket");
+            return;
+        };
+        const bucket = req.body[0..bucket_end];
+        const key_end = std.mem.indexOfScalarPos(u8, req.body, bucket_end + 1, '\n') orelse {
+            sendError(res, 400, "InvalidRequest", "Missing key");
+            return;
+        };
+        const key = req.body[bucket_end + 1 .. key_end];
+        const content = req.body[key_end + 1 ..];
+
+        if (!isValidBucketName(bucket) or !isValidKey(key)) {
+            sendError(res, 400, "InvalidRequest", "Invalid bucket or key");
+            return;
+        }
+        applyRemoteMeta(ctx, allocator, bucket, key, content) catch {
+            sendError(res, 400, "InvalidRequest", "Invalid meta entry");
+            return;
+        };
+        res.ok();
+    } else if (std.mem.eql(u8, path, "meta_get")) {
+        // Metadata lookup for a peer's read-through fallback
+        // Body: "<bucket>\n<key>", response: raw meta content (may be a tombstone)
+        if (!std.mem.eql(u8, req.method, "POST")) {
+            sendError(res, 405, "MethodNotAllowed", "Use POST");
+            return;
+        }
+        const bucket_end = std.mem.indexOfScalar(u8, req.body, '\n') orelse {
+            sendError(res, 400, "InvalidRequest", "Missing bucket");
+            return;
+        };
+        const bucket = req.body[0..bucket_end];
+        const key = req.body[bucket_end + 1 ..];
+
+        if (!isValidBucketName(bucket) or !isValidKey(key)) {
+            sendError(res, 400, "InvalidRequest", "Invalid bucket or key");
+            return;
+        }
+        const content = (dist.meta_index.readRaw(allocator, bucket, key) catch null) orelse {
+            sendError(res, 404, "NotFound", "No metadata for key");
+            return;
+        };
+        res.ok();
+        res.body = content;
+    } else if (std.mem.eql(u8, path, "index")) {
+        // Full index dump for a joining peer
+        if (!std.mem.eql(u8, req.method, "GET")) {
+            sendError(res, 405, "MethodNotAllowed", "Use GET");
+            return;
+        }
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        dumpMetaIndex(dist, allocator, &out) catch {
+            out.deinit(allocator);
+            sendError(res, 500, "InternalError", "Index dump failed");
+            return;
+        };
+        res.ok();
+        res.body = try out.toOwnedSlice(allocator);
+    } else if (std.mem.eql(u8, path, "bucket")) {
+        // Bucket creation propagated from a peer (body: bucket name)
+        if (!std.mem.eql(u8, req.method, "POST")) {
+            sendError(res, 405, "MethodNotAllowed", "Use POST");
+            return;
+        }
+        if (!isValidBucketName(req.body)) {
+            sendError(res, 400, "InvalidBucketName", "Bucket name is invalid");
+            return;
+        }
+        const bucket_path = try ctx.bucketPath(allocator, req.body);
+        defer allocator.free(bucket_path);
+        std.Io.Dir.cwd().createDirPath(app_io, bucket_path) catch {};
+        res.ok();
+    } else if (std.mem.eql(u8, path, "bucket_delete")) {
+        // Bucket deletion propagated from a peer (best-effort, only if empty)
+        if (!std.mem.eql(u8, req.method, "POST")) {
+            sendError(res, 405, "MethodNotAllowed", "Use POST");
+            return;
+        }
+        if (!isValidBucketName(req.body)) {
+            sendError(res, 400, "InvalidBucketName", "Bucket name is invalid");
+            return;
+        }
+        const bucket_path = try ctx.bucketPath(allocator, req.body);
+        defer allocator.free(bucket_path);
+        std.Io.Dir.cwd().deleteDir(app_io, bucket_path) catch {};
+        const index_path = try std.fs.path.join(allocator, &.{ dist.meta_index.data_dir, ".index", req.body });
+        defer allocator.free(index_path);
+        std.Io.Dir.cwd().deleteDir(app_io, index_path) catch {};
+        res.ok();
     } else {
-        _ = ctx;
         sendError(res, 404, "NotFound", "Unknown peer endpoint");
     }
 }
@@ -3170,6 +3363,13 @@ fn handleDistributedPut(ctx: *const S3Context, allocator: Allocator, req: *Reque
         dist.replication.schedule(hash) catch {};
     }
 
+    // Propagate the namespace entry to peers; replicate CAS blobs
+    propagateObjectMeta(ctx, allocator, bucket, key);
+    if (req.body.len > INLINE_THRESHOLD) {
+        broadcastAnnounce(dist, allocator, hash, dist.config.node_id);
+        replicateBlob(dist, allocator, hash);
+    }
+
     // Return ETag as content hash
     const etag = try std.fmt.allocPrint(allocator, "\"{x}\"", .{hash});
 
@@ -3181,11 +3381,13 @@ fn handleDistributedPut(ctx: *const S3Context, allocator: Allocator, req: *Reque
 fn handleDistributedGet(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
     const dist = ctx.distributed.?;
 
-    // Lookup full metadata (includes inline data if present)
-    const meta = try dist.meta_index.getFull(allocator, bucket, key) orelse {
-        sendError(res, 404, "NoSuchKey", "Object not found");
-        return;
-    };
+    // Lookup full metadata (includes inline data if present),
+    // falling back to a peer lookup when the entry isn't known locally
+    const meta = try dist.meta_index.getFull(allocator, bucket, key) orelse
+        fetchMetaFromPeers(ctx, allocator, bucket, key) orelse {
+            sendError(res, 404, "NoSuchKey", "Object not found");
+            return;
+        };
     // Note: inline_data is arena-allocated and will be freed with the request arena
 
     // Check for inline data first (small objects stored in metadata)
@@ -3203,34 +3405,38 @@ fn handleDistributedGet(ctx: *const S3Context, allocator: Allocator, req: *Reque
         return serveContent(allocator, req, res, data, &meta.hash, meta.created);
     } else |_| {}
 
-    // Content not local - query DHT for providers and use quorum reads
+    // Content not local - try known providers first, verifying content hashes
     const providers = dist.kademlia.findProviders(meta.hash);
-    if (providers.len == 0) {
-        sendError(res, 404, "NoSuchKey", "Content not available (no providers)");
-        return;
+    for (providers) |provider_id| {
+        const peer = dist.kademlia.findPeerById(provider_id) orelse continue;
+        if (fetchVerifyServe(dist, allocator, req, res, peer.address, &meta)) return;
     }
 
-    // Quorum read: try to get content from multiple providers
-    // In a real implementation, we'd query providers in parallel and verify hashes match
-    // For now, try providers sequentially until we get valid content
-    for (providers) |provider_id| {
-        // Find peer address
-        const peer = dist.kademlia.findPeerById(provider_id) orelse continue;
-
-        // Fetch from remote peer
-        if (fetchFromPeer(allocator, peer.address, meta.hash)) |data| {
-            // Verify hash matches (quorum verification)
-            const fetched_hash = CAS.computeHash(data);
-            if (std.mem.eql(u8, &fetched_hash, &meta.hash)) {
-                // Cache locally for future reads
-                _ = dist.cas.store(allocator, data) catch {};
-                return serveContent(allocator, req, res, data, &meta.hash, meta.created);
-            }
-            allocator.free(data);
-        } else |_| {}
+    // No usable provider record (e.g. this node joined after the announce) -
+    // sweep all known peers; the blob endpoint 404s harmlessly on peers without it
+    var peers: [MAX_BROADCAST_PEERS]PeerInfo = undefined;
+    const peer_count = dist.kademlia.collectPeers(&peers);
+    for (peers[0..peer_count]) |peer| {
+        if (fetchVerifyServe(dist, allocator, req, res, peer.address, &meta)) return;
     }
 
     sendError(res, 404, "NoSuchKey", "Content not available from any provider");
+}
+
+/// Fetch a blob from one peer, verify its hash, cache it, and serve it.
+/// Returns false (without touching the response) if the peer can't supply it.
+fn fetchVerifyServe(dist: *DistributedContext, allocator: Allocator, req: *Request, res: *Response, address: net.IpAddress, meta: *const MetaIndex.ObjectMeta) bool {
+    const data = fetchFromPeer(allocator, address, meta.hash) catch return false;
+    const fetched_hash = CAS.computeHash(data);
+    if (!std.mem.eql(u8, &fetched_hash, &meta.hash)) {
+        allocator.free(data);
+        return false;
+    }
+    // Cache locally for future reads and record ourselves as provider
+    _ = dist.cas.store(allocator, data) catch {};
+    dist.kademlia.announce(meta.hash) catch {};
+    serveContent(allocator, req, res, data, &meta.hash, meta.created);
+    return true;
 }
 
 /// Serve content with range request support
@@ -3272,49 +3478,264 @@ fn serveContent(allocator: Allocator, req: *Request, res: *Response, data: []con
 
 /// Fetch content from a remote peer
 fn fetchFromPeer(allocator: Allocator, address: net.IpAddress, hash: ContentHash) ![]const u8 {
-    // Connect to peer
-    var stream = address.connect(app_io, .{ .mode = .stream }) catch return error.ConnectionFailed;
-    defer stream.close(app_io);
-
-    // Build request
     var hash_hex: [40]u8 = undefined;
     bytesToHex(&hash, &hash_hex);
-
-    var req_buf: [256]u8 = undefined;
-    const request = std.fmt.bufPrint(&req_buf, "GET /_zs3/blob/{s} HTTP/1.1\r\nHost: {any}\r\nConnection: close\r\n\r\n", .{ hash_hex, address }) catch return error.BufferTooSmall;
-    streamWriteAll(stream, request) catch return error.WriteFailed;
-
-    // Read response
-    var response_buf = try allocator.alloc(u8, MAX_BODY_SIZE); // match standalone max
-    errdefer allocator.free(response_buf);
-
-    var total_read: usize = 0;
-    while (total_read < response_buf.len) {
-        const bytes = streamRead(stream, response_buf[total_read..]) catch break;
-        if (bytes == 0) break;
-        total_read += bytes;
-    }
-
-    // Parse response - find body after \r\n\r\n
-    const response = response_buf[0..total_read];
-    const header_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return error.InvalidResponse;
-
-    // Check status
-    if (!std.mem.startsWith(u8, response, "HTTP/1.1 200")) {
-        allocator.free(response_buf);
-        return error.NotFound;
-    }
-
-    const body = response[header_end + 4 ..];
-    const result = try allocator.dupe(u8, body);
-    allocator.free(response_buf);
-    return result;
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/_zs3/blob/{s}", .{hash_hex}) catch return error.BufferTooSmall;
+    return peerRequest(allocator, address, "GET", path, "", MAX_BODY_SIZE);
 }
 
-/// Distributed DELETE - remove metadata (CAS content can be garbage collected)
+/// Set send/receive timeouts on a peer socket so a stuck peer can't wedge
+/// the event loop (peer requests are synchronous within a request handler)
+fn setPeerTimeout(stream: net.Stream) void {
+    const tv = posix.timeval{ .sec = PEER_IO_TIMEOUT_SECS, .usec = 0 };
+    posix.setsockopt(stream.socket.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+    posix.setsockopt(stream.socket.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+}
+
+/// Send a request to a peer's /_zs3/ endpoint and return the response body
+fn peerRequest(allocator: Allocator, address: net.IpAddress, method: []const u8, path: []const u8, body: []const u8, max_response: usize) ![]u8 {
+    var stream = address.connect(app_io, .{ .mode = .stream }) catch return error.ConnectionFailed;
+    defer stream.close(app_io);
+    setPeerTimeout(stream);
+
+    var header_buf: [512]u8 = undefined;
+    const header = std.fmt.bufPrint(&header_buf, "{s} {s} HTTP/1.1\r\nHost: {any}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ method, path, address, body.len }) catch return error.BufferTooSmall;
+    streamWriteAll(stream, header) catch return error.WriteFailed;
+    if (body.len > 0) streamWriteAll(stream, body) catch return error.WriteFailed;
+
+    var response: std.ArrayListUnmanaged(u8) = .empty;
+    defer response.deinit(allocator);
+    var chunk: [16 * 1024]u8 = undefined;
+    while (true) {
+        const n = streamRead(stream, &chunk) catch break;
+        if (n == 0) break;
+        try response.appendSlice(allocator, chunk[0..n]);
+        if (response.items.len > max_response) return error.ResponseTooLarge;
+    }
+
+    const data = response.items;
+    const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return error.InvalidResponse;
+    if (!std.mem.startsWith(u8, data, "HTTP/1.1 200")) return error.RequestFailed;
+    return allocator.dupe(u8, data[header_end + 4 ..]);
+}
+
+/// Best-effort broadcast of a peer-protocol request to all known peers
+fn broadcastToPeers(dist: *DistributedContext, allocator: Allocator, method: []const u8, path: []const u8, body: []const u8) void {
+    var peers: [MAX_BROADCAST_PEERS]PeerInfo = undefined;
+    const n = dist.kademlia.collectPeers(&peers);
+    for (peers[0..n]) |peer| {
+        const response = peerRequest(allocator, peer.address, method, path, body, 4096) catch continue;
+        allocator.free(response);
+    }
+}
+
+/// Parse the logical timestamp of a raw meta entry: max(created, deleted).
+/// Returns null if the content doesn't parse as a meta entry (also validates).
+pub fn metaContentTimestamp(content: []const u8) ?i64 {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    const hash_hex = lines.next() orelse return null;
+    if (hash_hex.len != 40) return null;
+    var hash: ContentHash = undefined;
+    _ = std.fmt.hexToBytes(&hash, hash_hex) catch return null;
+    _ = std.fmt.parseInt(u64, lines.next() orelse return null, 10) catch return null;
+    const created = std.fmt.parseInt(i64, lines.next() orelse return null, 10) catch return null;
+    const deleted = std.fmt.parseInt(i64, lines.next() orelse return null, 10) catch return null;
+    return @max(created, deleted);
+}
+
+pub fn isTombstoneContent(content: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    _ = lines.next(); // hash
+    _ = lines.next(); // size
+    _ = lines.next(); // created
+    const deleted_str = lines.next() orelse return false;
+    const deleted = std.fmt.parseInt(i64, deleted_str, 10) catch return false;
+    return deleted > 0;
+}
+
+/// Apply a meta entry received from a peer with last-write-wins conflict
+/// resolution (ties prefer the tombstone so deletes don't resurrect)
+fn applyRemoteMeta(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, key: []const u8, content: []const u8) !void {
+    const dist = ctx.distributed.?;
+    const incoming_ts = metaContentTimestamp(content) orelse return error.InvalidMeta;
+
+    if (dist.meta_index.readRaw(allocator, bucket, key) catch null) |existing| {
+        defer allocator.free(existing);
+        if (metaContentTimestamp(existing)) |existing_ts| {
+            if (existing_ts > incoming_ts) return;
+            if (existing_ts == incoming_ts and !isTombstoneContent(content)) return;
+        }
+    }
+
+    // Ensure the bucket data dir exists so ListBuckets sees the bucket
+    const bucket_path = try ctx.bucketPath(allocator, bucket);
+    defer allocator.free(bucket_path);
+    std.Io.Dir.cwd().createDirPath(app_io, bucket_path) catch {};
+
+    try dist.meta_index.writeRaw(allocator, bucket, key, content);
+}
+
+/// Push the local meta entry (object or tombstone) for bucket/key to all peers
+fn propagateObjectMeta(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, key: []const u8) void {
+    const dist = ctx.distributed orelse return;
+    const content = (dist.meta_index.readRaw(allocator, bucket, key) catch return) orelse return;
+    defer allocator.free(content);
+
+    const body = std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}", .{ bucket, key, content }) catch return;
+    defer allocator.free(body);
+    broadcastToPeers(dist, allocator, "POST", "/_zs3/meta", body);
+}
+
+/// Tell all peers that `provider` has the content for `hash`
+fn broadcastAnnounce(dist: *DistributedContext, allocator: Allocator, hash: ContentHash, provider: NodeId) void {
+    var hash_hex: [40]u8 = undefined;
+    bytesToHex(&hash, &hash_hex);
+    var provider_hex: [40]u8 = undefined;
+    bytesToHex(&provider, &provider_hex);
+
+    var body_buf: [81]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf, "{s}\n{s}", .{ hash_hex, provider_hex }) catch return;
+    broadcastToPeers(dist, allocator, "POST", "/_zs3/announce", body);
+}
+
+/// Push a CAS blob to peers until the replication target is met
+/// (this node counts as one replica), announcing each new holder
+fn replicateBlob(dist: *DistributedContext, allocator: Allocator, hash: ContentHash) void {
+    if (dist.replication.target_replicas <= 1) return;
+    const data = dist.cas.retrieve(allocator, hash) catch return;
+    defer allocator.free(data);
+
+    var hash_hex: [40]u8 = undefined;
+    bytesToHex(&hash, &hash_hex);
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/_zs3/blob/{s}", .{hash_hex}) catch return;
+
+    var peers: [MAX_BROADCAST_PEERS]PeerInfo = undefined;
+    const n = dist.kademlia.collectPeers(&peers);
+    var replicas: usize = 1;
+    for (peers[0..n]) |peer| {
+        if (replicas >= dist.replication.target_replicas) break;
+        const response = peerRequest(allocator, peer.address, "PUT", path, data, 4096) catch continue;
+        allocator.free(response);
+        replicas += 1;
+        dist.kademlia.addProvider(hash, peer.id) catch {};
+        broadcastAnnounce(dist, allocator, hash, peer.id);
+    }
+}
+
+/// Read-through fallback: on a local metadata miss, ask peers for the entry.
+/// Caches whatever it learns locally (including tombstones) via LWW.
+fn fetchMetaFromPeers(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, key: []const u8) ?MetaIndex.ObjectMeta {
+    const dist = ctx.distributed.?;
+
+    const body = std.fmt.allocPrint(allocator, "{s}\n{s}", .{ bucket, key }) catch return null;
+    defer allocator.free(body);
+
+    var peers: [MAX_BROADCAST_PEERS]PeerInfo = undefined;
+    const n = dist.kademlia.collectPeers(&peers);
+    for (peers[0..n]) |peer| {
+        const content = peerRequest(allocator, peer.address, "POST", "/_zs3/meta_get", body, MAX_META_RESPONSE) catch continue;
+        defer allocator.free(content);
+
+        applyRemoteMeta(ctx, allocator, bucket, key, content) catch continue;
+        // Re-read locally: null means the entry is a tombstone
+        const meta = (dist.meta_index.getFull(allocator, bucket, key) catch null) orelse continue;
+
+        // The source peer can serve the blob for CAS-backed objects
+        if (meta.inline_data == null and meta.size > 0) {
+            dist.kademlia.addProvider(meta.hash, peer.id) catch {};
+        }
+        return meta;
+    }
+    return null;
+}
+
+/// Pull the full metadata index from a peer (join-time sync).
+/// Wire format per entry: "<bucket>\n<key>\n<content_len>\n" + content bytes.
+fn syncIndexFromPeer(allocator: Allocator, ctx: *const S3Context, peer: PeerInfo) void {
+    const body = peerRequest(allocator, peer.address, "GET", "/_zs3/index", "", MAX_INDEX_SYNC_SIZE) catch |err| {
+        std.log.warn("Index sync from peer failed: {t}", .{err});
+        return;
+    };
+    defer allocator.free(body);
+
+    var applied: usize = 0;
+    var offset: usize = 0;
+    while (offset < body.len) {
+        const bucket_end = std.mem.indexOfScalarPos(u8, body, offset, '\n') orelse break;
+        const bucket = body[offset..bucket_end];
+        const key_end = std.mem.indexOfScalarPos(u8, body, bucket_end + 1, '\n') orelse break;
+        const key = body[bucket_end + 1 .. key_end];
+        const len_end = std.mem.indexOfScalarPos(u8, body, key_end + 1, '\n') orelse break;
+        const content_len = std.fmt.parseInt(usize, body[key_end + 1 .. len_end], 10) catch break;
+        if (len_end + 1 + content_len > body.len) break;
+        const content = body[len_end + 1 ..][0..content_len];
+        offset = len_end + 1 + content_len;
+
+        if (!isValidBucketName(bucket) or !isValidKey(key)) continue;
+        applyRemoteMeta(ctx, allocator, bucket, key, content) catch continue;
+        applied += 1;
+    }
+    std.log.info("Synced {d} metadata entries from bootstrap peer", .{applied});
+}
+
+/// Serialize the entire metadata index (including tombstones) for a joining peer
+fn dumpMetaIndex(dist: *const DistributedContext, allocator: Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+    const index_path = try std.fs.path.join(allocator, &.{ dist.meta_index.data_dir, ".index" });
+    defer allocator.free(index_path);
+
+    var dir = std.Io.Dir.cwd().openDir(app_io, index_path, .{ .iterate = true }) catch return;
+    defer dir.close(app_io);
+
+    var iter = dir.iterate();
+    while (try iter.next(app_io)) |entry| {
+        if (entry.kind != .directory or entry.name[0] == '.') continue;
+        const bucket = try allocator.dupe(u8, entry.name);
+        defer allocator.free(bucket);
+        try dumpMetaDir(dist, allocator, bucket, "", out);
+    }
+}
+
+fn dumpMetaDir(dist: *const DistributedContext, allocator: Allocator, bucket: []const u8, prefix: []const u8, out: *std.ArrayListUnmanaged(u8)) !void {
+    const dir_path = if (prefix.len > 0)
+        try std.fs.path.join(allocator, &.{ dist.meta_index.data_dir, ".index", bucket, prefix })
+    else
+        try std.fs.path.join(allocator, &.{ dist.meta_index.data_dir, ".index", bucket });
+    defer allocator.free(dir_path);
+
+    var dir = std.Io.Dir.cwd().openDir(app_io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(app_io);
+
+    var iter = dir.iterate();
+    while (try iter.next(app_io)) |entry| {
+        if (entry.name[0] == '.') continue;
+        const full_name = if (prefix.len > 0)
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name })
+        else
+            try allocator.dupe(u8, entry.name);
+        defer allocator.free(full_name);
+
+        if (entry.kind == .directory) {
+            try dumpMetaDir(dist, allocator, bucket, full_name, out);
+        } else if (std.mem.endsWith(u8, entry.name, ".meta")) {
+            const key = full_name[0 .. full_name.len - 5];
+            const content = (dist.meta_index.readRaw(allocator, bucket, key) catch continue) orelse continue;
+            defer allocator.free(content);
+
+            const frame = try std.fmt.allocPrint(allocator, "{s}\n{s}\n{d}\n", .{ bucket, key, content.len });
+            defer allocator.free(frame);
+            try out.appendSlice(allocator, frame);
+            try out.appendSlice(allocator, content);
+        }
+    }
+}
+
+/// Distributed DELETE - write tombstone and propagate it to peers
 fn handleDistributedDelete(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, key: []const u8) !void {
     const dist = ctx.distributed.?;
     dist.meta_index.delete(allocator, bucket, key);
+    propagateObjectMeta(ctx, allocator, bucket, key);
     res.noContent();
 }
 
@@ -3498,10 +3919,11 @@ fn collectMetaKeys(allocator: Allocator, base_path: []const u8, current_prefix: 
 fn handleDistributedHead(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, key: []const u8) !void {
     const dist = ctx.distributed.?;
 
-    const meta = try dist.meta_index.getFull(allocator, bucket, key) orelse {
-        sendError(res, 404, "NoSuchKey", "Object not found");
-        return;
-    };
+    const meta = try dist.meta_index.getFull(allocator, bucket, key) orelse
+        fetchMetaFromPeers(ctx, allocator, bucket, key) orelse {
+            sendError(res, 404, "NoSuchKey", "Object not found");
+            return;
+        };
     if (meta.inline_data) |data| allocator.free(data);
 
     const size_str = std.fmt.allocPrint(allocator, "{d}", .{meta.size}) catch {
