@@ -642,8 +642,12 @@ const Kademlia = struct {
 
     self_id: NodeId,
     buckets: [ID_BITS]KBucket,
+    // Provider records are only touched from the event-loop thread
     providers: std.AutoHashMap(ContentHash, std.ArrayListUnmanaged(NodeId)),
     allocator: Allocator,
+    // Guards `buckets`: the push worker reads/updates the routing table
+    // (gossip, peer snapshots) concurrently with the event loop
+    mutex: std.Io.Mutex = .init,
 
     /// A single k-bucket holding up to K peers
     const KBucket = struct {
@@ -763,12 +767,16 @@ const Kademlia = struct {
     pub fn addPeer(self: *Kademlia, peer: PeerInfo) void {
         if (std.mem.eql(u8, &peer.id, &self.self_id)) return; // Don't add self
         const idx = self.bucketIndex(peer.id);
+        self.mutex.lockUncancelable(app_io);
+        defer self.mutex.unlock(app_io);
         self.buckets[idx].add(peer);
     }
 
     /// Remove a peer from the routing table
     pub fn removePeer(self: *Kademlia, id: NodeId) void {
         const idx = self.bucketIndex(id);
+        self.mutex.lockUncancelable(app_io);
+        defer self.mutex.unlock(app_io);
         self.buckets[idx].remove(id);
     }
 
@@ -787,6 +795,8 @@ const Kademlia = struct {
         var count: usize = 0;
 
         // Collect all peers with their distances
+        self.mutex.lockUncancelable(app_io);
+        defer self.mutex.unlock(app_io);
         for (&self.buckets) |*bucket| {
             var peers: [K]PeerInfo = undefined;
             const n = bucket.getPeers(&peers);
@@ -856,6 +866,8 @@ const Kademlia = struct {
 
     /// Find a peer by its node ID
     pub fn findPeerById(self: *Kademlia, id: NodeId) ?PeerInfo {
+        self.mutex.lockUncancelable(app_io);
+        defer self.mutex.unlock(app_io);
         const bucket_idx = self.bucketIndex(id);
         for (self.buckets[bucket_idx].peers) |slot| {
             if (slot) |peer| {
@@ -878,8 +890,10 @@ const Kademlia = struct {
     }
 
     /// Get total peer count across all buckets
-    pub fn peerCount(self: *const Kademlia) usize {
+    pub fn peerCount(self: *Kademlia) usize {
         var count: usize = 0;
+        self.mutex.lockUncancelable(app_io);
+        defer self.mutex.unlock(app_io);
         for (self.buckets) |bucket| {
             count += bucket.count;
         }
@@ -887,8 +901,10 @@ const Kademlia = struct {
     }
 
     /// Collect known peers across all buckets (up to out.len)
-    pub fn collectPeers(self: *const Kademlia, out: []PeerInfo) usize {
+    pub fn collectPeers(self: *Kademlia, out: []PeerInfo) usize {
         var count: usize = 0;
+        self.mutex.lockUncancelable(app_io);
+        defer self.mutex.unlock(app_io);
         for (&self.buckets) |*bucket| {
             for (bucket.peers) |slot| {
                 if (slot) |peer| {
@@ -906,6 +922,7 @@ const Kademlia = struct {
         var all_peers: [MAX_PEERS]PeerInfo = undefined;
         var total: usize = 0;
 
+        self.mutex.lockUncancelable(app_io);
         for (&self.buckets) |*bucket| {
             var peers: [K]PeerInfo = undefined;
             const n = bucket.getPeers(&peers);
@@ -916,6 +933,7 @@ const Kademlia = struct {
                 }
             }
         }
+        self.mutex.unlock(app_io);
 
         if (total == 0) return 0;
 
@@ -981,7 +999,92 @@ const DistributedConfig = struct {
     bootstrap_peers: []const []const u8 = &.{},
     target_replicas: u8 = REPLICATION_TARGET,
     http_port: u16 = 9000,
+    gossip_interval_ms: u64 = GOSSIP_INTERVAL_MS,
 };
+
+/// Background worker: replicates blobs, propagates bucket ops, and gossips
+/// with peers periodically — all off the request path so client writes only
+/// pay for the (small, synchronous) metadata push.
+const PushWorker = struct {
+    const Job = union(enum) {
+        blob: struct { hash: ContentHash },
+        bucket: struct { name: []u8, deleted: bool },
+    };
+
+    const POLL_INTERVAL_MS = 50;
+
+    dist: *DistributedContext = undefined,
+    mutex: std.Io.Mutex = .init,
+    jobs: std.ArrayListUnmanaged(Job) = .empty,
+
+    /// Called from the event-loop thread; job memory must be owned by
+    /// std.heap.page_allocator (freed on the worker thread)
+    pub fn enqueue(self: *PushWorker, job: Job) void {
+        self.mutex.lockUncancelable(app_io);
+        defer self.mutex.unlock(app_io);
+        self.jobs.append(std.heap.page_allocator, job) catch return;
+    }
+
+    pub fn run(self: *PushWorker) void {
+        const allocator = std.heap.page_allocator;
+        const interval_ms: i64 = @intCast(self.dist.config.gossip_interval_ms);
+        var last_gossip = std.Io.Clock.real.now(app_io).toMilliseconds();
+
+        while (true) {
+            self.mutex.lockUncancelable(app_io);
+            const job: ?Job = if (self.jobs.items.len > 0) self.jobs.orderedRemove(0) else null;
+            self.mutex.unlock(app_io);
+
+            if (job) |j| {
+                self.execute(allocator, j);
+            } else {
+                std.Io.sleep(app_io, .fromMilliseconds(POLL_INTERVAL_MS), .real) catch {};
+            }
+
+            const now = std.Io.Clock.real.now(app_io).toMilliseconds();
+            if (now - last_gossip >= interval_ms) {
+                last_gossip = now;
+                gossipOnce(allocator, self.dist);
+            }
+        }
+    }
+
+    fn execute(self: *PushWorker, allocator: Allocator, job: Job) void {
+        const dist = self.dist;
+        switch (job) {
+            .blob => |b| {
+                broadcastAnnounce(dist, allocator, b.hash, dist.config.node_id);
+                replicateBlob(dist, allocator, b.hash);
+            },
+            .bucket => |b| {
+                defer std.heap.page_allocator.free(b.name);
+                const path = if (b.deleted) "/_zs3/bucket_delete" else "/_zs3/bucket";
+                broadcastToPeers(dist, allocator, "POST", path, b.name);
+            },
+        }
+    }
+};
+
+/// One gossip round: refresh a few random peers (they also learn about us
+/// via the ping handshake) and pull their peer lists to repair the mesh
+fn gossipOnce(allocator: Allocator, dist: *DistributedContext) void {
+    var peers: [MAX_BROADCAST_PEERS]PeerInfo = undefined;
+    const n = dist.kademlia.collectPeers(&peers);
+    if (n == 0) return;
+
+    const rounds = @min(n, 3);
+    var seed: u64 = undefined;
+    app_io.random(std.mem.asBytes(&seed));
+    var prng = std.Random.DefaultPrng.init(seed);
+    const start = prng.random().uintLessThan(usize, n);
+    for (0..rounds) |i| {
+        const peer = peers[(start + i) % n];
+        if (pingPeerAddress(allocator, dist, peer.address)) |fresh| {
+            dist.kademlia.addPeer(fresh); // refreshes last_seen
+        } else |_| {}
+        discoverPeersFrom(allocator, dist, peer);
+    }
+}
 
 /// Extended context for distributed mode
 const DistributedContext = struct {
@@ -990,6 +1093,7 @@ const DistributedContext = struct {
     meta_index: MetaIndex,
     kademlia: Kademlia,
     replication: ReplicationManager,
+    worker: PushWorker,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, data_dir: []const u8, config: DistributedConfig) DistributedContext {
@@ -999,6 +1103,7 @@ const DistributedContext = struct {
             .meta_index = .{ .data_dir = data_dir },
             .kademlia = Kademlia.init(allocator, config.node_id),
             .replication = ReplicationManager.init(allocator),
+            .worker = .{},
             .allocator = allocator,
         };
     }
@@ -1018,6 +1123,7 @@ pub fn main(init: std.process.Init) !void {
     var bootstrap_peers: [10][]const u8 = undefined;
     var bootstrap_count: usize = 0;
     var port: u16 = 9000;
+    var gossip_interval_ms: u64 = GOSSIP_INTERVAL_MS;
     var data_dir: []const u8 = build_options.data_dir;
     var raw_acl_list: []const u8 = build_options.acl_list;
     var show_help: bool = false;
@@ -1043,6 +1149,8 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (std.mem.startsWith(u8, arg, "--port=")) {
             port = std.fmt.parseInt(u16, arg[7..], 10) catch 9000;
+        } else if (std.mem.startsWith(u8, arg, "--gossip-interval-ms=")) {
+            gossip_interval_ms = std.fmt.parseInt(u64, arg[21..], 10) catch GOSSIP_INTERVAL_MS;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             show_help = true;
         }
@@ -1061,6 +1169,9 @@ pub fn main(init: std.process.Init) !void {
             \\  --bootstrap=PEERS
             \\      Comma-separated bootstrap peer addresses
             \\
+            \\  --gossip-interval-ms={d}
+            \\      Interval for background peer gossip/refresh
+            \\
             \\  --port={d}
             \\      HTTP port to listen on
             \\
@@ -1078,7 +1189,7 @@ pub fn main(init: std.process.Init) !void {
             \\  zs3 --distributed                      # Distributed, auto-discover via mDNS
             \\  zs3 -d --bootstrap=10.0.0.1:9000       # Distributed with bootstrap peer
             \\
-        , .{ port, data_dir, raw_acl_list });
+        , .{ GOSSIP_INTERVAL_MS, port, data_dir, raw_acl_list });
         return;
     }
 
@@ -1109,6 +1220,7 @@ pub fn main(init: std.process.Init) !void {
             .node_id = node_id,
             .bootstrap_peers = bootstrap_peers[0..bootstrap_count],
             .http_port = port,
+            .gossip_interval_ms = gossip_interval_ms,
         };
         dist_ctx = DistributedContext.init(allocator, data_dir, config);
 
@@ -1168,6 +1280,11 @@ pub fn main(init: std.process.Init) !void {
     if (distributed_enabled) {
         std.log.info("dS3 server listening on http://0.0.0.0:{d}", .{port});
         bootstrapPeers(allocator, &ctx, &dist_ctx.?);
+
+        // Background replication/gossip worker
+        dist_ctx.?.worker.dist = &dist_ctx.?;
+        const worker_thread = try std.Thread.spawn(.{}, PushWorker.run, .{&dist_ctx.?.worker});
+        worker_thread.detach();
     } else {
         std.log.info("S3 server listening on http://0.0.0.0:{d}", .{port});
     }
@@ -1217,7 +1334,7 @@ fn pingPeerAddress(allocator: Allocator, dist: *const DistributedContext, addres
     var request_buffer: [512]u8 = undefined;
     const request = std.fmt.bufPrint(
         &request_buffer,
-        "GET /_zs3/ping HTTP/1.1\r\nHost: {any}\r\nX-Zs3-Node-Id: {s}\r\nX-Zs3-Port: {d}\r\nConnection: close\r\n\r\n",
+        "GET /_zs3/ping HTTP/1.1\r\nHost: {f}\r\nX-Zs3-Node-Id: {s}\r\nX-Zs3-Port: {d}\r\nConnection: close\r\n\r\n",
         .{ address, self_id_hex, dist.config.http_port },
     ) catch return error.BufferTooSmall;
     try streamWriteAll(stream, request);
@@ -1250,9 +1367,9 @@ fn pingPeerAddress(allocator: Allocator, dist: *const DistributedContext, addres
 }
 
 /// Learn about a bootstrap peer's peers, handshaking with each discovered
-/// node so the connection graph becomes bidirectional. Discovered peers are
-/// assumed to be reachable at the source's IP (the /peers gossip format only
-/// carries ports).
+/// node so the connection graph becomes bidirectional. Uses the gossiped
+/// "addr" field when present, falling back to the source's IP + gossiped
+/// port for older peers.
 fn discoverPeersFrom(allocator: Allocator, dist: *DistributedContext, source: PeerInfo) void {
     const body = peerRequest(allocator, source.address, "GET", "/_zs3/peers", "", 64 * 1024) catch return;
     defer allocator.free(body);
@@ -1272,8 +1389,21 @@ fn discoverPeersFrom(allocator: Allocator, dist: *DistributedContext, source: Pe
         while (port_end < chunk.len and std.ascii.isDigit(chunk[port_end])) port_end += 1;
         const port = std.fmt.parseInt(u16, chunk[port_idx + port_key.len .. port_end], 10) catch continue;
 
-        var address = source.address;
-        address.setPort(port);
+        var address: net.IpAddress = fallback: {
+            var a = source.address;
+            a.setPort(port);
+            break :fallback a;
+        };
+        const addr_key = "\"addr\":\"";
+        if (std.mem.indexOf(u8, chunk, addr_key)) |addr_idx| {
+            const addr_start = addr_idx + addr_key.len;
+            if (std.mem.indexOfScalarPos(u8, chunk, addr_start, '"')) |addr_end| {
+                if (net.IpAddress.parseLiteral(chunk[addr_start..addr_end])) |parsed| {
+                    address = parsed;
+                } else |_| {}
+            }
+        }
+
         const peer = pingPeerAddress(allocator, dist, address) catch continue;
         dist.kademlia.addPeer(peer);
     }
@@ -2655,7 +2785,9 @@ fn handleCreateBucket(ctx: *const S3Context, allocator: Allocator, res: *Respons
     };
 
     if (ctx.distributed) |dist| {
-        broadcastToPeers(dist, allocator, "POST", "/_zs3/bucket", bucket);
+        if (std.heap.page_allocator.dupe(u8, bucket)) |name| {
+            dist.worker.enqueue(.{ .bucket = .{ .name = name, .deleted = false } });
+        } else |_| {}
     }
 
     res.ok();
@@ -2691,7 +2823,9 @@ fn handleDeleteBucket(ctx: *const S3Context, allocator: Allocator, res: *Respons
     };
 
     if (ctx.distributed) |dist| {
-        broadcastToPeers(dist, allocator, "POST", "/_zs3/bucket_delete", bucket);
+        if (std.heap.page_allocator.dupe(u8, bucket)) |name| {
+            dist.worker.enqueue(.{ .bucket = .{ .name = name, .deleted = true } });
+        } else |_| {}
     }
 
     res.noContent();
@@ -2927,8 +3061,7 @@ fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Re
             }
             propagateObjectMeta(ctx, allocator, bucket, key);
             if (data.len > INLINE_THRESHOLD) {
-                broadcastAnnounce(dist, allocator, content_hash, dist.config.node_id);
-                replicateBlob(dist, allocator, content_hash);
+                dist.worker.enqueue(.{ .blob = .{ .hash = content_hash } });
             }
         }
     }
@@ -3091,8 +3224,8 @@ fn handlePeerProtocol(ctx: *const S3Context, dist: *DistributedContext, allocato
             var id_hex: [40]u8 = undefined;
             bytesToHex(&peer.id, &id_hex);
 
-            var buf: [128]u8 = undefined;
-            const peer_json = std.fmt.bufPrint(&buf, "{{\"id\":\"{s}\",\"port\":{d}}}", .{ id_hex, peer.address.getPort() }) catch continue;
+            var buf: [192]u8 = undefined;
+            const peer_json = std.fmt.bufPrint(&buf, "{{\"id\":\"{s}\",\"port\":{d},\"addr\":\"{f}\"}}", .{ id_hex, peer.address.getPort(), peer.address }) catch continue;
             try json.appendSlice(allocator, peer_json);
         }
 
@@ -3363,11 +3496,11 @@ fn handleDistributedPut(ctx: *const S3Context, allocator: Allocator, req: *Reque
         dist.replication.schedule(hash) catch {};
     }
 
-    // Propagate the namespace entry to peers; replicate CAS blobs
+    // Propagate the namespace entry to peers synchronously (small, keeps
+    // cross-node reads consistent); replicate CAS blobs in the background
     propagateObjectMeta(ctx, allocator, bucket, key);
     if (req.body.len > INLINE_THRESHOLD) {
-        broadcastAnnounce(dist, allocator, hash, dist.config.node_id);
-        replicateBlob(dist, allocator, hash);
+        dist.worker.enqueue(.{ .blob = .{ .hash = hash } });
     }
 
     // Return ETag as content hash
@@ -3500,7 +3633,7 @@ fn peerRequest(allocator: Allocator, address: net.IpAddress, method: []const u8,
     setPeerTimeout(stream);
 
     var header_buf: [512]u8 = undefined;
-    const header = std.fmt.bufPrint(&header_buf, "{s} {s} HTTP/1.1\r\nHost: {any}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ method, path, address, body.len }) catch return error.BufferTooSmall;
+    const header = std.fmt.bufPrint(&header_buf, "{s} {s} HTTP/1.1\r\nHost: {f}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ method, path, address, body.len }) catch return error.BufferTooSmall;
     streamWriteAll(stream, header) catch return error.WriteFailed;
     if (body.len > 0) streamWriteAll(stream, body) catch return error.WriteFailed;
 
@@ -3619,7 +3752,8 @@ fn replicateBlob(dist: *DistributedContext, allocator: Allocator, hash: ContentH
         const response = peerRequest(allocator, peer.address, "PUT", path, data, 4096) catch continue;
         allocator.free(response);
         replicas += 1;
-        dist.kademlia.addProvider(hash, peer.id) catch {};
+        // No local addProvider here: this runs on the worker thread and the
+        // providers map belongs to the event loop; peers learn via announce
         broadcastAnnounce(dist, allocator, hash, peer.id);
     }
 }

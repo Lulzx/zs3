@@ -199,6 +199,7 @@ class Cluster:
             "--distributed",
             f"--port={port}",
             f"--data-dir={self.root / name}",
+            "--gossip-interval-ms=500",
         ]
         if bootstrap:
             argv.append("--bootstrap=" + ",".join(f"localhost:{self.ports[b]}" for b in bootstrap))
@@ -464,6 +465,40 @@ def scenario_restart_catchup(c):
           f"status {status}")
 
 
+def scenario_gossip_repair(c):
+    print("\n[periodic gossip repairs a wiped routing table]")
+    ping_a = wait_ready(c.port("a"))
+    ping_c = wait_ready(c.port("c"))
+    # Restart B with no --bootstrap: its in-memory routing table starts empty
+    c.stop("b")
+    c.start("b", bootstrap=None)
+    ping_b = wait_ready(c.port("b"))
+
+    def b_knows(node_id):
+        status, body = raw(c.port("b"), "GET", "/_zs3/peers")
+        return status == 200 and node_id.encode() in body
+
+    check("B relearns A via gossip", retry(lambda: b_knows(ping_a["id"]), timeout=15))
+    check("B relearns C via gossip", retry(lambda: b_knows(ping_c["id"]), timeout=15))
+
+    def a_knows_b():
+        status, body = raw(c.port("a"), "GET", "/_zs3/peers")
+        return status == 200 and ping_b["id"].encode() in body
+
+    check("A still knows B", retry(a_knows_b, timeout=15))
+    # B can serve reads again after repair (read-through via relearned peers)
+    status, body, _ = s3(c.port("b"), "GET", "/demo-bucket/versioned.txt")
+    check("B serves reads after repair", status == 200 and body == b"version 2 wins",
+          f"status {status}")
+
+
+def scenario_gossip_addr_format(c):
+    print("\n[gossip peer list carries full addresses]")
+    status, body = raw(c.port("a"), "GET", "/_zs3/peers")
+    check("peers JSON includes addr field", status == 200 and b'"addr":"127.0.0.1:' in body,
+          f"status {status}, body {body[:200]}")
+
+
 def scenario_bucket_lifecycle(c):
     print("\n[second bucket lifecycle]")
     status, _, _ = s3(c.port("c"), "PUT", "/short-lived")
@@ -484,8 +519,21 @@ def scenario_bucket_lifecycle(c):
 
 def scenario_origin_death(c, replicated_body):
     print("\n[origin death: blob survives via replicas]")
-    status, _, _ = s3(c.port("a"), "PUT", "/demo-bucket/final/replicated.bin", replicated_body)
+    status, _, headers = s3(c.port("a"), "PUT", "/demo-bucket/final/replicated.bin", replicated_body)
     check("PUT replicated blob on A", status == 200, f"status {status}")
+
+    # Blob replication is asynchronous: wait until the replication target is
+    # met on other nodes before killing the origin
+    blob_hash = (headers.get("ETag") or "").strip('"')
+
+    def replicas_ready():
+        holders = sum(
+            1 for node in ("b", "c", "d")
+            if raw(c.port(node), "GET", f"/_zs3/blob/{blob_hash}")[0] == 200
+        )
+        return holders >= 2
+
+    check("blob replicated to 2 peers", retry(replicas_ready, timeout=10))
     c.stop("a")
     check("node A stopped", not c.alive("a"))
     for node in ("b", "c", "d"):
@@ -559,6 +607,8 @@ def main():
             scenario_list_features(cluster)
             scenario_late_join(cluster, large_body)
             scenario_restart_catchup(cluster)
+            scenario_gossip_repair(cluster)
+            scenario_gossip_addr_format(cluster)
             scenario_bucket_lifecycle(cluster)
             scenario_peer_protocol_validation(cluster)
             scenario_origin_death(cluster, replicated_body)  # kills node A; keep last

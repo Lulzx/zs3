@@ -100,10 +100,14 @@ Other useful flags: `--port=PORT`, `--data-dir=PATH`, `--help`.
 All nodes share the same S3 API. PUT on any node, GET from any node.
 
 How the namespace stays in sync: every PUT/DELETE pushes the bucket/key
-metadata entry (and inline data for small objects) to all known peers,
-larger blobs are replicated to `REPLICATION_TARGET` nodes and announced in
-the DHT, a joining node pulls the full index from its bootstrap peers, and
-a GET for a key the node hasn't seen falls back to asking peers directly.
+metadata entry (and inline data for small objects) to all known peers
+before acknowledging, so cross-node reads are immediately consistent.
+Larger blobs are replicated to `REPLICATION_TARGET` nodes and announced in
+the DHT by a background worker, off the write path; a GET that arrives
+before replication lands falls back to fetching the blob from peers. A
+joining node pulls the full index from its bootstrap peers and discovers
+their peers, and a periodic gossip round (`--gossip-interval-ms`, default
+30s) refreshes liveness and repairs the mesh after restarts or partitions.
 Conflicts resolve last-write-wins at second granularity; deletes propagate
 as tombstones.
 
