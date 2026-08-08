@@ -625,6 +625,90 @@ const MetaIndex = struct {
     }
 };
 
+/// Last-write-wins bookkeeping for bucket create/delete propagation.
+///
+/// Bucket create and delete are broadcast by different nodes at different
+/// times, so a peer can receive them in either order. Without ordering, a
+/// late-arriving "bucket created" message resurrects a bucket that was
+/// deleted moments earlier (issue: flaky `HEAD <bucket>` on replicas).
+/// Each node persists per-bucket wall-clock timestamps for the last create
+/// and last delete; an incoming op only applies if it is newer, and on a
+/// timestamp tie the delete wins (matching the object-metadata tombstone
+/// convention, so a delete issued in the same second as a create sticks).
+///
+/// Persisted as `<create_ts>\n<delete_ts>\n` in `data_dir/.buckets/<bucket>`
+/// (a dot-directory, invisible to ListBuckets and index dumps).
+const BucketOps = struct {
+    data_dir: []const u8,
+
+    const State = struct {
+        create_ts: i64 = 0,
+        delete_ts: i64 = 0, // 0 = never deleted
+    };
+
+    fn path(self: *const BucketOps, allocator: Allocator, bucket: []const u8) ![]const u8 {
+        return std.fs.path.join(allocator, &.{ self.data_dir, ".buckets", bucket });
+    }
+
+    /// Read the persisted state; returns zeros when absent or unreadable.
+    fn read(self: *const BucketOps, allocator: Allocator, bucket: []const u8) State {
+        const p = self.path(allocator, bucket) catch return .{};
+        defer allocator.free(p);
+
+        var file = std.Io.Dir.cwd().openFile(app_io, p, .{}) catch return .{};
+        defer file.close(app_io);
+
+        const stat = file.stat(app_io) catch return .{};
+        if (stat.size > 128) return .{};
+        var buf: [128]u8 = undefined;
+        _ = file.readPositionalAll(app_io, buf[0..@intCast(stat.size)], 0) catch return .{};
+        var lines = std.mem.splitScalar(u8, buf[0..@intCast(stat.size)], '\n');
+        const create_ts = std.fmt.parseInt(i64, lines.next() orelse return .{}, 10) catch return .{};
+        const delete_ts = std.fmt.parseInt(i64, lines.next() orelse return .{}, 10) catch return .{};
+        return .{ .create_ts = create_ts, .delete_ts = delete_ts };
+    }
+
+    fn write(self: *const BucketOps, allocator: Allocator, bucket: []const u8, state: State) void {
+        const p = self.path(allocator, bucket) catch return;
+        defer allocator.free(p);
+        if (std.fs.path.dirname(p)) |dir| {
+            std.Io.Dir.cwd().createDirPath(app_io, dir) catch {};
+        }
+        var file = std.Io.Dir.cwd().createFile(app_io, p, .{}) catch return;
+        defer file.close(app_io);
+        var buf: [64]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{d}\n{d}\n", .{ state.create_ts, state.delete_ts }) catch return;
+        file.writeStreamingAll(app_io, text) catch {};
+    }
+
+    /// Record a local or accepted create at `ts`.
+    fn noteCreate(self: *const BucketOps, allocator: Allocator, bucket: []const u8, ts: i64) void {
+        const state = self.read(allocator, bucket);
+        self.write(allocator, bucket, .{ .create_ts = @max(state.create_ts, ts), .delete_ts = state.delete_ts });
+    }
+
+    /// Record a local or accepted delete at `ts`.
+    fn noteDelete(self: *const BucketOps, allocator: Allocator, bucket: []const u8, ts: i64) void {
+        const state = self.read(allocator, bucket);
+        self.write(allocator, bucket, .{ .create_ts = state.create_ts, .delete_ts = @max(state.delete_ts, ts) });
+    }
+
+    /// A peer's create is applicable when it is strictly newer than any local
+    /// delete; on a tie the delete wins so a deleted bucket cannot resurrect.
+    fn shouldApplyCreate(self: *const BucketOps, allocator: Allocator, bucket: []const u8, create_ts: i64) bool {
+        const state = self.read(allocator, bucket);
+        if (state.delete_ts == 0) return true;
+        return create_ts > state.delete_ts;
+    }
+
+    /// A peer's delete is applicable when it is at least as new as any local
+    /// create; on a tie the delete wins.
+    fn shouldApplyDelete(self: *const BucketOps, allocator: Allocator, bucket: []const u8, delete_ts: i64) bool {
+        const state = self.read(allocator, bucket);
+        return delete_ts >= state.create_ts;
+    }
+};
+
 /// Peer information for DHT
 const PeerInfo = struct {
     id: NodeId,
@@ -1008,7 +1092,7 @@ const DistributedConfig = struct {
 const PushWorker = struct {
     const Job = union(enum) {
         blob: struct { hash: ContentHash },
-        bucket: struct { name: []u8, deleted: bool },
+        bucket: struct { name: []u8, deleted: bool, ts: i64 },
     };
 
     const POLL_INTERVAL_MS = 50;
@@ -1058,8 +1142,12 @@ const PushWorker = struct {
             },
             .bucket => |b| {
                 defer std.heap.page_allocator.free(b.name);
+                // Body carries the origin timestamp so peers can order create
+                // vs delete (LWW, delete wins ties) regardless of arrival order.
                 const path = if (b.deleted) "/_zs3/bucket_delete" else "/_zs3/bucket";
-                broadcastToPeers(dist, allocator, "POST", path, b.name);
+                const body = std.fmt.allocPrint(allocator, "{s}\n{d}", .{ b.name, b.ts }) catch return;
+                defer allocator.free(body);
+                broadcastToPeers(dist, allocator, "POST", path, body);
             },
         }
     }
@@ -1094,6 +1182,7 @@ const DistributedContext = struct {
     kademlia: Kademlia,
     replication: ReplicationManager,
     worker: PushWorker,
+    bucket_ops: BucketOps,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, data_dir: []const u8, config: DistributedConfig) DistributedContext {
@@ -1104,6 +1193,7 @@ const DistributedContext = struct {
             .kademlia = Kademlia.init(allocator, config.node_id),
             .replication = ReplicationManager.init(allocator),
             .worker = .{},
+            .bucket_ops = .{ .data_dir = data_dir },
             .allocator = allocator,
         };
     }
@@ -2785,8 +2875,10 @@ fn handleCreateBucket(ctx: *const S3Context, allocator: Allocator, res: *Respons
     };
 
     if (ctx.distributed) |dist| {
+        const ts = std.Io.Clock.real.now(app_io).toSeconds();
+        dist.bucket_ops.noteCreate(allocator, bucket, ts);
         if (std.heap.page_allocator.dupe(u8, bucket)) |name| {
-            dist.worker.enqueue(.{ .bucket = .{ .name = name, .deleted = false } });
+            dist.worker.enqueue(.{ .bucket = .{ .name = name, .deleted = false, .ts = ts } });
         } else |_| {}
     }
 
@@ -2823,8 +2915,17 @@ fn handleDeleteBucket(ctx: *const S3Context, allocator: Allocator, res: *Respons
     };
 
     if (ctx.distributed) |dist| {
+        const ts = std.Io.Clock.real.now(app_io).toSeconds();
+        dist.bucket_ops.noteDelete(allocator, bucket, ts);
+        // Drop the object-metadata tree for this bucket so tombstones and
+        // inline data don't leak, and peers can't serve a deleted bucket's
+        // index on a later sync.
+        if (std.fs.path.join(allocator, &.{ dist.meta_index.data_dir, ".index", bucket })) |index_path| {
+            defer allocator.free(index_path);
+            std.Io.Dir.cwd().deleteTree(app_io, index_path) catch {};
+        } else |_| {}
         if (std.heap.page_allocator.dupe(u8, bucket)) |name| {
-            dist.worker.enqueue(.{ .bucket = .{ .name = name, .deleted = true } });
+            dist.worker.enqueue(.{ .bucket = .{ .name = name, .deleted = true, .ts = ts } });
         } else |_| {}
     }
 
@@ -3435,35 +3536,61 @@ fn handlePeerProtocol(ctx: *const S3Context, dist: *DistributedContext, allocato
         res.ok();
         res.body = try out.toOwnedSlice(allocator);
     } else if (std.mem.eql(u8, path, "bucket")) {
-        // Bucket creation propagated from a peer (body: bucket name)
+        // Bucket creation propagated from a peer (body: "bucket\ncreate_ts")
         if (!std.mem.eql(u8, req.method, "POST")) {
             sendError(res, 405, "MethodNotAllowed", "Use POST");
             return;
         }
-        if (!isValidBucketName(req.body)) {
+        const bucket_end = std.mem.indexOfScalar(u8, req.body, '\n') orelse req.body.len;
+        if (!isValidBucketName(req.body[0..bucket_end])) {
             sendError(res, 400, "InvalidBucketName", "Bucket name is invalid");
             return;
         }
-        const bucket_path = try ctx.bucketPath(allocator, req.body);
+        const bucket = req.body[0..bucket_end];
+        // Missing ts (legacy peer) is treated as "now" so a bare-name create still applies.
+        const create_ts = if (bucket_end < req.body.len)
+            std.fmt.parseInt(i64, req.body[bucket_end + 1 ..], 10) catch 0
+        else
+            std.Io.Clock.real.now(app_io).toSeconds();
+        // LWW: an older create must not resurrect a bucket deleted more recently.
+        if (!dist.bucket_ops.shouldApplyCreate(allocator, bucket, create_ts)) {
+            res.ok();
+            return;
+        }
+        const bucket_path = try ctx.bucketPath(allocator, bucket);
         defer allocator.free(bucket_path);
         std.Io.Dir.cwd().createDirPath(app_io, bucket_path) catch {};
+        dist.bucket_ops.noteCreate(allocator, bucket, create_ts);
         res.ok();
     } else if (std.mem.eql(u8, path, "bucket_delete")) {
-        // Bucket deletion propagated from a peer (best-effort, only if empty)
+        // Bucket deletion propagated from a peer (body: "bucket\ndelete_ts")
         if (!std.mem.eql(u8, req.method, "POST")) {
             sendError(res, 405, "MethodNotAllowed", "Use POST");
             return;
         }
-        if (!isValidBucketName(req.body)) {
+        const bucket_end = std.mem.indexOfScalar(u8, req.body, '\n') orelse req.body.len;
+        if (!isValidBucketName(req.body[0..bucket_end])) {
             sendError(res, 400, "InvalidBucketName", "Bucket name is invalid");
             return;
         }
-        const bucket_path = try ctx.bucketPath(allocator, req.body);
+        const bucket = req.body[0..bucket_end];
+        // Missing ts (legacy peer) is treated as "now" so a bare-name delete still applies.
+        const delete_ts = if (bucket_end < req.body.len)
+            std.fmt.parseInt(i64, req.body[bucket_end + 1 ..], 10) catch 0
+        else
+            std.Io.Clock.real.now(app_io).toSeconds();
+        // LWW: a stale delete must not remove a bucket recreated more recently.
+        if (!dist.bucket_ops.shouldApplyDelete(allocator, bucket, delete_ts)) {
+            res.ok();
+            return;
+        }
+        const bucket_path = try ctx.bucketPath(allocator, bucket);
         defer allocator.free(bucket_path);
-        std.Io.Dir.cwd().deleteDir(app_io, bucket_path) catch {};
-        const index_path = try std.fs.path.join(allocator, &.{ dist.meta_index.data_dir, ".index", req.body });
+        std.Io.Dir.cwd().deleteTree(app_io, bucket_path) catch {};
+        const index_path = try std.fs.path.join(allocator, &.{ dist.meta_index.data_dir, ".index", bucket });
         defer allocator.free(index_path);
-        std.Io.Dir.cwd().deleteDir(app_io, index_path) catch {};
+        std.Io.Dir.cwd().deleteTree(app_io, index_path) catch {};
+        dist.bucket_ops.noteDelete(allocator, bucket, delete_ts);
         res.ok();
     } else {
         sendError(res, 404, "NotFound", "Unknown peer endpoint");
