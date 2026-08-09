@@ -28,6 +28,8 @@ const MAX_INDEX_SYNC_SIZE = 256 * 1024 * 1024; // Cap on a full index dump durin
 const PEER_IO_TIMEOUT_SECS = 5; // Socket timeout for peer-to-peer requests
 
 const ERROR_403 = "HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\nDenied";
+const ERROR_431 = "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const ERROR_400_ENTITY_TOO_LARGE = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 /// Format a Unix timestamp (seconds) as an HTTP date (RFC 7231).
 /// Returns a 29-byte string like "Mon, 02 Jan 2006 15:04:05 GMT".
@@ -621,7 +623,23 @@ const MetaIndex = struct {
     fn metaPath(self: *const MetaIndex, allocator: Allocator, bucket: []const u8, key: []const u8) ![]const u8 {
         const key_with_ext = try std.fmt.allocPrint(allocator, "{s}.meta", .{key});
         defer allocator.free(key_with_ext);
-        return std.fs.path.join(allocator, &.{ self.data_dir, ".index", bucket, key_with_ext });
+        const path = try std.fs.path.join(allocator, &.{ self.data_dir, ".index", bucket, key_with_ext });
+        // Same filesystem guards as S3Context.objectPath (NAME_MAX per
+        // component, PATH_MAX total): an un-storable key must surface as a
+        // client error, not a 500. Note key_with_ext includes the ".meta"
+        // suffix, so its components are the ones that land on disk.
+        var component_itr = std.mem.splitScalar(u8, key_with_ext, '/');
+        while (component_itr.next()) |component| {
+            if (component.len >= std.posix.NAME_MAX) {
+                allocator.free(path);
+                return error.NameTooLong;
+            }
+        }
+        if (path.len >= std.posix.PATH_MAX) {
+            allocator.free(path);
+            return error.PathTooLong;
+        }
+        return path;
     }
 };
 
@@ -1683,7 +1701,24 @@ const S3Context = struct {
     }
 
     fn objectPath(self: *const S3Context, allocator: Allocator, bucket: []const u8, key: []const u8) ![]const u8 {
-        return std.fs.path.join(allocator, &[_][]const u8{ self.data_dir, bucket, key });
+        const path = try std.fs.path.join(allocator, &[_][]const u8{ self.data_dir, bucket, key });
+        // The flat-file layout turns a key into a filesystem path. Reject keys
+        // that cannot be stored on this platform with a clean client error
+        // instead of a 500 when the OS returns ENAMETOOLONG:
+        //   - a single component longer than NAME_MAX (255) cannot be a filename
+        //   - the full path must fit PATH_MAX (e.g. 1024 on macOS)
+        var component_itr = std.mem.splitScalar(u8, key, '/');
+        while (component_itr.next()) |component| {
+            if (component.len >= std.posix.NAME_MAX) {
+                allocator.free(path);
+                return error.NameTooLong;
+            }
+        }
+        if (path.len >= std.posix.PATH_MAX) {
+            allocator.free(path);
+            return error.PathTooLong;
+        }
+        return path;
     }
 
     pub fn deinit(self: *S3Context) void {
@@ -1965,6 +2000,22 @@ fn handleConnectionWithStream(allocator: Allocator, ctx: *const S3Context, strea
         if (findHeaderEnd(buf[0..total_read])) |_| break;
     }
     if (total_read == 0) return false;
+    // If the 8KB buffer filled without seeing the header terminator, the
+    // request headers exceed MAX_HEADER_SIZE. Reject cleanly instead of
+    // parsing a truncated header section.
+    if (findHeaderEnd(buf[0..total_read]) == null) {
+        streamWriteAll(stream, ERROR_431) catch return false;
+        // Give the client's remaining bytes a moment to arrive, then drain
+        // them so the close is a clean FIN. Closing with unread data in the
+        // receive buffer sends a RST, which discards the 431 response.
+        app_io.sleep(.fromMilliseconds(1), .awake) catch {};
+        var discard: [512]u8 = undefined;
+        for (0..64) |_| {
+            const n = streamRead(stream, &discard) catch break;
+            if (n == 0) break;
+        }
+        return false;
+    }
 
     const data = buf[0..total_read];
 
@@ -1979,12 +2030,22 @@ fn handleConnectionWithStream(allocator: Allocator, ctx: *const S3Context, strea
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var req = parseRequestFromBuf(alloc, data, stream) catch return false;
+    var req = parseRequestFromBuf(alloc, data, stream) catch |err| {
+        if (err == error.PayloadTooLarge) {
+            streamWriteAll(stream, ERROR_400_ENTITY_TOO_LARGE) catch return false;
+        }
+        return false;
+    };
     var res = Response.init(alloc);
 
     route(ctx, alloc, &req, &res) catch |err| {
-        std.log.err("Handler error: {}", .{err});
-        sendError(&res, 500, "InternalError", "Internal server error");
+        switch (err) {
+            error.PathTooLong, error.NameTooLong => sendError(&res, 400, "KeyTooLong", "Object key is too long for the filesystem (path or filename component limit)"),
+            else => {
+                std.log.err("Handler error: {}", .{err});
+                sendError(&res, 500, "InternalError", "Internal server error");
+            },
+        }
     };
 
     res.write(stream) catch return false;

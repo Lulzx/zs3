@@ -2,6 +2,7 @@
 """Test client for zs3 - uses only stdlib"""
 import hashlib
 import hmac
+import socket
 from datetime import datetime, timezone
 import urllib.request
 import urllib.parse
@@ -71,6 +72,46 @@ def request(method, path, data=None, query=""):
         return e.code, e.read().decode()
     except urllib.error.URLError as e:
         return 0, f"Connection failed: {e.reason}"
+
+def raw_request(method, path, headers=None, body=b"", query=""):
+    """Send a raw HTTP request over a socket with SigV4 signing.
+
+    Unlike `request`, the caller controls Content-Length and header ordering,
+    which lets us exercise the server's size-limit paths (oversized headers,
+    >5GB Content-Length) that urllib would normalize away.
+    """
+    payload = body if isinstance(body, bytes) else body.encode()
+    sign_headers = dict(headers) if headers else {}
+    # Sign against the canonical payload, but let the caller override the wire
+    # Content-Length (used to fake a huge body without sending it).
+    sig = sign_request(method, path, query, sign_headers, payload)
+    content_length = (headers or {}).get("Content-Length", str(len(payload)))
+
+    req_lines = [f"{method} {path}{f'?{query}' if query else ''} HTTP/1.1", f"Host: {HOST}"]
+    # Send signed headers first, then any extra caller headers. Content-Length
+    # is appended separately (below) so the override is not duplicated.
+    for k, v in sig.items():
+        if k.lower() == "content-length":
+            continue
+        req_lines.append(f"{k}: {v}")
+    req_lines.append(f"Content-Length: {content_length}")
+    req_lines.append("Connection: close")
+    raw = ("\r\n".join(req_lines) + "\r\n\r\n").encode() + payload
+
+    with socket.create_connection((HOST.split(':')[0], int(HOST.split(':')[1])), timeout=5) as sock:
+        sock.sendall(raw)
+        chunks = []
+        while True:
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+    response = b"".join(chunks).decode(errors="replace")
+    status_line = response.split("\r\n", 1)[0] if response else ""
+    return status_line, response
 
 def test(name, expected_status, actual_status, body=""):
     status = "PASS" if actual_status == expected_status else "FAIL"
@@ -232,6 +273,42 @@ def run_tests():
     else:
         failed += 1
         print(f"        Got: {body}")
+
+    # Size limits (regression: these used to 500 or silently truncate)
+    print("\n[Size Limits]")
+
+    # Test: key component at the filesystem NAME_MAX boundary (254 chars) stores
+    boundary_key = "k" * 254
+    status, body = request("PUT", f"/testbucket/{boundary_key}", "boundary")
+    if test("254-char key component stores", 200, status, body):
+        passed += 1
+    else:
+        failed += 1
+
+    # Test: single key component over NAME_MAX (255) -> clean 400, not a 500
+    long_component = "k" * 300
+    status, body = request("PUT", f"/testbucket/{long_component}", "toolong")
+    if test("Over-long key component rejected (400)", 400, status, body):
+        passed += 1
+    else:
+        failed += 1
+
+    # Test: >5GB Content-Length -> 400 EntityTooLarge, not a silent close
+    status_line, _ = raw_request("PUT", "/testbucket/huge.bin",
+                                 headers={"Content-Length": "5368709121"})
+    status_code = int(status_line.split()[1]) if status_line else 0
+    if test(">5GB Content-Length rejected (400)", 400, status_code, status_line):
+        passed += 1
+    else:
+        failed += 1
+
+    # Test: >8KB of request headers -> 431, not silent truncation
+    status_line, _ = raw_request("GET", "/testbucket", headers={"X-Big": "A" * 9000})
+    status_code = int(status_line.split()[1]) if status_line else 0
+    if test(">8KB headers rejected (431)", 431, status_code, status_line):
+        passed += 1
+    else:
+        failed += 1
 
     # Batch Operations
     print("\n[Batch Operations]")

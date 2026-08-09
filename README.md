@@ -18,7 +18,7 @@ storage platform.
 
 | | zs3 | RustFS | MinIO |
 |---|-----|--------|-------|
-| Lines | ~3,000 | ~80,000 | 200,000 |
+| Lines | ~4,300 | ~80,000 | 200,000 |
 | Binary | <360KB | ~50MB | 100MB |
 | RAM idle | 3MB | ~100MB | 200MB+ |
 | Dependencies | 0 | ~200 crates | many |
@@ -216,7 +216,7 @@ zig build test                               # run tests
 zig build test                  # ~30 unit tests
 python3 test_bootstrap.py       # two-node bootstrap discovery
 python3 test_replication.py     # four-node replication suite (stdlib only)
-python3 test_client.py          # 24/24 integration tests (stdlib only)
+python3 test_client.py          # 28/28 integration tests (stdlib only)
 python3 test_comprehensive.py   # 67/67 boto3 tests (standalone)
 ./zs3 --distributed && \
 python3 test_comprehensive.py   # 72/72 boto3 tests (distributed)
@@ -291,6 +291,13 @@ python3 ../benchmark.py --only zs3,garage \
 | Max body size | 5 GB |
 | Max key length | 1024 bytes |
 | Bucket name | 3-63 chars |
+
+The 1024-byte key limit matches S3. Because objects are stored as plain
+files, a single `/`-separated key component is also limited to 255 bytes
+(filesystem filename limit), and the full path (`data_dir` + bucket + key)
+must fit the platform's `PATH_MAX` (1024 on macOS). Keys beyond those
+filesystem limits are rejected with a clean `400 KeyTooLong` error rather
+than failing to store.
 
 ## Security
 
