@@ -156,14 +156,15 @@ const CAS = struct {
             return hash;
         } else |_| {}
 
-        // Create parent directory (.cas/xx/)
-        if (std.fs.path.dirname(path)) |dir| {
-            std.Io.Dir.cwd().createDirPath(app_io, dir) catch {};
-        }
-
-        var file = try std.Io.Dir.cwd().createFile(app_io, path, .{});
-        defer file.close(app_io);
-        try file.writeStreamingAll(app_io, data);
+        // Write the blob atomically (temp file + rename) so a concurrent reader
+        // never sees a half-written blob under a content hash.
+        var af = try std.Io.Dir.cwd().createFileAtomic(app_io, path, .{
+            .make_path = true,
+            .replace = true,
+        });
+        defer af.deinit(app_io);
+        try af.file.writeStreamingAll(app_io, data);
+        try af.replace(app_io);
 
         return hash;
     }
@@ -368,13 +369,13 @@ const MetaIndex = struct {
         const path = try self.metaPath(allocator, bucket, key);
         defer allocator.free(path);
 
-        // Create parent directories
-        if (std.fs.path.dirname(path)) |dir| {
-            std.Io.Dir.cwd().createDirPath(app_io, dir) catch {};
-        }
-
-        var file = try std.Io.Dir.cwd().createFile(app_io, path, .{});
-        defer file.close(app_io);
+        // Write the index entry atomically (temp file + rename) so a concurrent
+        // reader never sees a half-written .meta file.
+        var af = try std.Io.Dir.cwd().createFileAtomic(app_io, path, .{
+            .make_path = true,
+            .replace = true,
+        });
+        defer af.deinit(app_io);
 
         // Format: hex_hash\nsize\ncreated\ndeleted\n[inline_data_base64]
         var hash_hex: [40]u8 = undefined;
@@ -383,12 +384,14 @@ const MetaIndex = struct {
 
         var buf: [128]u8 = undefined;
         const header = std.fmt.bufPrint(&buf, "{s}\n{d}\n{d}\n0\n", .{ hash_hex, size, created }) catch unreachable;
-        try file.writeStreamingAll(app_io, header);
+        try af.file.writeStreamingAll(app_io, header);
 
         // Write inline data if provided
         if (inline_data) |data| {
-            try file.writeStreamingAll(app_io, data);
+            try af.file.writeStreamingAll(app_io, data);
         }
+
+        try af.replace(app_io);
     }
 
     /// Get metadata for an S3 object (returns null for tombstones)
@@ -2135,7 +2138,7 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
                 try handleDistributedDelete(ctx, allocator, res, bucket, key);
                 return;
             } else if (std.mem.eql(u8, req.method, "HEAD")) {
-                try handleDistributedHead(ctx, allocator, res, bucket, key);
+                try handleDistributedHead(ctx, allocator, req, res, bucket, key);
                 return;
             }
         } else if (bucket.len > 0 and std.mem.eql(u8, req.method, "GET")) {
@@ -2174,7 +2177,7 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         if (key.len == 0) {
             try handleHeadBucket(ctx, allocator, res, bucket);
         } else {
-            try handleHeadObject(ctx, allocator, res, bucket, key);
+            try handleHeadObject(ctx, allocator, req, res, bucket, key);
         }
     } else if (std.mem.eql(u8, req.method, "POST")) {
         if (hasQuery(req.query, "delete")) {
@@ -2505,6 +2508,60 @@ pub fn sortQueryString(allocator: Allocator, query: []const u8) ![]const u8 {
     return result.toOwnedSlice(allocator);
 }
 
+/// Returns true if the ETag list header (If-Match / If-None-Match value) matches
+/// the given ETag. Handles `*` and comma-separated lists of quoted ETags.
+fn etagListMatches(header: []const u8, etag: []const u8) bool {
+    if (std.mem.eql(u8, std.mem.trim(u8, header, " \t"), "*")) return true;
+    var it = std.mem.splitScalar(u8, header, ',');
+    while (it.next()) |item| {
+        if (std.mem.eql(u8, std.mem.trim(u8, item, " \t"), etag)) return true;
+    }
+    return false;
+}
+
+/// Compute the ETag (wyhash of content, same formula as PUT/GET) for an existing
+/// object at `path`, or null if it doesn't exist. Only called when a conditional
+/// header is present, so the read cost is paid only on conditional requests.
+fn existingEtag(allocator: Allocator, path: []const u8) ?[]const u8 {
+    var file = std.Io.Dir.cwd().openFile(app_io, path, .{}) catch return null;
+    defer file.close(app_io);
+    const content = readToEndAlloc(file, allocator, MAX_BODY_SIZE) catch return null;
+    defer allocator.free(content);
+    const hash = std.hash.Wyhash.hash(0, content);
+    return std.fmt.allocPrint(allocator, "\"{x}\"", .{hash}) catch null;
+}
+
+/// Evaluate If-Match / If-None-Match preconditions for a write to `path`.
+/// Returns true if the request should proceed; false if a 412 has already been
+/// sent. If-Match requires the object to exist with a matching ETag; If-None-Match
+/// requires the object to be absent or have a non-matching ETag.
+fn checkPutPreconditions(allocator: Allocator, req: *const Request, res: *Response, path: []const u8) bool {
+    const if_match = req.header("if-match");
+    const if_none_match = req.header("if-none-match");
+    if (if_match == null and if_none_match == null) return true;
+
+    const existing = existingEtag(allocator, path);
+    defer if (existing) |e| allocator.free(e);
+
+    if (if_match) |im| {
+        const matches = if (existing) |e| etagListMatches(im, e) else false;
+        if (!matches) {
+            sendError(res, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
+            return false;
+        }
+    }
+
+    if (if_none_match) |inm| {
+        const matches = if (existing) |e| etagListMatches(inm, e) else false;
+        if (matches) {
+            sendError(res, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
+            return false;
+        }
+    }
+
+    return true;
+}
+
 fn handlePutObject(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
     // Keys ending with '/' are folder markers — store as ".folder_marker" file
     const effective_key = if (key.len > 0 and key[key.len - 1] == '/')
@@ -2516,17 +2573,26 @@ fn handlePutObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     const path = try ctx.objectPath(allocator, bucket, effective_key);
     defer allocator.free(path);
 
-    if (std.fs.path.dirname(path)) |dir| {
-        std.Io.Dir.cwd().createDirPath(app_io, dir) catch {};
-    }
+    // Honor If-Match / If-None-Match before touching the object.
+    if (!checkPutPreconditions(allocator, req, res, path)) return;
 
-    var file = std.Io.Dir.cwd().createFile(app_io, path, .{}) catch {
+    // Write atomically: temp file + rename, so a concurrent GET never sees a
+    // half-written object. make_path creates parent directories.
+    var af = std.Io.Dir.cwd().createFileAtomic(app_io, path, .{
+        .make_path = true,
+        .replace = true,
+    }) catch {
         sendError(res, 500, "InternalError", "Cannot create file");
         return;
     };
-    defer file.close(app_io);
+    defer af.deinit(app_io);
 
-    file.writeStreamingAll(app_io, req.body) catch {
+    af.file.writeStreamingAll(app_io, req.body) catch {
+        sendError(res, 500, "InternalError", "Cannot write file");
+        return;
+    };
+
+    af.replace(app_io) catch {
         sendError(res, 500, "InternalError", "Cannot write file");
         return;
     };
@@ -2567,6 +2633,60 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
         sendError(res, 500, "InternalError", "Date format failed");
         return;
     };
+
+    // Conditional requests (If-Match / If-None-Match) need the ETag, which requires
+    // reading the content. Only pay that cost when a conditional header is present.
+    const if_match = req.header("if-match");
+    const if_none_match = req.header("if-none-match");
+    if (if_match != null or if_none_match != null) {
+        const content = readToEndAlloc(file, allocator, MAX_BODY_SIZE) catch {
+            file.close(app_io);
+            sendError(res, 500, "InternalError", "Read failed");
+            return;
+        };
+        file.close(app_io);
+
+        const hash = std.hash.Wyhash.hash(0, content);
+        const etag = std.fmt.allocPrint(allocator, "\"{x}\"", .{hash}) catch {
+            sendError(res, 500, "InternalError", "ETag failed");
+            return;
+        };
+
+        if (if_match) |im| {
+            if (!etagListMatches(im, etag)) {
+                sendError(res, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
+                return;
+            }
+        }
+        if (if_none_match) |inm| {
+            if (etagListMatches(inm, etag)) {
+                res.status = 304;
+                res.status_text = "Not Modified";
+                return;
+            }
+        }
+
+        // Preconditions passed — serve from the content we already read.
+        res.ok();
+        res.setHeader("Accept-Ranges", "bytes");
+        res.setHeader("ETag", etag);
+        res.setHeader("Last-Modified", last_modified);
+        if (req.header("range")) |range_header| {
+            if (parseRange(range_header, content.len)) |range| {
+                const content_range = std.fmt.allocPrint(allocator, "bytes {d}-{d}/{d}", .{ range.start, range.end, content.len }) catch {
+                    sendError(res, 500, "InternalError", "Range format failed");
+                    return;
+                };
+                res.status = 206;
+                res.status_text = "Partial Content";
+                res.setHeader("Content-Range", content_range);
+                res.body = content[range.start .. range.end + 1];
+                return;
+            }
+        }
+        res.body = content;
+        return;
+    }
 
     // For range requests, use sendFile without ETag (efficient for large files)
     if (req.header("range")) |range_header| {
@@ -2682,7 +2802,7 @@ fn handleDeleteObjects(ctx: *const S3Context, allocator: Allocator, req: *Reques
     res.setXmlBody(try xml.toOwnedSlice(allocator));
 }
 
-fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, key: []const u8) !void {
+fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
     const effective_key = if (key.len > 0 and key[key.len - 1] == '/')
         try std.fmt.allocPrint(allocator, "{s}.folder_marker", .{key})
     else
@@ -2722,6 +2842,21 @@ fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, res: *Response,
         sendError(res, 500, "InternalError", "ETag failed");
         return;
     };
+
+    // Conditional requests: If-Match mismatch → 412, If-None-Match match → 304.
+    if (req.header("if-match")) |im| {
+        if (!etagListMatches(im, etag)) {
+            sendError(res, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
+            return;
+        }
+    }
+    if (req.header("if-none-match")) |inm| {
+        if (etagListMatches(inm, etag)) {
+            res.status = 304;
+            res.status_text = "Not Modified";
+            return;
+        }
+    }
 
     const len_str = std.fmt.allocPrint(allocator, "{d}", .{stat.size}) catch {
         sendError(res, 500, "InternalError", "Format failed");
@@ -3670,6 +3805,33 @@ fn handleDistributedPut(ctx: *const S3Context, allocator: Allocator, req: *Reque
     // Compute content hash
     const hash = CAS.computeHash(req.body);
 
+    // Honor If-Match / If-None-Match against the existing object's hash (its ETag).
+    const if_match = req.header("if-match");
+    const if_none_match = req.header("if-none-match");
+    if (if_match != null or if_none_match != null) {
+        const existing = dist.meta_index.get(allocator, bucket, key) catch null;
+        const existing_etag = if (existing) |m| blk: {
+            const e = try std.fmt.allocPrint(allocator, "\"{x}\"", .{m.hash});
+            break :blk e;
+        } else null;
+        defer if (existing_etag) |e| allocator.free(e);
+
+        if (if_match) |im| {
+            const matches = if (existing_etag) |e| etagListMatches(im, e) else false;
+            if (!matches) {
+                sendError(res, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
+                return;
+            }
+        }
+        if (if_none_match) |inm| {
+            const matches = if (existing_etag) |e| etagListMatches(inm, e) else false;
+            if (matches) {
+                sendError(res, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
+                return;
+            }
+        }
+    }
+
     // For small objects, store inline in metadata (skip CAS)
     // Inline objects are NOT announced to DHT since they can't be fetched via blob API
     if (req.body.len <= INLINE_THRESHOLD) {
@@ -3710,6 +3872,25 @@ fn handleDistributedGet(ctx: *const S3Context, allocator: Allocator, req: *Reque
             return;
         };
     // Note: inline_data is arena-allocated and will be freed with the request arena
+
+    // Conditional requests: If-Match mismatch → 412, If-None-Match match → 304.
+    const etag = std.fmt.allocPrint(allocator, "\"{x}\"", .{meta.hash}) catch {
+        sendError(res, 500, "InternalError", "ETag failed");
+        return;
+    };
+    if (req.header("if-match")) |im| {
+        if (!etagListMatches(im, etag)) {
+            sendError(res, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
+            return;
+        }
+    }
+    if (req.header("if-none-match")) |inm| {
+        if (etagListMatches(inm, etag)) {
+            res.status = 304;
+            res.status_text = "Not Modified";
+            return;
+        }
+    }
 
     // Check for inline data first (small objects stored in metadata)
     if (meta.inline_data) |data| {
@@ -4238,7 +4419,7 @@ fn collectMetaKeys(allocator: Allocator, base_path: []const u8, current_prefix: 
 }
 
 /// Distributed HEAD - return metadata without body
-fn handleDistributedHead(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, key: []const u8) !void {
+fn handleDistributedHead(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
     const dist = ctx.distributed.?;
 
     const meta = try dist.meta_index.getFull(allocator, bucket, key) orelse
@@ -4256,6 +4437,22 @@ fn handleDistributedHead(ctx: *const S3Context, allocator: Allocator, res: *Resp
         sendError(res, 500, "InternalError", "ETag failed");
         return;
     };
+
+    // Conditional requests: If-Match mismatch → 412, If-None-Match match → 304.
+    if (req.header("if-match")) |im| {
+        if (!etagListMatches(im, etag)) {
+            sendError(res, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
+            return;
+        }
+    }
+    if (req.header("if-none-match")) |inm| {
+        if (etagListMatches(inm, etag)) {
+            res.status = 304;
+            res.status_text = "Not Modified";
+            return;
+        }
+    }
+
     const last_modified = allocHttpDate(allocator, meta.created) catch {
         sendError(res, 500, "InternalError", "Date format failed");
         return;
@@ -4276,6 +4473,7 @@ fn sendError(res: *Response, status: u16, code: []const u8, message: []const u8)
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        412 => "Precondition Failed",
         500 => "Internal Server Error",
         else => "Error",
     };
