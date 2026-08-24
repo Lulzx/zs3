@@ -2528,7 +2528,7 @@ pub fn sortQueryString(allocator: Allocator, query: []const u8) ![]const u8 {
 
 /// Returns true if the ETag list header (If-Match / If-None-Match value) matches
 /// the given ETag. Handles `*` and comma-separated lists of quoted ETags.
-fn etagListMatches(header: []const u8, etag: []const u8) bool {
+pub fn etagListMatches(header: []const u8, etag: []const u8) bool {
     if (std.mem.eql(u8, std.mem.trim(u8, header, " \t"), "*")) return true;
     var it = std.mem.splitScalar(u8, header, ',');
     while (it.next()) |item| {

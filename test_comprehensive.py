@@ -11,6 +11,7 @@ Tests cover:
 - Batch operations
 - Security (path traversal, auth, invalid inputs)
 - Edge cases (empty, large, unicode, special chars)
+- Conditional requests (If-Match, If-None-Match, concurrent create-if-absent)
 - Distributed mode features
 """
 
@@ -812,6 +813,200 @@ def test_distributed_features(s3):
     cleanup_bucket(s3, bucket)
 
 # =============================================================================
+# CONDITIONAL REQUEST TESTS
+# =============================================================================
+
+def test_status(name, expected_status, func, *args, **kwargs):
+    """Test that a call fails with the expected HTTP status.
+
+    Checked on status rather than error code: a HEAD has no body to parse, so
+    botocore reports the bare status where a GET reports PreconditionFailed.
+    """
+    global passed, failed
+    try:
+        func(*args, **kwargs)
+        print(f"  [FAIL] {name} - expected {expected_status}, got success")
+        failed += 1
+        return False
+    except ClientError as e:
+        actual = e.response['ResponseMetadata']['HTTPStatusCode']
+        if actual == expected_status:
+            print(f"  [PASS] {name}")
+            passed += 1
+            return True
+        print(f"  [FAIL] {name} - expected {expected_status}, got {actual}")
+        failed += 1
+        return False
+    except Exception as e:
+        print(f"  [FAIL] {name} - unexpected error: {e}")
+        failed += 1
+        return False
+
+def test_conditional_requests(s3):
+    print("\n[Conditional Requests]")
+    bucket = "test-conditional"
+    cleanup_bucket(s3, bucket)
+    s3.create_bucket(Bucket=bucket)
+
+    # --- If-None-Match: * on PUT (create-if-absent) ---
+
+    try:
+        response = s3.put_object(Bucket=bucket, Key="claim.txt", Body=b"first",
+                                 IfNoneMatch="*")
+        etag = response['ETag']
+        test("PUT If-None-Match * creates absent key", bool(etag))
+    except Exception as e:
+        test("PUT If-None-Match * creates absent key", False, str(e))
+        etag = None
+
+    test_status("PUT If-None-Match * rejects existing key", 412,
+                s3.put_object, Bucket=bucket, Key="claim.txt", Body=b"second",
+                IfNoneMatch="*")
+
+    try:
+        body = s3.get_object(Bucket=bucket, Key="claim.txt")['Body'].read()
+        test("Rejected PUT left object unchanged", body == b"first",
+             f"got {body!r}")
+    except Exception as e:
+        test("Rejected PUT left object unchanged", False, str(e))
+
+    # --- If-Match on PUT (compare-and-swap) ---
+
+    try:
+        response = s3.put_object(Bucket=bucket, Key="claim.txt", Body=b"second",
+                                 IfMatch=etag)
+        new_etag = response['ETag']
+        test("PUT If-Match accepts current ETag", new_etag != etag)
+    except Exception as e:
+        test("PUT If-Match accepts current ETag", False, str(e))
+        new_etag = None
+
+    test_status("PUT If-Match rejects stale ETag", 412,
+                s3.put_object, Bucket=bucket, Key="claim.txt", Body=b"third",
+                IfMatch=etag)
+
+    try:
+        body = s3.get_object(Bucket=bucket, Key="claim.txt")['Body'].read()
+        test("Stale CAS left object unchanged", body == b"second",
+             f"got {body!r}")
+    except Exception as e:
+        test("Stale CAS left object unchanged", False, str(e))
+
+    test_status("PUT If-Match rejects absent key", 412,
+                s3.put_object, Bucket=bucket, Key="never-written.txt",
+                Body=b"x", IfMatch=new_etag)
+
+    # If-Match: * means "any current version", so it requires the key to exist
+    try:
+        s3.put_object(Bucket=bucket, Key="claim.txt", Body=b"second", IfMatch="*")
+        test("PUT If-Match * accepts existing key", True)
+    except Exception as e:
+        test("PUT If-Match * accepts existing key", False, str(e))
+
+    test_status("PUT If-Match * rejects absent key", 412,
+                s3.put_object, Bucket=bucket, Key="still-absent.txt",
+                Body=b"x", IfMatch="*")
+
+    # --- ETag lists ---
+
+    try:
+        current = s3.head_object(Bucket=bucket, Key="claim.txt")['ETag']
+    except Exception as e:
+        current = None
+        test("HEAD returns ETag for list tests", False, str(e))
+
+    if current:
+        try:
+            s3.put_object(Bucket=bucket, Key="claim.txt", Body=b"second",
+                          IfMatch=f'"aaaaaaaa", {current}, "bbbbbbbb"')
+            test("PUT If-Match matches ETag in list", True)
+        except Exception as e:
+            test("PUT If-Match matches ETag in list", False, str(e))
+
+        test_status("PUT If-None-Match rejects ETag in list", 412,
+                    s3.put_object, Bucket=bucket, Key="claim.txt", Body=b"x",
+                    IfNoneMatch=f'"aaaaaaaa", {current}')
+
+        try:
+            s3.put_object(Bucket=bucket, Key="claim.txt", Body=b"second",
+                          IfNoneMatch='"aaaaaaaa", "bbbbbbbb"')
+            test("PUT If-None-Match allows unmatched list", True)
+        except Exception as e:
+            test("PUT If-None-Match allows unmatched list", False, str(e))
+
+    # --- Conditional reads: 304 on GET/HEAD, 412 on If-Match mismatch ---
+
+    if current:
+        test_status("GET If-None-Match matching returns 304", 304,
+                    s3.get_object, Bucket=bucket, Key="claim.txt",
+                    IfNoneMatch=current)
+
+        test_status("HEAD If-None-Match matching returns 304", 304,
+                    s3.head_object, Bucket=bucket, Key="claim.txt",
+                    IfNoneMatch=current)
+
+        try:
+            body = s3.get_object(Bucket=bucket, Key="claim.txt",
+                                 IfNoneMatch='"cccccccc"')['Body'].read()
+            test("GET If-None-Match non-matching returns body", body == b"second",
+                 f"got {body!r}")
+        except Exception as e:
+            test("GET If-None-Match non-matching returns body", False, str(e))
+
+        try:
+            body = s3.get_object(Bucket=bucket, Key="claim.txt",
+                                 IfMatch=current)['Body'].read()
+            test("GET If-Match matching returns body", body == b"second",
+                 f"got {body!r}")
+        except Exception as e:
+            test("GET If-Match matching returns body", False, str(e))
+
+        test_status("GET If-Match stale returns 412", 412,
+                    s3.get_object, Bucket=bucket, Key="claim.txt",
+                    IfMatch='"cccccccc"')
+
+        test_status("HEAD If-Match stale returns 412", 412,
+                    s3.head_object, Bucket=bucket, Key="claim.txt",
+                    IfMatch='"cccccccc"')
+
+    # --- Unconditional writes are unaffected ---
+
+    try:
+        s3.put_object(Bucket=bucket, Key="claim.txt", Body=b"unconditional")
+        body = s3.get_object(Bucket=bucket, Key="claim.txt")['Body'].read()
+        test("Unconditional PUT still overwrites", body == b"unconditional",
+             f"got {body!r}")
+    except Exception as e:
+        test("Unconditional PUT still overwrites", False, str(e))
+
+    # --- Concurrent create-if-absent: exactly one writer may win ---
+
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+
+        racers = 32
+
+        def claim(i):
+            # A client per thread: botocore clients are not thread-safe.
+            client = get_client()
+            try:
+                client.put_object(Bucket=bucket, Key="race.txt",
+                                  Body=str(i).encode(), IfNoneMatch="*")
+                return 1
+            except ClientError:
+                return 0
+
+        with ThreadPoolExecutor(max_workers=racers) as pool:
+            winners = sum(pool.map(claim, range(racers)))
+
+        test(f"Exactly one winner in {racers}-way create-if-absent race",
+             winners == 1, f"{winners} writers got a 200")
+    except Exception as e:
+        test("Exactly one winner in create-if-absent race", False, str(e))
+
+    cleanup_bucket(s3, bucket)
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -844,6 +1039,7 @@ def main():
     test_batch_delete(s3)
     test_security(s3)
     test_edge_cases(s3)
+    test_conditional_requests(s3)
     test_distributed_features(s3)
 
     # Summary

@@ -14,6 +14,7 @@ const SigV4 = main.SigV4;
 const formatHttpDate = main.formatHttpDate;
 const formatIso8601 = main.formatIso8601;
 const decodeAwsChunked = main.decodeAwsChunked;
+const etagListMatches = main.etagListMatches;
 
 test "isValidBucketName" {
     try std.testing.expect(isValidBucketName("mybucket"));
@@ -517,4 +518,40 @@ test "isTombstoneContent" {
     try std.testing.expect(!isTombstoneContent(VALID_HASH ++ "\n123\n1700000000\nabc\n"));
     // Negative deleted timestamp is not a tombstone
     try std.testing.expect(!isTombstoneContent(VALID_HASH ++ "\n123\n1700000000\n-5\n"));
+}
+
+test "etagListMatches - wildcard matches any etag" {
+    try std.testing.expect(etagListMatches("*", "\"abc123\""));
+    try std.testing.expect(etagListMatches("  *  ", "\"abc123\""));
+}
+
+test "etagListMatches - single etag" {
+    try std.testing.expect(etagListMatches("\"abc123\"", "\"abc123\""));
+    try std.testing.expect(!etagListMatches("\"abc123\"", "\"def456\""));
+}
+
+test "etagListMatches - comma-separated list" {
+    const list = "\"aaa\", \"bbb\", \"ccc\"";
+    try std.testing.expect(etagListMatches(list, "\"aaa\""));
+    try std.testing.expect(etagListMatches(list, "\"bbb\""));
+    try std.testing.expect(etagListMatches(list, "\"ccc\""));
+    try std.testing.expect(!etagListMatches(list, "\"ddd\""));
+}
+
+test "etagListMatches - unquoted value does not match quoted etag" {
+    try std.testing.expect(!etagListMatches("abc123", "\"abc123\""));
+}
+
+test "etagListMatches - no partial matches" {
+    try std.testing.expect(!etagListMatches("\"abc\"", "\"abc123\""));
+    try std.testing.expect(!etagListMatches("\"abc123\"", "\"abc\""));
+}
+
+test "etagListMatches - empty header matches nothing" {
+    try std.testing.expect(!etagListMatches("", "\"abc123\""));
+}
+
+test "etagListMatches - wildcard inside a list is not a wildcard" {
+    // Only a bare "*" is the wildcard; RFC 9110 does not allow it as a list member.
+    try std.testing.expect(!etagListMatches("\"aaa\", *", "\"bbb\""));
 }
