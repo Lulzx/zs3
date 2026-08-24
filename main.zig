@@ -1559,9 +1559,27 @@ fn bootstrapPeers(allocator: Allocator, ctx: *const S3Context, dist: *Distribute
     std.log.info("Known peers: {d}", .{dist.kademlia.peerCount()});
 }
 
+/// Read from a socket, tolerating EAGAIN. The std netRead treats EAGAIN as a
+/// programmer bug because it assumes the socket blocks, but peer sockets carry
+/// an SO_RCVTIMEO (see setPeerTimeout) and return it when that timeout expires.
+/// Poll for readability and retry; report an expired poll as error.Timeout.
 fn streamRead(stream: net.Stream, buffer: []u8) !usize {
-    var buffers = [1][]u8{buffer};
-    return app_io.vtable.netRead(app_io.userdata, stream.socket.handle, &buffers);
+    const fd = stream.socket.handle;
+    while (true) {
+        const rc = posix.system.read(fd, buffer.ptr, buffer.len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => {
+                var pfd = [1]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+                const ready = posix.poll(&pfd, PEER_IO_TIMEOUT_SECS * 1000) catch return error.ReadFailed;
+                if (ready == 0) return error.Timeout;
+            },
+            .TIMEDOUT => return error.Timeout,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            else => return error.ReadFailed,
+        }
+    }
 }
 
 fn streamWriteAll(stream: net.Stream, bytes: []const u8) !void {
