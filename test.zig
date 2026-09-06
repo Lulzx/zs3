@@ -14,7 +14,12 @@ const SigV4 = main.SigV4;
 const formatHttpDate = main.formatHttpDate;
 const formatIso8601 = main.formatIso8601;
 const decodeAwsChunked = main.decodeAwsChunked;
+const decodeAwsChunkedFull = main.decodeAwsChunkedFull;
+const computeChecksum = main.computeChecksum;
+const ChecksumAlgo = main.ChecksumAlgo;
 const etagListMatches = main.etagListMatches;
+const md5Etag = main.md5Etag;
+const sniffContentType = main.sniffContentType;
 
 test "isValidBucketName" {
     try std.testing.expect(isValidBucketName("mybucket"));
@@ -554,4 +559,82 @@ test "etagListMatches - empty header matches nothing" {
 test "etagListMatches - wildcard inside a list is not a wildcard" {
     // Only a bare "*" is the wildcard; RFC 9110 does not allow it as a list member.
     try std.testing.expect(!etagListMatches("\"aaa\", *", "\"bbb\""));
+}
+
+test "md5Etag - known vectors" {
+    const allocator = std.testing.allocator;
+    // MD5("") = d41d8cd98f00b204e9800998ecf8427e
+    const empty = try md5Etag(allocator, "");
+    defer allocator.free(empty);
+    try std.testing.expectEqualStrings("\"d41d8cd98f00b204e9800998ecf8427e\"", empty);
+    // MD5("abc") = 900150983cd24fb0d6963f7d28e17f72
+    const abc = try md5Etag(allocator, "abc");
+    defer allocator.free(abc);
+    try std.testing.expectEqualStrings("\"900150983cd24fb0d6963f7d28e17f72\"", abc);
+}
+
+test "sniffContentType - common extensions" {
+    try std.testing.expectEqualStrings("text/html", sniffContentType("index.html"));
+    try std.testing.expectEqualStrings("text/html", sniffContentType("a/b.HTM"));
+    try std.testing.expectEqualStrings("text/css", sniffContentType("style.css"));
+    try std.testing.expectEqualStrings("application/javascript", sniffContentType("app.js"));
+    try std.testing.expectEqualStrings("application/json", sniffContentType("data.json"));
+    try std.testing.expectEqualStrings("image/png", sniffContentType("img.png"));
+    try std.testing.expectEqualStrings("image/jpeg", sniffContentType("photo.JPG"));
+    try std.testing.expectEqualStrings("application/pdf", sniffContentType("doc.pdf"));
+    try std.testing.expectEqualStrings("binary/octet-stream", sniffContentType("noext"));
+    try std.testing.expectEqualStrings("binary/octet-stream", sniffContentType("archive.unknownxyz"));
+    try std.testing.expectEqualStrings("binary/octet-stream", sniffContentType(".folder_marker"));
+}
+
+test "decodeAwsChunkedFull - captures trailer block" {
+    const allocator = std.testing.allocator;
+    const input = "5;chunk-signature=ab\r\nhello\r\n0;chunk-signature=cd\r\nx-amz-checksum-crc32: NSRBwg==\r\n\r\n";
+    const result = try decodeAwsChunkedFull(allocator, input);
+    defer allocator.free(result.data);
+    try std.testing.expectEqualStrings("hello", result.data);
+    try std.testing.expect(std.mem.indexOf(u8, result.trailers, "x-amz-checksum-crc32: NSRBwg==") != null);
+}
+
+test "decodeAwsChunkedFull - no trailer leaves empty block" {
+    const allocator = std.testing.allocator;
+    const input = "3;chunk-signature=ab\r\nabc\r\n0;chunk-signature=cd\r\n";
+    const result = try decodeAwsChunkedFull(allocator, input);
+    defer allocator.free(result.data);
+    try std.testing.expectEqualStrings("abc", result.data);
+    try std.testing.expectEqualStrings("", result.trailers);
+}
+
+test "ChecksumAlgo.fromHeaderName" {
+    try std.testing.expect(ChecksumAlgo.fromHeaderName("x-amz-checksum-crc32").? == .crc32);
+    try std.testing.expect(ChecksumAlgo.fromHeaderName("x-amz-checksum-crc32c").? == .crc32c);
+    try std.testing.expect(ChecksumAlgo.fromHeaderName("x-amz-checksum-crc64nvme").? == .crc64nvme);
+    try std.testing.expect(ChecksumAlgo.fromHeaderName("x-amz-checksum-sha1").? == .sha1);
+    try std.testing.expect(ChecksumAlgo.fromHeaderName("x-amz-checksum-sha256").? == .sha256);
+    try std.testing.expect(ChecksumAlgo.fromHeaderName("x-amz-checksum-type") == null);
+    try std.testing.expect(ChecksumAlgo.fromHeaderName("content-md5") == null);
+}
+
+test "computeChecksum - known vectors for abc" {
+    const allocator = std.testing.allocator;
+    // Verified against Python zlib/hashlib and the CRC-64/NVME check value.
+    const cases = [_]struct { algo: ChecksumAlgo, want: []const u8 }{
+        .{ .algo = .crc32, .want = "NSRBwg==" },
+        .{ .algo = .crc32c, .want = "Nks/tw==" },
+        .{ .algo = .sha1, .want = "qZk+NkcGgWq6PiVxeFDCbJzQ2J0=" },
+        .{ .algo = .sha256, .want = "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=" },
+    };
+    for (cases) |c| {
+        const got = try computeChecksum(allocator, c.algo, "abc");
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+}
+
+test "computeChecksum - crc64nvme standard check value" {
+    const allocator = std.testing.allocator;
+    const got = try computeChecksum(allocator, .crc64nvme, "123456789");
+    defer allocator.free(got);
+    // 0xae8b14860a799888 big-endian, base64-encoded.
+    try std.testing.expectEqualStrings("rosUhgp5mIg=", got);
 }
