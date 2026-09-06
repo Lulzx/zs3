@@ -1,0 +1,10 @@
+data/
+zig-out/
+.zig-cache/
+.git/
+.gitignore
+bench/
+*.pyc
+__pycache__/
+.DS_Store
+/tmp/
