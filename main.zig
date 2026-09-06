@@ -2336,9 +2336,9 @@ fn handleConnectionWithStream(allocator: Allocator, ctx: *const S3Context, strea
 
     const data = buf[0..total_read];
 
-    // Allow peer protocol endpoints without auth
-    const is_peer_protocol = if (std.mem.indexOf(u8, data, "/_zs3/")) |_| true else false;
-    if (!is_peer_protocol and !hasAuth(data)) {
+    // Requests that never need auth: peer protocol, CORS preflight, and the
+    // public observability/console endpoints.
+    if (!isPublicRequest(data) and !hasAuth(data)) {
         streamWriteAll(stream, ERROR_403) catch return false;
         return true;
     }
@@ -2401,20 +2401,73 @@ pub fn isValidKey(key: []const u8) bool {
 }
 
 fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response) !void {
+    metrics.requests += 1;
+    defer {
+        if (res.status >= 500) {
+            metrics.errors_5xx += 1;
+        } else if (res.status >= 400) {
+            metrics.errors_4xx += 1;
+        }
+    }
     var path = req.path;
     if (path.len > 0 and path[0] == '/') path = path[1..];
 
+    // CORS preflight: browsers send OPTIONS without credentials. Answer
+    // directly so the embedded console and direct-upload flows work.
+    if (std.mem.eql(u8, req.method, "OPTIONS")) {
+        res.status = 200;
+        res.status_text = "OK";
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, PUT, POST, DELETE, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "authorization, x-amz-date, x-amz-content-sha256, content-type, x-amz-meta-*, x-amz-copy-source, range");
+        res.setHeader("Access-Control-Expose-Headers", "ETag, Content-Length, Content-Type, Content-Range, x-amz-meta-*, x-amz-version-id");
+        res.setHeader("Content-Length", "0");
+        return;
+    }
+
+    // Public observability + console endpoints (no auth; safe to expose).
+    if (std.mem.eql(u8, path, "metrics") and std.mem.eql(u8, req.method, "GET")) {
+        try handleMetrics(ctx, allocator, res);
+        return;
+    }
+
+    // Verify client-supplied payload checksums before anything is stored.
+    // Covers the header form and the trailer form from STREAMING-*-TRAILER
+    // uploads. CopyObject is exempt: its checksum headers describe the
+    // destination object, not this (empty) request body.
+    if (std.mem.eql(u8, req.method, "PUT") and req.header("x-amz-copy-source") == null) {
+        if (try mismatchedChecksum(allocator, req)) |bad| {
+            const msg = try std.fmt.allocPrint(allocator, "The {s} you specified did not match what we received", .{bad});
+            sendError(res, 400, "XAmzContentChecksumMismatch", msg);
+            return;
+        }
+    }
+
     // Handle peer protocol (no auth required for peer-to-peer)
     if (std.mem.startsWith(u8, path, "_zs3/")) {
+        const sub = path[5..];
+        // Console and metrics are served in both standalone and distributed mode.
+        if (std.mem.eql(u8, sub, "console") and std.mem.eql(u8, req.method, "GET")) {
+            handleConsole(allocator, res);
+            return;
+        }
+        if (std.mem.eql(u8, sub, "metrics") and std.mem.eql(u8, req.method, "GET")) {
+            try handleMetrics(ctx, allocator, res);
+            return;
+        }
         if (ctx.distributed) |dist| {
-            try handlePeerProtocol(ctx, dist, allocator, req, res, path[5..]);
+            try handlePeerProtocol(ctx, dist, allocator, req, res, sub);
         } else {
             sendError(res, 404, "NotFound", "Distributed mode not enabled");
         }
         return;
     }
 
-    const acl_ctx = SigV4.verify(ctx, req, allocator);
+    var acl_ctx = SigV4.verify(ctx, req, allocator);
+    if (!acl_ctx.authenticated) {
+        // Fall back to query-string SigV4 (presigned URLs).
+        acl_ctx = SigV4.verifyPresigned(ctx, req, allocator);
+    }
 
     // S3 API requires authentication
     if (!acl_ctx.authenticated) {
@@ -3459,26 +3512,42 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
         }
 
         // Preconditions passed — serve from the content we already read.
+        // A satisfiable Range turns this into a 206, which (like S3) omits
+        // whole-object checksums; decide before applying attributes.
+        const cond_range = if (req.header("range")) |rh| parseRange(rh, content.len) else null;
         res.ok();
         res.setHeader("Accept-Ranges", "bytes");
         res.setHeader("ETag", etag);
         res.setHeader("Last-Modified", last_modified);
-        if (req.header("range")) |range_header| {
-            if (parseRange(range_header, content.len)) |range| {
-                const content_range = std.fmt.allocPrint(allocator, "bytes {d}-{d}/{d}", .{ range.start, range.end, content.len }) catch {
-                    sendError(res, 500, "InternalError", "Range format failed");
-                    return;
-                };
-                res.status = 206;
-                res.status_text = "Partial Content";
-                res.setHeader("Content-Range", content_range);
-                res.body = content[range.start .. range.end + 1];
-                return;
+        // NB: no deinit — response headers borrow attrs memory, which the
+        // request arena frees after the response is written.
+        if (loadStandaloneAttrs(allocator, path, key)) |attrs| {
+            if (cond_range != null) {
+                applyAttrsToRangeResponse(res, &attrs);
+            } else {
+                applyAttrsToResponse(res, &attrs);
             }
+        } else |_| {}
+        if (cond_range) |range| {
+            const content_range = std.fmt.allocPrint(allocator, "bytes {d}-{d}/{d}", .{ range.start, range.end, content.len }) catch {
+                sendError(res, 500, "InternalError", "Range format failed");
+                return;
+            };
+            res.status = 206;
+            res.status_text = "Partial Content";
+            res.setHeader("Content-Range", content_range);
+            res.body = content[range.start .. range.end + 1];
+            metrics.get_bytes += res.body.len;
+            return;
         }
         res.body = content;
+        metrics.get_bytes += content.len;
         return;
     }
+
+    // NB: no deinit — response headers borrow attrs memory, freed by the
+    // request arena after the response is written.
+    const obj_attrs = loadStandaloneAttrs(allocator, path, key) catch null;
 
     // For range requests, use sendFile without ETag (efficient for large files)
     if (req.header("range")) |range_header| {
@@ -3496,6 +3565,8 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
             res.setHeader("Content-Range", content_range);
             res.setHeader("Accept-Ranges", "bytes");
             res.setHeader("Last-Modified", last_modified);
+            if (obj_attrs) |*a| applyAttrsToRangeResponse(res, a);
+            metrics.get_bytes += len;
             res.setSendFile(file, len, range.start);
             return;
         }
@@ -3518,6 +3589,8 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("ETag", etag);
     res.setHeader("Last-Modified", last_modified);
+    if (obj_attrs) |*a| applyAttrsToResponse(res, a);
+    metrics.get_bytes += content.len;
     res.body = content;
 }
 
@@ -5846,17 +5919,90 @@ fn handleDistributedHead(ctx: *const S3Context, allocator: Allocator, req: *Requ
     res.setHeader("ETag", etag);
     res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("Last-Modified", last_modified);
+    // NB: no deinit — headers borrow attrs memory (arena-freed after write).
+    const hattrs = readDistAttrs(allocator, dist, bucket, key) orelse fetchAttrsFromPeers(ctx, allocator, bucket, key);
+    if (hattrs) |*a| {
+        applyAttrsToResponse(res, a);
+    } else {
+        res.setHeader("Content-Type", DEFAULT_CONTENT_TYPE);
+    }
+}
+
+/// Prometheus-compatible process metrics. No auth: safe to scrape.
+fn handleMetrics(ctx: *const S3Context, allocator: Allocator, res: *Response) !void {
+    const now = std.Io.Clock.real.now(app_io).toSeconds();
+    const uptime = now - metrics.start_time_secs;
+    const peers: usize = if (ctx.distributed) |dist| dist.kademlia.peerCount() else 0;
+
+    var buckets: usize = 0;
+    if (std.Io.Dir.cwd().openDir(app_io, ctx.data_dir, .{ .iterate = true })) |*d| {
+        var dir = d.*;
+        defer dir.close(app_io);
+        var iter = dir.iterate();
+        while (iter.next(app_io) catch null) |entry| {
+            if (entry.kind == .directory and entry.name[0] != '.') buckets += 1;
+        }
+    } else |_| {}
+
+    const body = try std.fmt.allocPrint(allocator,
+        \\# HELP zs3_requests_total Total HTTP requests served since start.
+        \\# TYPE zs3_requests_total counter
+        \\zs3_requests_total {d}
+        \\# HELP zs3_errors_4xx Total 4xx responses served.
+        \\# TYPE zs3_errors_4xx counter
+        \\zs3_errors_4xx {d}
+        \\# HELP zs3_errors_5xx Total 5xx responses served.
+        \\# TYPE zs3_errors_5xx counter
+        \\zs3_errors_5xx {d}
+        \\# HELP zs3_put_bytes Total object bytes written via PUT/CopyObject.
+        \\# TYPE zs3_put_bytes counter
+        \\zs3_put_bytes {d}
+        \\# HELP zs3_get_bytes Total object bytes served via GET.
+        \\# TYPE zs3_get_bytes counter
+        \\zs3_get_bytes {d}
+        \\# HELP zs3_uptime_seconds Seconds since process start.
+        \\# TYPE zs3_uptime_seconds gauge
+        \\zs3_uptime_seconds {d}
+        \\# HELP zs3_buckets Number of buckets in the data dir.
+        \\# TYPE zs3_buckets gauge
+        \\zs3_buckets {d}
+        \\# HELP zs3_known_peers Peers in the Kademlia routing table (0 in standalone mode).
+        \\# TYPE zs3_known_peers gauge
+        \\zs3_known_peers {d}
+        \\
+    , .{ metrics.requests, metrics.errors_4xx, metrics.errors_5xx, metrics.put_bytes, metrics.get_bytes, uptime, buckets, peers });
+
+    res.ok();
+    res.setHeader("Content-Type", "text/plain; version=0.0.4");
+    res.body = body;
+}
+
+const console_html = @embedFile("console.html");
+
+/// Single-file browser console (no auth on the page itself; the JS signs S3
+/// requests with keys the user types, kept in localStorage only).
+fn handleConsole(allocator: Allocator, res: *Response) void {
+    _ = allocator;
+    res.ok();
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.body = console_html;
 }
 
 fn sendError(res: *Response, status: u16, code: []const u8, message: []const u8) void {
     res.status = status;
     res.status_text = switch (status) {
+        200 => "OK",
+        204 => "No Content",
+        206 => "Partial Content",
+        304 => "Not Modified",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
         412 => "Precondition Failed",
+        416 => "Range Not Satisfiable",
         500 => "Internal Server Error",
         else => "Error",
     };

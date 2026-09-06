@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>zs3 / console</title>
+<style>
+:root{--paper:#f4f2eb;--ink:#24231f;--muted:#706d64;--rule:#cfcdc3;--accent:#bd3c1b;--wash:#eae7dd;--line:21px;color-scheme:light;font:14px/var(--line) ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;background:var(--paper);color:var(--ink)}
+:root[data-theme=dark]{--paper:#22221f;--ink:#eeece3;--muted:#aaa69b;--rule:#4b4a42;--accent:#f08a62;--wash:#2d2d28;color-scheme:dark}
+*{box-sizing:border-box}body{margin:0}button,input,select{font:inherit;color:inherit}button,a,input,select,summary{-webkit-tap-highlight-color:transparent}button{border:0;background:transparent;padding:5px 0;cursor:pointer;white-space:nowrap}button::before{content:"[";color:var(--muted)}button::after{content:"]";color:var(--muted)}button:hover{color:var(--accent)}button:active{transform:translateY(1px)}button:disabled{opacity:.4;cursor:default}button.primary{color:var(--accent);font-weight:700}button.plain::before,button.plain::after,button.bucket::before,button.bucket::after{content:none}a{color:inherit}input,select{border:1px solid var(--rule);border-radius:0;background:var(--paper);padding:8px 1ch;min-width:0;width:100%}input:focus{border-color:var(--accent)}:focus-visible{outline:2px solid var(--accent);outline-offset:3px}h1,h2,p{margin:0}h1{font-size:28px;line-height:42px;letter-spacing:-1.5px;font-weight:600}h1 span{font-weight:400;color:var(--muted)}h2,.eyebrow{font-size:11px;line-height:21px;letter-spacing:1.4px;font-weight:500;text-transform:uppercase}.muted{color:var(--muted)}.accent{color:var(--accent)}[hidden]{display:none!important}.shell{max-width:1440px;padding:42px 4ch 21px;margin:auto}.masthead{display:flex;justify-content:space-between;gap:3ch;padding-bottom:28px;align-items:center}.tagline{color:var(--muted);margin-top:7px}.server{text-align:right;min-width:0}.endpoint{max-width:48ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}.server-controls{display:flex;justify-content:flex-end;align-items:center;gap:2ch;margin-top:7px}.status{font-size:12px;color:var(--muted)}.status.connected{color:var(--ink)}.status.connected::before{content:"● ";color:var(--accent)}.toprule{border-top:2px solid var(--ink);border-bottom:1px solid var(--rule);display:flex;justify-content:space-between;padding:10px 0;gap:2ch}.workspace{display:grid;grid-template-columns:25ch minmax(0,1fr);min-height:525px;border-bottom:1px solid var(--ink)}.sidebar{border-right:1px solid var(--rule);padding:24px 2ch 24px 0;display:flex;flex-direction:column;gap:14px;min-width:0}.section-label{display:flex;justify-content:space-between;align-items:center}.count{color:var(--muted);font-size:11px}.buckets{display:flex;flex-direction:column;gap:3px}.bucket{text-align:left;padding:7px 1ch;overflow:hidden;text-overflow:ellipsis;width:100%}.bucket::first-letter{color:var(--muted)}.bucket.active{background:var(--ink);color:var(--paper)}.sidebar-foot{margin-top:auto;padding-top:42px;color:var(--muted);font-size:11px;line-height:18px}.objects-pane{min-width:0;position:relative;display:flex;flex-direction:column;padding:24px 0 0 3ch}.crumb{display:flex;flex-wrap:wrap;align-items:center;gap:1ch;overflow-wrap:anywhere;min-height:31px}.crumb button{white-space:normal;text-align:left;font-weight:600;overflow-wrap:anywhere}.crumb .slash{color:var(--muted)}.toolbar{display:flex;align-items:center;justify-content:space-between;gap:2ch;padding:14px 0 21px}.actions{display:flex;gap:2ch;align-items:center;flex-wrap:wrap}.filter{display:flex;align-items:center;gap:2ch;border-top:1px solid var(--rule);padding:10px 0}.filter label{font-size:12px;white-space:nowrap;color:var(--muted)}.filter input{border:0;padding:3px 0;background:transparent}.key{border:1px solid var(--rule);padding:0 5px;color:var(--muted);font-size:11px}.table-wrap{min-height:280px}table{width:100%;border-collapse:collapse;table-layout:fixed}th{text-align:left;color:var(--muted);font-size:11px;font-weight:400;letter-spacing:1px;padding:11px 1ch;border-top:1px solid var(--ink);border-bottom:1px solid var(--rule)}td{padding:11px 1ch;border-bottom:1px solid var(--rule);vertical-align:middle}th:first-child,td:first-child{padding-left:1ch}.namecol{width:auto}.sizecol{width:13ch;text-align:right}.datecol{width:19ch;text-align:right}.object-row{cursor:pointer}.object-row:hover{background:var(--wash)}.object-row.selected{background:var(--ink);color:var(--paper)}.object-row.selected .muted{color:var(--paper)}.object-name{display:flex;gap:1ch;align-items:center;min-width:0}.object-name button{text-align:left;overflow:hidden;text-overflow:ellipsis;display:block;padding:0;flex:1}.object-name .marker{color:var(--muted);width:2ch;flex-shrink:0}.selected .marker{color:var(--paper)}.folder .object-name button{font-weight:600}.date-text{color:var(--muted);font-size:12px}.selected .date-text{color:var(--paper)}.pagination{display:flex;justify-content:space-between;align-items:center;gap:2ch;color:var(--muted);font-size:12px;padding:14px 0 21px;margin-top:auto}.empty{padding:63px 2ch;text-align:center;border-top:1px solid var(--ink)}.empty .diagram{white-space:pre;font-size:14px;line-height:21px;color:var(--muted);margin-bottom:21px}.empty p{margin-top:7px;color:var(--muted)}.inspector{border-bottom:1px solid var(--ink);padding:21px 0}.inspector-heading{display:flex;justify-content:space-between;gap:2ch;align-items:center}.inspector-name{min-width:0;overflow-wrap:anywhere;font-weight:600}.metadata{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:21px 3ch;margin-top:21px}.metadata dt{color:var(--muted);font-size:11px;letter-spacing:1px;margin-bottom:7px}.metadata dd{margin:0;overflow-wrap:anywhere}.metadata dl{margin:0}.preview{padding-top:21px}.preview pre{max-height:360px;overflow:auto;background:var(--wash);padding:21px 2ch;margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}.preview img{display:block;max-width:100%;max-height:420px;object-fit:contain;background:var(--wash)}.ledger{padding:14px 0;border-bottom:1px solid var(--rule)}.ledger summary{cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:3ch;font-size:12px}.ledger summary::before{content:"+";color:var(--accent)}.ledger[open] summary::before{content:"−"}.ledger .latest{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.activity{list-style:none;padding:14px 0 0;margin:0;max-height:220px;overflow:auto}.activity li{display:grid;grid-template-columns:9ch 1fr auto;gap:2ch;padding:7px 0;font-size:12px;border-top:1px solid var(--rule);overflow-wrap:anywhere}.footer{display:flex;justify-content:space-between;gap:2ch;font-size:11px;color:var(--muted);padding-top:21px}.footer span{display:flex;gap:2ch;align-items:center}.error{color:var(--accent);border-left:3px solid var(--accent);padding:14px 2ch;background:var(--wash);margin:14px 0;white-space:pre-wrap;overflow-wrap:anywhere}.drop-overlay{position:absolute;inset:0;border:2px dashed var(--accent);background:var(--paper);z-index:2;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px;pointer-events:none;padding:3ch;text-align:center;overflow-wrap:anywhere}.mobile-buckets{display:none}dialog{background:var(--paper);color:var(--ink);border:1px solid var(--ink);border-top:3px solid var(--ink);padding:28px 3ch;width:min(560px,calc(100% - 32px));max-height:90dvh}dialog::backdrop{background:rgb(25 24 20 / .35)}dialog h2{font-size:14px;letter-spacing:0;text-transform:none;font-weight:600;margin-bottom:21px}dialog label{display:block;color:var(--muted);font-size:12px;margin-bottom:14px}dialog input{margin-top:7px;color:var(--ink)}dialog .dialog-actions{display:flex;gap:3ch;justify-content:flex-end;margin-top:21px}dialog p{color:var(--muted);font-size:12px;overflow-wrap:anywhere}dialog .check{display:flex;gap:1ch;align-items:center;margin-top:14px}dialog .check input{width:auto;margin:0}.loading{padding:28px 1ch;color:var(--muted);border-top:1px solid var(--ink)}.loading-lines{margin-top:21px;background:repeating-linear-gradient(to bottom,var(--wash) 0,var(--wash) 12px,transparent 12px,transparent 42px);height:126px;width:75%}.more-menu{position:relative}.more-menu summary{cursor:pointer;color:var(--muted)}.more-menu[open]{padding:7px 1ch;border:1px solid var(--rule)}
+@media(min-width:1400px){.shell{padding-top:63px}.workspace{min-height:588px}}
+@media(max-width:760px){.shell{padding:21px 2ch}.masthead{align-items:flex-start;gap:1ch;padding-bottom:21px}h1{font-size:23px}.tagline{font-size:11px}.endpoint{max-width:23ch;font-size:11px}.server-controls{gap:1ch;flex-wrap:wrap;font-size:11px}.status{font-size:11px}.toprule{font-size:11px}.workspace{grid-template-columns:1fr;min-height:420px}.sidebar{display:none}.mobile-buckets{display:flex;align-items:center;gap:2ch;padding:14px 0;border-bottom:1px solid var(--rule)}.mobile-buckets label{font-size:11px;color:var(--muted)}.objects-pane{padding:14px 0 0}.datecol{display:none}.sizecol{width:11ch}.toolbar{gap:1ch}.actions{gap:1ch}.filter{gap:1ch}.filter label{font-size:11px}.inspector-heading{align-items:flex-start;flex-direction:column}.metadata{grid-template-columns:1fr 1fr}.footer{flex-direction:column;gap:14px}.activity li{grid-template-columns:1fr auto}.activity time{display:none}.ledger summary{gap:1ch}.ledger .eyebrow{display:none}.empty{padding:42px 1ch}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+</style>
+</head>
+<body>
+<div class="shell">
+<header class="masthead"><div><h1>zs3 <span>/ console</span></h1><p class="tagline">SQLite for objects.</p></div><div class="server"><span class="endpoint" id="endpointLabel"></span><div class="server-controls"><span id="status" class="status" role="status">not connected</span><button id="connection">Connection</button><button id="theme" aria-label="Switch to dark theme">Dark</button></div></div></header>
+<div class="toprule"><span class="eyebrow">Object storage / browser</span><span class="muted" id="regionLabel">us-east-1</span></div>
+<div class="error" id="err" role="alert" hidden></div>
+<div class="mobile-buckets"><label for="bucketSelect">BUCKET</label><select id="bucketSelect"><option value="">Select a bucket</option></select><button id="mobileCreate">+ New</button></div>
+<main class="workspace"><aside class="sidebar" aria-label="Buckets"><div class="section-label"><h2>Buckets</h2><span id="bucketCount" class="count">—</span></div><nav id="buckets" class="buckets" aria-label="Bucket list"><p class="muted">Connect to list buckets.</p></nav><div class="actions"><button id="newBucketButton">+ New bucket</button><button id="refreshBuckets" aria-label="Refresh buckets">↻</button></div><div class="sidebar-foot">ONE ENDPOINT.<br>EVERY OBJECT.<br><br>Browse your buckets.<br>Keep your bearings.</div></aside>
+<section class="objects-pane" id="dropZone" aria-label="Object browser"><nav id="crumb" class="crumb" aria-label="Object path"><span class="muted">/ Select a bucket</span></nav><div class="toolbar"><div class="actions"><button id="up" disabled>↑ Up</button><button id="refreshObjects" disabled>↻ Refresh</button></div><button class="primary" id="upload" disabled>+ Upload</button><input id="file" type="file" multiple hidden></div><div class="filter"><label for="filter">Filter this page</label><input id="filter" type="text" placeholder="Start typing a name…" autocomplete="off" disabled><kbd class="key">/</kbd></div><div id="objects" class="table-wrap" aria-busy="false"></div><div class="pagination"><span id="pageInfo">No bucket selected</span><div class="actions"><button id="previous" hidden>← Previous</button><button id="next" hidden>Next →</button></div></div><div class="drop-overlay" id="dropOverlay" hidden><span class="accent">↓ DROP TO UPLOAD</span><span id="dropDestination"></span></div></section></main>
+<section class="inspector" id="inspector" aria-label="Object inspector" hidden><div class="inspector-heading"><span id="inspectorName" class="inspector-name"></span><div class="actions"><button id="download">Download</button><button id="copyUri">Copy S3 URI</button><button id="previewButton">Preview</button><details class="more-menu" id="moreMenu"><summary>[More]</summary><button id="deleteObject">Delete object</button></details><button id="closeInspector" aria-label="Close inspector">×</button></div></div><div class="metadata" id="metadata"></div><div class="preview" id="preview" hidden></div></section>
+<details class="ledger" id="ledger"><summary><span class="eyebrow">Session activity</span><span class="latest" id="latest">Ready when you are.</span><span class="muted" id="latestResult">No requests yet</span></summary><ol id="activity" class="activity"></ol></details>
+<footer class="footer"><span><span><kbd class="key">/</kbd> filter</span><span><kbd class="key">↑ ↓</kbd> select</span><span><kbd class="key">↵</kbd> open</span></span><span>zs3 / embedded console <span aria-hidden="true">·</span> <button id="deleteBucket" disabled>Delete bucket</button></span></footer>
+</div>
+<dialog id="connectionDialog"><form id="connectionForm"><h2>Connect to object storage</h2><label>Endpoint<input id="endpoint" type="url" required placeholder="http://localhost:9000"></label><label>Region<input id="region" type="text" value="us-east-1" required></label><label>Access key<input id="ak" type="text" autocomplete="off" required></label><label>Secret key<input id="sk" type="password" autocomplete="off" required></label><label class="check"><input id="remember" type="checkbox">Remember credentials in this browser</label><p>Requests are signed in your browser. Remembered credentials are stored in localStorage on this device.</p><div class="error" id="connectionError" role="alert" hidden></div><div class="dialog-actions"><button type="button" id="cancelConnection">Cancel</button><button type="submit" id="save" class="primary">Connect</button></div></form></dialog>
+<dialog id="newBucketDialog"><form id="newBucketForm"><h2>Create a bucket</h2><label>Bucket name<input id="newBucket" required minlength="3" maxlength="63" pattern="[a-z0-9][a-z0-9.-]*[a-z0-9]" placeholder="build-artifacts" autocomplete="off"></label><p>3–63 characters. Lowercase letters, numbers, dots, and hyphens.</p><div class="error" id="bucketError" role="alert" hidden></div><div class="dialog-actions"><button type="button" id="cancelBucket">Cancel</button><button type="submit" id="createBucket" class="primary">Create bucket</button></div></form></dialog>
+<dialog id="confirmDialog"><form id="confirmForm"><h2 id="confirmTitle">Delete object?</h2><p id="confirmText"></p><div class="error" id="confirmError" role="alert" hidden></div><div class="dialog-actions"><button type="button" id="cancelDelete">Cancel</button><button type="submit" id="confirmDelete" class="primary">Delete</button></div></form></dialog>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const el = (tag, text, cls) => { const n=document.createElement(tag); if(text!==undefined)n.textContent=text; if(cls)n.className=cls; return n; };
+function err(m){ $("err").textContent=String(m); $("err").hidden=false; }
+function clearErr(){ $("err").hidden=true; }
+function readSetting(key){try{return localStorage.getItem("zs3."+key)}catch{return null}}
+function writeSetting(key,value){if(value===null)localStorage.removeItem("zs3."+key);else localStorage.setItem("zs3."+key,value)}
+let curBucket="",curPrefix="", entries=[],selected=null,bucketNames=[],generation=0,inspectGeneration=0,pageTokens=[undefined],pageIndex=0,nextToken=null,previewUrl=null,uploading=false,deleteAction=null;
+const bytes=n=>{n=Number(n);if(n<1024)return n+" B";const units=["KB","MB","GB","TB"];let i=-1;do{n/=1024;i++}while(n>=1024&&i<units.length-1);return n.toFixed(1)+" "+units[i]};
+function activity(method,path,result){const row=el("li");row.append(el("time",new Date().toLocaleTimeString([],{hour12:false})),el("span",method+" "+path),el("span",result,"muted"));$("activity").prepend(row);while($("activity").children.length>60)$("activity").lastChild.remove();$("latest").textContent=method+" "+path;$("latestResult").textContent=result;}
+async function signedFetch(method,path,query={},body){const start=performance.now();try{const r=await rawSignedFetch(method,path,query,body);activity(method,path+(Object.keys(query).length?"?"+new URLSearchParams(query):""),r.status+" OK · "+Math.round(performance.now()-start)+" ms");return r}catch(e){activity(method,path,"FAILED · "+Math.round(performance.now()-start)+" ms");throw e}}
+const enc = new TextEncoder();
+function hex(buf) { return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join(""); }
+async function sha256Hex(data) { return hex(await crypto.subtle.digest("SHA-256", data)); }
+async function hmac(key, data) {
+  const k = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return crypto.subtle.sign("HMAC", k, typeof data === "string" ? enc.encode(data) : data);
+}
+function amzDates() {
+  const d = new Date();
+  const p = (n, l=2) => String(n).padStart(l, "0");
+  const stamp = d.getUTCFullYear() + p(d.getUTCMonth()+1) + p(d.getUTCDate());
+  return { date: stamp, datetime: stamp + "T" + p(d.getUTCHours()) + p(d.getUTCMinutes()) + p(d.getUTCSeconds()) + "Z" };
+}
+function uriEncodePath(path) {
+  return path.split("/").map(s => encodeURIComponent(s).replace(/[!'()*]/g, c => "%" + c.charCodeAt(0).toString(16).toUpperCase())).join("/");
+}
+async function rawSignedFetch(method, path, query, body) {
+  const endpoint = $("endpoint").value.replace(/\/$/, "");
+  const region = $("region").value || "us-east-1";
+  const ak = $("ak").value, sk = $("sk").value;
+  const url = new URL(endpoint);
+  const host = url.host;
+  const { date, datetime } = amzDates();
+  const payloadHash = await sha256Hex(body || enc.encode(""));
+  const canonPath = uriEncodePath(path.startsWith("/") ? path : "/" + path);
+  const canonQuery = Object.keys(query).sort().map(k => encodeURIComponent(k) + "=" + encodeURIComponent(query[k])).join("&");
+  const canonHeaders = "host:" + host + "\n" + "x-amz-content-sha256:" + payloadHash + "\n" + "x-amz-date:" + datetime + "\n";
+  const signedHeaders = "host;x-amz-content-sha256;x-amz-date";
+  const canon = [method, canonPath, canonQuery, canonHeaders, signedHeaders, payloadHash].join("\n");
+  const scope = date + "/" + region + "/s3/aws4_request";
+  const sts = ["AWS4-HMAC-SHA256", datetime, scope, await sha256Hex(enc.encode(canon))].join("\n");
+  let key = await hmac(enc.encode("AWS4" + sk), date);
+  key = await hmac(key, region);
+  key = await hmac(key, "s3");
+  key = await hmac(key, "aws4_request");
+  const sig = hex(await hmac(key, sts));
+  const qs = canonQuery ? "?" + canonQuery : "";
+  const resp = await fetch(endpoint + canonPath + qs, {
+    method,
+    headers: {
+      "Authorization": "AWS4-HMAC-SHA256 Credential=" + ak + "/" + scope + ", SignedHeaders=" + signedHeaders + ", Signature=" + sig,
+      "x-amz-date": datetime,
+      "x-amz-content-sha256": payloadHash,
+    },
+    body: body || undefined,
+  });
+  if (!resp.ok) {
+    const t = await resp.text();
+    throw new Error(method + " " + path + " -> " + resp.status + " " + t.slice(0, 500));
+  }
+  return resp;
+}
+function parseXml(text) { return new DOMParser().parseFromString(text, "application/xml"); }
+function tags(doc, name) { return [...doc.getElementsByTagName(name)].map(e => e.textContent); }
+
