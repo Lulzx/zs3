@@ -119,12 +119,23 @@ pub fn formatIso8601(buf: *[20]u8, timestamp: i64) void {
     }) catch unreachable;
 }
 
+/// Result of decoding AWS chunked transfer encoding: the payload, plus the raw
+/// trailer block that follows the terminating 0-size chunk (empty when absent).
+pub const ChunkedBody = struct {
+    data: []const u8,
+    trailers: []const u8,
+};
+
 /// Decode AWS chunked transfer encoding.
 /// Format: <hex-size>;chunk-signature=...\r\n<data>\r\n repeated, terminated by 0-size chunk.
-pub fn decodeAwsChunked(allocator: Allocator, body: []const u8) ![]const u8 {
+/// The -TRAILER variants append `x-amz-checksum-*: <base64>` lines after that
+/// final chunk; they are returned rather than discarded so the checksum can be
+/// verified against the payload.
+pub fn decodeAwsChunkedFull(allocator: Allocator, body: []const u8) !ChunkedBody {
     var result: std.ArrayListUnmanaged(u8) = .empty;
     errdefer result.deinit(allocator);
 
+    var trailers: []const u8 = "";
     var pos: usize = 0;
     while (pos < body.len) {
         // Find the end of the chunk header line (terminated by \r\n)
@@ -136,7 +147,11 @@ pub fn decodeAwsChunked(allocator: Allocator, body: []const u8) ![]const u8 {
         const hex_str = chunk_header[0..size_end];
         const chunk_size = std.fmt.parseInt(usize, hex_str, 16) catch break;
 
-        if (chunk_size == 0) break;
+        if (chunk_size == 0) {
+            // Everything past the terminating chunk's CRLF is the trailer block.
+            trailers = body[@min(line_end + 2, body.len)..];
+            break;
+        }
 
         // Data starts after \r\n
         const data_start = line_end + 2;
@@ -148,7 +163,98 @@ pub fn decodeAwsChunked(allocator: Allocator, body: []const u8) ![]const u8 {
         pos = data_start + chunk_size + 2;
     }
 
-    return result.toOwnedSlice(allocator);
+    return .{ .data = try result.toOwnedSlice(allocator), .trailers = trailers };
+}
+
+/// Payload-only wrapper for callers with no interest in trailers.
+pub fn decodeAwsChunked(allocator: Allocator, body: []const u8) ![]const u8 {
+    const decoded = try decodeAwsChunkedFull(allocator, body);
+    return decoded.data;
+}
+
+// ============================================================================
+// PAYLOAD CHECKSUMS (x-amz-checksum-*, header or trailer form)
+// ============================================================================
+
+/// CRC-64/NVME is absent from Zig's CRC catalog, so build it from the generic
+/// implementation. Check value for "123456789" is 0xae8b14860a799888.
+const Crc64Nvme = std.hash.crc.Crc(u64, .{
+    .polynomial = 0xad93d23594c93659,
+    .initial = 0xffffffffffffffff,
+    .reflect_input = true,
+    .reflect_output = true,
+    .xor_output = 0xffffffffffffffff,
+});
+
+pub const ChecksumAlgo = enum {
+    crc32,
+    crc32c,
+    crc64nvme,
+    sha1,
+    sha256,
+
+    /// Map a full header name ("x-amz-checksum-crc32c") to its algorithm.
+    pub fn fromHeaderName(name: []const u8) ?ChecksumAlgo {
+        const prefix = "x-amz-checksum-";
+        if (!std.mem.startsWith(u8, name, prefix)) return null;
+        const suffix = name[prefix.len..];
+        if (std.mem.eql(u8, suffix, "crc32")) return .crc32;
+        if (std.mem.eql(u8, suffix, "crc32c")) return .crc32c;
+        if (std.mem.eql(u8, suffix, "crc64nvme")) return .crc64nvme;
+        if (std.mem.eql(u8, suffix, "sha1")) return .sha1;
+        if (std.mem.eql(u8, suffix, "sha256")) return .sha256;
+        return null;
+    }
+};
+
+/// Compute the base64 digest S3 carries in x-amz-checksum-<algo>.
+pub fn computeChecksum(allocator: Allocator, algo: ChecksumAlgo, data: []const u8) ![]const u8 {
+    var digest: [32]u8 = undefined;
+    const raw: []const u8 = switch (algo) {
+        .crc32 => blk: {
+            std.mem.writeInt(u32, digest[0..4], std.hash.crc.Crc32IsoHdlc.hash(data), .big);
+            break :blk digest[0..4];
+        },
+        .crc32c => blk: {
+            std.mem.writeInt(u32, digest[0..4], std.hash.crc.Crc32Iscsi.hash(data), .big);
+            break :blk digest[0..4];
+        },
+        .crc64nvme => blk: {
+            std.mem.writeInt(u64, digest[0..8], Crc64Nvme.hash(data), .big);
+            break :blk digest[0..8];
+        },
+        .sha1 => blk: {
+            std.crypto.hash.Sha1.hash(data, digest[0..20], .{});
+            break :blk digest[0..20];
+        },
+        .sha256 => blk: {
+            std.crypto.hash.sha2.Sha256.hash(data, digest[0..32], .{});
+            break :blk digest[0..32];
+        },
+    };
+    const encoder = std.base64.standard.Encoder;
+    const out = try allocator.alloc(u8, encoder.calcSize(raw.len));
+    return encoder.encode(out, raw);
+}
+
+/// Verify every x-amz-checksum-* the client supplied against the received
+/// payload. Returns the name of the first header that disagrees, or null when
+/// all of them match (including when none were sent).
+///
+/// Composite values ("<base64>-<partcount>", returned by CompleteMultipartUpload)
+/// describe an assembled object rather than this request body, so they are
+/// skipped.
+pub fn mismatchedChecksum(allocator: Allocator, req: *const Request) !?[]const u8 {
+    var it = req.headers.iterator();
+    while (it.next()) |entry| {
+        const algo = ChecksumAlgo.fromHeaderName(entry.key_ptr.*) orelse continue;
+        const want = std.mem.trim(u8, entry.value_ptr.*, " \t");
+        if (want.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, want, '-') != null) continue;
+        const got = try computeChecksum(allocator, algo, req.body);
+        if (!std.mem.eql(u8, got, want)) return entry.key_ptr.*;
+    }
+    return null;
 }
 
 /// Heap-allocate an RFC 7231 date string suitable for Response.setHeader.
@@ -2074,11 +2180,35 @@ fn parseRequestFromBuf(allocator: Allocator, data: []const u8, stream: net.Strea
             }
             body = body_buf;
 
-            // Decode AWS chunked transfer encoding if present
+            // Decode AWS chunked transfer encoding if present. Any STREAMING-*
+            // form carries chunk framing: the base
+            // STREAMING-AWS4-HMAC-SHA256-PAYLOAD, the -TRAILER variants (with
+            // trailing x-amz-checksum-* headers after the final 0 chunk, used
+            // when a checksum algorithm is negotiated via
+            // x-amz-sdk-checksum-algorithm), and STREAMING-UNSIGNED-PAYLOAD-TRAILER
+            // (unsigned streaming with a trailing checksum). Trailers are
+            // lifted into the header map below and verified against the
+            // payload in route(). Plain UNSIGNED-PAYLOAD is raw bytes and must
+            // NOT be decoded.
             if (headers.get("x-amz-content-sha256")) |sha| {
-                if (std.mem.eql(u8, sha, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")) {
-                    const decoded = try decodeAwsChunked(allocator, body);
-                    body = decoded;
+                if (std.mem.startsWith(u8, sha, "STREAMING-")) {
+                    const decoded = try decodeAwsChunkedFull(allocator, body);
+                    body = decoded.data;
+                    // Fold trailer lines into the header map so a trailing
+                    // checksum is indistinguishable from a header one to every
+                    // downstream consumer (validation, persistence, echo).
+                    var line_it = std.mem.splitSequence(u8, decoded.trailers, "\r\n");
+                    while (line_it.next()) |line| {
+                        const trimmed = std.mem.trim(u8, line, " \t");
+                        if (trimmed.len == 0) continue;
+                        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+                        const raw_name = std.mem.trim(u8, trimmed[0..colon], " \t");
+                        const value = std.mem.trim(u8, trimmed[colon + 1 ..], " \t");
+                        if (raw_name.len == 0 or raw_name.len > 128) continue;
+                        const name = try allocator.alloc(u8, raw_name.len);
+                        _ = std.ascii.lowerString(name, raw_name);
+                        try headers.put(name, value);
+                    }
                 }
             }
         }
