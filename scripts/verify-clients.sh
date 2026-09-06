@@ -38,6 +38,16 @@ aws --endpoint-url "$endpoint" --no-cli-pager s3api head-object \
 aws --endpoint-url "$endpoint" --no-cli-pager s3api get-object \
     --bucket "$aws_bucket" --key aws-cli/compatibility.txt "$tmp_dir/aws-output" >/dev/null
 cmp "$tmp_dir/aws-input" "$tmp_dir/aws-output"
+# Server-side copy: the primitive behind `s3 mv` / `s3 sync` / `rclone move`.
+aws --endpoint-url "$endpoint" --no-cli-pager s3api copy-object \
+    --bucket "$aws_bucket" --key aws-cli/copied.txt \
+    --copy-source "$aws_bucket/aws-cli/compatibility.txt" >/dev/null
+aws --endpoint-url "$endpoint" --no-cli-pager s3api get-object \
+    --bucket "$aws_bucket" --key aws-cli/copied.txt "$tmp_dir/aws-copied" >/dev/null
+cmp "$tmp_dir/aws-input" "$tmp_dir/aws-copied"
+aws --endpoint-url "$endpoint" --no-cli-pager s3 mv "s3://$aws_bucket/aws-cli/copied.txt" "s3://$aws_bucket/aws-cli/moved.txt" >/dev/null
+aws --endpoint-url "$endpoint" --no-cli-pager s3api delete-object \
+    --bucket "$aws_bucket" --key aws-cli/moved.txt >/dev/null
 aws --endpoint-url "$endpoint" --no-cli-pager s3api delete-object \
     --bucket "$aws_bucket" --key aws-cli/compatibility.txt >/dev/null
 aws --endpoint-url "$endpoint" --no-cli-pager s3api delete-bucket --bucket "$aws_bucket" >/dev/null
@@ -60,8 +70,14 @@ rclone --config "$tmp_dir/rclone.conf" cat \
 cmp "$tmp_dir/rclone-input" "$tmp_dir/rclone-output"
 rclone --config "$tmp_dir/rclone.conf" lsf "zs3:$rclone_bucket/rclone" \
     | grep -qx 'compatibility.txt'
+# rclone server-side move (CopyObject + DeleteObject).
+rclone --config "$tmp_dir/rclone.conf" moveto \
+    "zs3:$rclone_bucket/rclone/compatibility.txt" "zs3:$rclone_bucket/rclone/moved.txt"
+rclone --config "$tmp_dir/rclone.conf" cat \
+    "zs3:$rclone_bucket/rclone/moved.txt" >"$tmp_dir/rclone-output"
+cmp "$tmp_dir/rclone-input" "$tmp_dir/rclone-output"
 rclone --config "$tmp_dir/rclone.conf" deletefile \
-    "zs3:$rclone_bucket/rclone/compatibility.txt"
+    "zs3:$rclone_bucket/rclone/moved.txt"
 rclone --config "$tmp_dir/rclone.conf" rmdir "zs3:$rclone_bucket"
 echo "PASS rclone $(rclone version | sed -n '1s/^rclone v//p')"
 
