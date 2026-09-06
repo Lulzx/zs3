@@ -5,9 +5,11 @@ the same S3 endpoint, credentials, bucket names, and client libraries.
 
 zs3 implements a deliberately small S3 subset. Check the
 [API reference](api.md) before migrating: versioning, lifecycle policies,
-bucket ACLs, presigned URLs, object tags, and server-side encryption are not
-supported. This replacement is intended for local development, CI, agent
-artifacts, and edge workloads—not as a production MinIO migration.
+bucket ACLs, object tags, and server-side encryption are not
+supported. Presigned URLs, server-side copy, Content-Type/user metadata, and
+SDK checksums are supported. This replacement is intended for local
+development, CI, agent artifacts, and edge workloads—not as a production
+MinIO migration.
 
 ## 1. Build the Linux binary
 
@@ -70,8 +72,9 @@ volumes:
 ```
 
 The application endpoint remains `http://object-storage:9000` from another
-Compose service, or `http://localhost:9000` from the host. Remove MinIO's port
-9001: zs3 has no admin console.
+Compose service, or `http://localhost:9000` from the host. zs3 ships an
+embedded browser console at `http://localhost:9000/_zs3/console` (no MinIO
+port-9001 equivalent to configure — it is compiled into the binary).
 
 `--acl` entries use `role:access_key:secret_key`. Comma-separate entries for
 multiple credentials. Do not commit production secrets to a Compose file.

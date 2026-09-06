@@ -4,7 +4,7 @@ zs3 implements a subset of the AWS S3 REST API with SigV4 authentication.
 
 ## Authentication
 
-All requests must be signed using AWS Signature Version 4.
+Header auth (all requests):
 
 ```
 Authorization: AWS4-HMAC-SHA256
@@ -18,6 +18,12 @@ Required headers:
 - `x-amz-date` - Request timestamp (ISO 8601)
 - `x-amz-content-sha256` - SHA256 hash of request body
 - `Host` - Server hostname
+
+Query-string SigV4 (presigned URLs) is also accepted: `X-Amz-Algorithm`,
+`X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`, `X-Amz-SignedHeaders`,
+`X-Amz-Signature`. Expiry is enforced against the server clock. Generate with
+any SDK (`generate_presigned_url` with `signature_version='s3v4'`); use for
+browser direct-uploads and share links.
 
 ## Bucket Operations
 
@@ -55,8 +61,30 @@ PUT /{bucket}/{key}
 
 Uploads an object. Creates parent directories as needed.
 
+Request headers honored:
+- `Content-Type` - stored and returned on GET/HEAD (default `binary/octet-stream`)
+- `x-amz-meta-*` - user metadata, returned on GET/HEAD
+- `x-amz-checksum-*` - accepted, stored, echoed back (validated by SDKs on
+  full GETs; omitted from 206 range responses, which describe a byte range,
+  not the whole object)
+- `x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER...]` -
+  AWS chunked transfer decoding, including checksum-trailer variants
+
 Response headers:
-- `ETag` - MD5 hash of object content
+- `ETag` - hash of object content
+
+### CopyObject
+
+```
+PUT /{bucket}/{key}
+x-amz-copy-source: /{src-bucket}/{src-key}   (URL-encoded, ?versionId= ignored)
+x-amz-metadata-directive: COPY | REPLACE     (default COPY)
+```
+
+Server-side copy. Powers `aws s3 mv/sync`, `rclone move`, and the Terraform
+S3 backend. With `COPY`, the destination inherits the source's Content-Type
+and metadata; with `REPLACE`, the request's headers are used instead.
+Returns `CopyObjectResult` XML with the new ETag.
 
 ### GetObject
 
@@ -125,7 +153,27 @@ PUT /{bucket}/{key}?uploadId={id}&partNumber={n}
 Uploads a part. Part numbers start at 1.
 
 Response headers:
-- `ETag` - MD5 hash of part content
+- `ETag` - hash of part content
+
+### UploadPartCopy
+
+```
+PUT /{bucket}/{key}?uploadId={id}&partNumber={n}
+x-amz-copy-source: /{src-bucket}/{src-key}
+x-amz-copy-source-range: bytes={first}-{last}   (optional)
+```
+
+Copies (a byte range of) an existing object into a multipart part. Returns
+`CopyPartResult` XML. Missing upload IDs return `NoSuchUpload`;
+unsatisfiable ranges return `416 InvalidRange`.
+
+### ListParts
+
+```
+GET /{bucket}/{key}?uploadId={id}
+```
+
+Returns `ListPartsResult` XML with part numbers, ETags, and sizes.
 
 ### CompleteMultipartUpload
 
@@ -164,8 +212,27 @@ All errors return XML:
 | NoSuchBucket | 404 | Bucket not found |
 | BucketNotEmpty | 409 | Cannot delete non-empty bucket |
 | NoSuchUpload | 404 | Multipart upload not found |
+| InvalidRange | 416 | Copy source range not satisfiable |
 | MethodNotAllowed | 405 | HTTP method not supported |
 | InternalError | 500 | Server error |
+
+## Snapshots
+
+Content-addressed bucket snapshots live under the `.zs3snapshots/` prefix
+(manifests at `.zs3snapshots/<name>.json`, chunks at
+`.zs3snapshots/chunks/<hex>`). They are ordinary objects, hidden from normal
+LIST responses — LIST with `prefix=.zs3snapshots/` shows them. Created and
+consumed with `zs3 snapshot` / `zs3 clone`; see [snapshots.md](snapshots.md).
+
+## Console and metrics
+
+- `GET /_zs3/console` - embedded single-file browser console
+  (list/create buckets, browse, upload, download, delete). No server auth on
+  the page; the JavaScript signs S3 requests with keys kept in localStorage.
+- `GET /metrics` and `GET /_zs3/metrics` - Prometheus text exposition
+  (`zs3_requests_total`, `zs3_errors_4xx/5xx`, `zs3_put_bytes`,
+  `zs3_get_bytes`, `zs3_uptime_seconds`, `zs3_buckets`, `zs3_known_peers`).
+  No auth; safe to scrape.
 
 ## Limits
 

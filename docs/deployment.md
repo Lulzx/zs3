@@ -67,6 +67,24 @@ sudo systemctl enable --now zs3
 
 ## Docker
 
+Use the prebuilt image (multi-arch amd64/arm64, published on tags):
+
+```bash
+docker run -p 9000:9000 -v zs3-data:/data \
+  ghcr.io/lulzx/zs3:latest --acl=admin:local-access:local-secret
+```
+
+Or build locally (downloads Zig 0.16.0 in the build stage; the runtime image
+is `scratch` + the static binary):
+
+```bash
+docker build -t zs3 .
+docker run -p 9000:9000 -v ./data:/data zs3
+```
+
+The old inline-Dockerfile recipe below still works if you prefer copying a
+locally built binary into your own image:
+
 ```dockerfile
 FROM alpine:latest
 COPY zs3 /usr/local/bin/zs3

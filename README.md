@@ -1,14 +1,17 @@
 # zs3
 
-**SQLite for objects.** Local, dev, and edge S3 storage in a static binary under
-360KB.
+**SQLite for objects.** Local, dev, and edge S3 storage in a small static
+binary with no runtime, control plane, or dependency tree.
 
 Run one file, point an existing S3 client at it, and keep the data on disk. zs3
 is standalone by default and adds content-addressed, peer-to-peer storage when
-you ask for distributed mode. No runtime, control plane, or dependency tree.
+you ask for distributed mode. `zs3 snapshot` / `zs3 clone` move
+content-addressed bucket snapshots between machines, transferring only the
+blocks the destination lacks.
 
 [Replace MinIO in Docker Compose](docs/replace-minio.md) ·
-[Product direction](docs/vision.md) · [API subset](docs/api.md)
+[Product direction](docs/vision.md) · [API subset](docs/api.md) ·
+[Snapshots & clone](docs/snapshots.md)
 
 ## Why
 
@@ -18,23 +21,37 @@ storage platform.
 
 | | zs3 | RustFS | MinIO |
 |---|-----|--------|-------|
-| Lines | ~4,300 | ~80,000 | 200,000 |
-| Binary | <360KB | ~50MB | 100MB |
+| Lines (server: `wc -l main.zig acl.zig build.zig`) | ~6,900 | ~80,000 | 200,000 |
+| Binary (static Linux musl, `ReleaseSmall`) | ~440KB x86-64 / ~400KB aarch64 | ~50MB | 100MB |
 | RAM idle | 3MB | ~100MB | 200MB+ |
 | Dependencies | 0 | ~200 crates | many |
 
 ## What it does
 
 **Standalone Mode:**
-- Full AWS SigV4 authentication (verified with aws-cli, boto3, and rclone)
+- Full AWS SigV4 authentication, header and presigned-URL (query-string) forms
+  (verified with aws-cli, boto3, and rclone)
 - PUT, GET, DELETE, HEAD, LIST (v2)
 - HeadBucket for bucket existence checks
+- CopyObject + UploadPartCopy (`aws s3 mv/sync`, `rclone move` work)
+- ListParts for multipart inspection
+- Content-Type and `x-amz-meta-*` stored per object, served on GET/HEAD
+- SDK checksums accepted and stored (`x-amz-checksum-*`, checksum trailers)
 - DeleteObjects batch operation
 - Multipart uploads for large files
-- Range requests for streaming/seeking (RFC 7233 compliant suffix ranges)
+- Range requests for streaming/seeking (RFC 7233 compliant suffix ranges;
+  whole-object checksums omitted from 206 responses, like S3)
 - HTTP 100-continue support (boto3 compatible)
-- AWS chunked transfer encoding support
-- <360KB static Linux binary (`ReleaseSmall`)
+- AWS chunked transfer encoding support, including `-TRAILER` variants
+- fsync-on-write by default (`--fast` disables it for benchmarks)
+- Embedded browser console (`/_zs3/console`) and Prometheus `/metrics`
+- Static Linux musl binary, zero dependencies
+
+**Snapshots & clone:**
+- `zs3 snapshot --bucket=B --name=N` chunks a bucket into content-addressed
+  BLAKE3 blocks, uploading only missing chunks, and stores a manifest
+- `zs3 clone --bucket=B --name=N --dest=DIR` fetches the manifest and
+  downloads only blocks the local cache lacks (warm re-clones transfer ~nothing)
 
 **Distributed Mode (IPFS-like):**
 - Content-addressed storage with BLAKE3 hashing
@@ -50,7 +67,7 @@ storage platform.
 ## What it doesn't do
 
 - Versioning, lifecycle policies, bucket ACLs
-- Pre-signed URLs, object tagging, encryption
+- Object tagging, encryption
 - Anything you'd actually need a cloud provider for
 
 If you need these, use MinIO or AWS. zs3 wins on size, inspectability, and
@@ -82,7 +99,19 @@ Format: `role:access_key:secret_key`, comma-separated. Roles:
 | writer | GET, HEAD, OPTIONS, PUT, POST, DELETE        |
 | reader | GET, HEAD, OPTIONS                           |
 
-Other useful flags: `--port=PORT`, `--data-dir=PATH`, `--help`.
+Other useful flags: `--port=PORT`, `--data-dir=PATH`, `--fast`, `--help`.
+
+`--fast` disables fsync-on-write for benchmarks; see [Durability](#durability).
+
+### Console and metrics
+
+Open `http://localhost:9000/_zs3/console` for an embedded browser console
+(list/create buckets, browse, upload, download, delete). The page needs no
+server auth; it signs S3 requests in-browser with keys you enter (kept in
+localStorage only).
+
+`http://localhost:9000/metrics` exposes Prometheus text metrics
+(request/error counters, byte counters, uptime, bucket and peer gauges).
 
 ## Distributed Mode
 
@@ -177,10 +206,34 @@ print(s3.get_object(Bucket='test', Key='hello.txt')['Body'].read())
 - Edge and embedded appliances
 - Learning how S3 actually works
 
+## Snapshots: `git clone` for buckets
+
+```bash
+zs3 snapshot --bucket=artifacts --name=v1   # chunk + manifest, uploads only missing blocks
+zs3 clone --bucket=artifacts --name=v1 --dest=./v1
+zs3 snapshots --bucket=artifacts             # list snapshot names
+```
+
+Flags take `--endpoint=URL` (or `ZS3_ENDPOINT`) and standard `AWS_*` env vars.
+Full format and behavior: [docs/snapshots.md](docs/snapshots.md).
+
+## Durability
+
+"SQLite for objects" is a crash-safety claim, so zs3 fsyncs file contents (and
+best-effort parent directories) before acknowledging PUT, CopyObject,
+multipart-complete, and snapshot writes. Atomic rename means a concurrent GET
+never sees a half-written object; fsync means an acknowledged write survives a
+crash or power loss.
+
+The benchmark numbers below were measured with `--fast` (no fsync). On Apple
+Silicon the durable default costs roughly 10% on small PUTs (PUT 1KB 0.64ms
+vs 0.57ms) and nothing measurable on reads — fsync-slow disks (spinning rust,
+some NFS) will show a bigger gap. If you only need "it's on your disk", run
+`zs3 --fast`.
+
 ## When NOT to use this
 
 - Production with untrusted users
-- Anything requiring durability guarantees beyond "it's on your disk"
 - If you need any feature in the "not supported" list
 
 ## Configuration
@@ -205,10 +258,30 @@ does not build with Zig 0.15.x.
 zig build                                      # debug
 zig build -Doptimize=ReleaseSmall              # smallest native release
 zig build -Dtarget=x86_64-linux-musl \
-  -Dcpu=baseline -Doptimize=ReleaseSmall       # static Linux (<360KB)
+  -Dcpu=baseline -Doptimize=ReleaseSmall       # static Linux (~440KB)
 zig build -Doptimize=ReleaseFast               # favor throughput over size
 zig build test                               # run tests
 ```
+
+## Install
+
+Tagged releases ship static musl binaries (`zs3-x86_64-linux-musl`,
+`zs3-aarch64-linux-musl`), a macOS ARM64 binary, and a multi-arch image:
+
+```bash
+# Docker / Compose (GHCR)
+docker run -p 9000:9000 -v zs3-data:/data \
+  ghcr.io/lulzx/zs3 --acl=admin:local-access:local-secret
+
+# Static binary
+curl -fsSL https://github.com/Lulzx/zs3/releases/latest/download/zs3-x86_64-linux-musl -o zs3
+chmod +x zs3 && ./zs3
+
+# Homebrew (see packaging/homebrew/zs3.rb for the tap setup)
+brew tap Lulzx/zs3 && brew install zs3
+```
+
+`docker build -t zs3 .` builds the image locally with Zig 0.16.0.
 
 ## Testing
 
@@ -311,7 +384,10 @@ than failing to store.
 - Runtime safety checks enabled on all network-facing code
 - Single file, easy to audit
 
-TLS not included. Use a reverse proxy (nginx, caddy) for HTTPS.
+TLS not included. zs3 speaks plain HTTP; terminate TLS in a reverse proxy
+(see [Deployment](docs/deployment.md) for Caddy/nginx configs). Presigned URLs
+embed the endpoint scheme, so generate them against the public https:// URL —
+signatures verify the same behind the proxy.
 
 ## License
 

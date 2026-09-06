@@ -4,6 +4,60 @@ All notable changes to zs3 are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **CopyObject + UploadPartCopy.** Server-side copy via `x-amz-copy-source`
+  (URL-encoded, `?versionId=` accepted and ignored), with
+  `MetadataDirective: COPY|REPLACE`, `x-amz-copy-source-range` for parts,
+  `NoSuchUpload`/`416 InvalidRange` errors, and a new `ListParts` API.
+  `aws s3 mv/sync` and `rclone move` now work.
+- **Presigned URLs.** Query-string SigV4 (`X-Amz-Signature`) with server-side
+  expiry enforcement, for direct-upload and share-link flows.
+- **Content-Type + user metadata.** Stored per object (sidecar files in
+  standalone mode, replicated `.attrs` entries in distributed mode) and
+  served on GET/HEAD. Default `binary/octet-stream`.
+- **SDK checksums.** `x-amz-checksum-*` accepted, stored, and echoed back;
+  `STREAMING-...-TRAILER` chunked variants decoded. Whole-object checksums
+  are omitted from 206 range responses, matching S3.
+- **`zs3 snapshot` / `zs3 clone` / `zs3 snapshots`.** Content-addressed bucket
+  snapshots (BLAKE3 chunks + JSON manifest under `.zs3snapshots/`) with
+  upload/download dedup; warm re-clones transfer only the manifest.
+  See `docs/snapshots.md`.
+- **Embedded console + metrics.** `GET /_zs3/console` serves a single-file
+  browser UI (SigV4 in-page, keys in localStorage only); `GET /metrics`
+  (and `/_zs3/metrics`) exposes Prometheus counters. CORS preflight
+  (`OPTIONS`) answered without auth.
+- **Distribution.** `Dockerfile` (multi-arch static), GHCR publish +
+  musl/macOS release binaries via `release.yml`, CI via `ci.yml`,
+  Homebrew tap template in `packaging/homebrew/`.
+- **`--fast` benchmark mode.** fsync-on-write is now the default (see Fixed);
+  `--fast`/`--no-fsync` restores the no-fsync fast path.
+
+### Fixed
+
+- **fsync-on-write (durability).** Acknowledged PUT/CopyObject/
+  multipart-complete/snapshot writes fsync file contents and best-effort
+  parent dirs. The old behavior (rename without fsync) is available via
+  `--fast`, which the README benchmarks now use.
+- **MD5 ETags.** Single-object ETags are the quoted lowercase hex MD5 of the
+  content, so `aws s3 sync`, `rclone check`, and local `md5sum` agree —
+  including against trees zs3 did not write. (Multipart keeps the composite
+  `"md5-of-part-md5s-N"` form.)
+- **Request paths are percent-decoded.** Keys with spaces, `+`, `#`, or
+  non-ASCII characters are stored under their real names, so `ls` shows what
+  you PUT and LIST returns decoded keys. Data dirs written before this change
+  keep working via a read fallback (see `docs/deployment.md#migrating`).
+- **ListBuckets hides unusable directories.** Only directories with valid
+  bucket names are listed; the rest are skipped instead of advertised-then-rejected.
+- **Content-Type sniffing for foreign files.** Objects without a stored
+  sidecar (files zs3 did not write) get a Content-Type from a small extension
+  table instead of `binary/octet-stream`. Explicitly stored types always win.
+- **Sidecar/attrs files no longer leak into LIST responses.**
+- **Snapshot system objects hidden** from normal LIST (visible with
+  `prefix=.zs3snapshots/`).
+
 ## [0.1.0] - 2026-08-09
 
 First release. Distributed mode now replicates across nodes: writes leave
