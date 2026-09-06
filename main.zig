@@ -31,6 +31,46 @@ const ERROR_403 = "HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: ke
 const ERROR_431 = "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const ERROR_400_ENTITY_TOO_LARGE = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
+// Crash-safety knob. Default ON: PUT/CopyObject/multipart-complete fsync file
+// contents (and best-effort parent dirs) so an acknowledged write survives a
+// crash or power loss — the "SQLite for objects" claim requires it. Pass
+// --fast (benchmark mode) or --no-fsync to restore the no-fsync fast path and
+// the original benchmark numbers.
+var enable_fsync: bool = true;
+
+fn fsyncFile(file: std.Io.File) void {
+    if (!enable_fsync) return;
+    file.sync(app_io) catch {};
+}
+
+fn fsyncParentDir(path: []const u8) void {
+    if (!enable_fsync) return;
+    if (std.fs.path.dirname(path)) |dir| {
+        var d = std.Io.Dir.cwd().openDir(app_io, dir, .{}) catch return;
+        defer d.close(app_io);
+        // fsync the dir fd so the rename entry is durable. Best-effort:
+        // ignore failures (filesystems that reject dir fsync). Raw syscall
+        // on Linux to keep the static musl build libc-free.
+        if (builtin.os.tag == .linux) {
+            _ = std.os.linux.fsync(d.handle);
+        } else {
+            _ = std.c.fsync(d.handle);
+        }
+    }
+}
+
+// Lightweight process metrics, mutated only on the event-loop thread so no
+// atomics are needed (the background PushWorker never touches these).
+const Metrics = struct {
+    start_time_secs: i64 = 0,
+    requests: u64 = 0,
+    errors_4xx: u64 = 0,
+    errors_5xx: u64 = 0,
+    put_bytes: u64 = 0,
+    get_bytes: u64 = 0,
+};
+var metrics: Metrics = .{};
+
 /// Format a Unix timestamp (seconds) as an HTTP date (RFC 7231).
 /// Returns a 29-byte string like "Mon, 02 Jan 2006 15:04:05 GMT".
 /// When using with Response.setHeader, the returned slice must outlive
@@ -645,6 +685,81 @@ const MetaIndex = struct {
         return path;
     }
 };
+
+// ============================================================================
+// DISTRIBUTED OBJECT ATTRIBUTES
+// ============================================================================
+// Content-Type / user metadata / checksums for distributed objects live in
+// `.index/<bucket>/<key>.attrs` (same `name: value` text format as the
+// standalone sidecar). They replicate alongside metadata: pushed synchronously
+// on write (`POST /_zs3/attrs`), pulled on read misses (`POST /_zs3/attrs_get`),
+// and included in join-time index dumps (frames prefixed with a kind line).
+
+fn distAttrsPath(allocator: Allocator, data_dir: []const u8, bucket: []const u8, key: []const u8) ![]const u8 {
+    const key_with_ext = try std.fmt.allocPrint(allocator, "{s}.attrs", .{key});
+    defer allocator.free(key_with_ext);
+    const path = try std.fs.path.join(allocator, &.{ data_dir, ".index", bucket, key_with_ext });
+    var component_itr = std.mem.splitScalar(u8, key_with_ext, '/');
+    while (component_itr.next()) |component| {
+        if (component.len >= std.posix.NAME_MAX) {
+            allocator.free(path);
+            return error.NameTooLong;
+        }
+    }
+    if (path.len >= std.posix.PATH_MAX) {
+        allocator.free(path);
+        return error.PathTooLong;
+    }
+    return path;
+}
+
+fn attrsToText(allocator: Allocator, attrs: *const ObjectAttrs) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "content-type: ");
+    try buf.appendSlice(allocator, attrs.content_type);
+    try buf.append(allocator, '\n');
+    for (attrs.entries) |e| {
+        try buf.appendSlice(allocator, e.name);
+        try buf.appendSlice(allocator, ": ");
+        try buf.appendSlice(allocator, e.value);
+        try buf.append(allocator, '\n');
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+fn writeDistAttrs(allocator: Allocator, dist: *const DistributedContext, bucket: []const u8, key: []const u8, attrs: *const ObjectAttrs) void {
+    const path = distAttrsPath(allocator, dist.meta_index.data_dir, bucket, key) catch return;
+    defer allocator.free(path);
+    const text = attrsToText(allocator, attrs) catch return;
+    defer allocator.free(text);
+    if (std.fs.path.dirname(path)) |dir| {
+        std.Io.Dir.cwd().createDirPath(app_io, dir) catch {};
+    }
+    var file = std.Io.Dir.cwd().createFile(app_io, path, .{}) catch return;
+    defer file.close(app_io);
+    file.writeStreamingAll(app_io, text) catch {};
+    if (enable_fsync) {
+        fsyncFile(file);
+        fsyncParentDir(path);
+    }
+}
+
+fn readDistAttrs(allocator: Allocator, dist: *const DistributedContext, bucket: []const u8, key: []const u8) ?ObjectAttrs {
+    const path = distAttrsPath(allocator, dist.meta_index.data_dir, bucket, key) catch return null;
+    defer allocator.free(path);
+    var file = std.Io.Dir.cwd().openFile(app_io, path, .{}) catch return null;
+    defer file.close(app_io);
+    const content = readToEndAlloc(file, allocator, 64 * 1024) catch return null;
+    defer allocator.free(content);
+    return parseAttrsContent(allocator, content) catch null;
+}
+
+fn deleteDistAttrs(allocator: Allocator, dist: *const DistributedContext, bucket: []const u8, key: []const u8) void {
+    const path = distAttrsPath(allocator, dist.meta_index.data_dir, bucket, key) catch return;
+    defer allocator.free(path);
+    std.Io.Dir.cwd().deleteFile(app_io, path) catch {};
+}
 
 /// Last-write-wins bookkeeping for bucket create/delete propagation.
 ///
@@ -1262,16 +1377,25 @@ pub fn main(init: std.process.Init) !void {
             port = std.fmt.parseInt(u16, arg[7..], 10) catch 9000;
         } else if (std.mem.startsWith(u8, arg, "--gossip-interval-ms=")) {
             gossip_interval_ms = std.fmt.parseInt(u64, arg[21..], 10) catch GOSSIP_INTERVAL_MS;
+        } else if (std.mem.eql(u8, arg, "--fsync")) {
+            enable_fsync = true;
+        } else if (std.mem.eql(u8, arg, "--no-fsync") or std.mem.eql(u8, arg, "--fast")) {
+            enable_fsync = false;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             show_help = true;
         }
     }
+
+    metrics.start_time_secs = std.Io.Clock.real.now(app_io).toSeconds();
 
     if (show_help) {
         std.debug.print(
             \\zs3 - Distributed S3-compatible storage
             \\
             \\Usage: zs3 [OPTIONS]
+            \\       zs3 snapshot --bucket=BUCKET --name=NAME [--endpoint=URL]
+            \\       zs3 clone --bucket=BUCKET --name=NAME --dest=DIR [--endpoint=URL]
+            \\       zs3 snapshots --bucket=BUCKET [--endpoint=URL]
             \\
             \\Options:
             \\  --distributed, -d
@@ -2130,9 +2254,26 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         return;
     }
 
+    // Split the raw path, then decode each segment: the filesystem stores
+    // decoded names, while SigV4 above verified the raw (encoded) form.
+    // Segments split before decoding so a literal %2F inside a key survives
+    // as data rather than splitting the key.
     var path_parts = std.mem.splitScalar(u8, path, '/');
-    const bucket = path_parts.next() orelse "";
-    const key = path_parts.rest();
+    const raw_bucket = path_parts.next() orelse "";
+    const raw_key = path_parts.rest();
+    const bucket = try uriDecodePath(allocator, raw_bucket);
+    var key_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer key_buf.deinit(allocator);
+    var seg_iter = std.mem.splitScalar(u8, raw_key, '/');
+    var first_seg = true;
+    while (seg_iter.next()) |seg| {
+        if (!first_seg) try key_buf.append(allocator, '/');
+        first_seg = false;
+        const dec = try uriDecodePath(allocator, seg);
+        defer allocator.free(dec);
+        try key_buf.appendSlice(allocator, dec);
+    }
+    var key: []const u8 = try key_buf.toOwnedSlice(allocator);
 
     if (bucket.len > 0 and !isValidBucketName(bucket)) {
         sendError(res, 400, "InvalidBucketName", "Bucket name is invalid");
@@ -2143,13 +2284,21 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         return;
     }
 
+    // Legacy fallback: objects written before path decoding are stored
+    // encoded; prefer whichever file exists.
+    key = try resolveLegacyKey(ctx, allocator, bucket, key, raw_key);
+
     // In distributed mode, use CAS for object storage
     if (ctx.distributed != null) {
         if (key.len > 0) {
             if (std.mem.eql(u8, req.method, "PUT") and !hasQuery(req.query, "uploadId")) {
+                if (req.header("x-amz-copy-source")) |_| {
+                    try handleCopyObject(ctx, allocator, req, res, bucket, key);
+                    return;
+                }
                 try handleDistributedPut(ctx, allocator, req, res, bucket, key);
                 return;
-            } else if (std.mem.eql(u8, req.method, "GET")) {
+            } else if (std.mem.eql(u8, req.method, "GET") and !hasQuery(req.query, "uploadId")) {
                 try handleDistributedGet(ctx, allocator, req, res, bucket, key);
                 return;
             } else if (std.mem.eql(u8, req.method, "DELETE") and !hasQuery(req.query, "uploadId")) {
@@ -2172,6 +2321,8 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
             try handleListBuckets(ctx, allocator, res);
         } else if (key.len == 0) {
             try handleListObjects(ctx, allocator, req, res, bucket);
+        } else if (hasQuery(req.query, "uploadId")) {
+            try handleListParts(ctx, allocator, req, res, bucket, key);
         } else {
             try handleGetObject(ctx, allocator, req, res, bucket, key);
         }
@@ -2179,7 +2330,13 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         if (key.len == 0) {
             try handleCreateBucket(ctx, allocator, res, bucket);
         } else if (hasQuery(req.query, "uploadId")) {
-            try handleUploadPart(ctx, allocator, req, res, bucket, key);
+            if (req.header("x-amz-copy-source")) |_| {
+                try handleUploadPartCopy(ctx, allocator, req, res, bucket, key);
+            } else {
+                try handleUploadPart(ctx, allocator, req, res, bucket, key);
+            }
+        } else if (req.header("x-amz-copy-source")) |_| {
+            try handleCopyObject(ctx, allocator, req, res, bucket, key);
         } else {
             try handlePutObject(ctx, allocator, req, res, bucket, key);
         }
@@ -2485,6 +2642,56 @@ fn hexDigitToInt(c: u8) ?u8 {
     return null;
 }
 
+/// Decode %XX sequences in a URL path segment. Unlike uriDecode, '+' is left
+/// alone: in paths it is a literal plus (RFC 3986), not a space — only query
+/// strings use '+'-for-space.
+pub fn uriDecodePath(allocator: Allocator, input: []const u8) ![]const u8 {
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer result.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '%' and i + 2 < input.len) {
+            const high = hexDigitToInt(input[i + 1]) orelse {
+                try result.append(allocator, input[i]);
+                i += 1;
+                continue;
+            };
+            const low = hexDigitToInt(input[i + 2]) orelse {
+                try result.append(allocator, input[i]);
+                i += 1;
+                continue;
+            };
+            try result.append(allocator, (high << 4) | low);
+            i += 3;
+        } else {
+            try result.append(allocator, input[i]);
+            i += 1;
+        }
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+/// Resolve which on-disk name a request key refers to. New objects live at
+/// the decoded (canonical) name, but objects written before path decoding
+/// existed are stored under the still-encoded name — prefer whichever file
+/// actually exists so those objects keep working, defaulting to canonical.
+fn resolveLegacyKey(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, decoded: []const u8, raw: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, decoded, raw)) return allocator.dupe(u8, decoded);
+    const dec_path = try ctx.objectPath(allocator, bucket, decoded);
+    defer allocator.free(dec_path);
+    if (std.Io.Dir.cwd().access(app_io, dec_path, .{})) |_| {
+        return allocator.dupe(u8, decoded);
+    } else |_| {}
+    const raw_path = try ctx.objectPath(allocator, bucket, raw);
+    defer allocator.free(raw_path);
+    if (std.Io.Dir.cwd().access(app_io, raw_path, .{})) |_| {
+        return allocator.dupe(u8, raw);
+    } else |_| {}
+    return allocator.dupe(u8, decoded);
+}
+
 pub fn sortQueryString(allocator: Allocator, query: []const u8) ![]const u8 {
     if (query.len == 0) return try allocator.dupe(u8, "");
 
@@ -2537,7 +2744,16 @@ pub fn etagListMatches(header: []const u8, etag: []const u8) bool {
     return false;
 }
 
-/// Compute the ETag (wyhash of content, same formula as PUT/GET) for an existing
+/// S3 ETag for a single object: quoted lowercase hex MD5 of the content.
+/// (Multipart uploads use the composite `"md5-of-part-md5s-N"` form instead,
+/// computed in handleCompleteMultipart.)
+pub fn md5Etag(allocator: Allocator, data: []const u8) ![]const u8 {
+    var digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(data, &digest, .{});
+    return std.fmt.allocPrint(allocator, "\"{x}\"", .{digest});
+}
+
+/// Compute the ETag (MD5 of content, same formula as PUT/GET) for an existing
 /// object at `path`, or null if it doesn't exist. Only called when a conditional
 /// header is present, so the read cost is paid only on conditional requests.
 fn existingEtag(allocator: Allocator, path: []const u8) ?[]const u8 {
@@ -2545,8 +2761,7 @@ fn existingEtag(allocator: Allocator, path: []const u8) ?[]const u8 {
     defer file.close(app_io);
     const content = readToEndAlloc(file, allocator, MAX_BODY_SIZE) catch return null;
     defer allocator.free(content);
-    const hash = std.hash.Wyhash.hash(0, content);
-    return std.fmt.allocPrint(allocator, "\"{x}\"", .{hash}) catch null;
+    return md5Etag(allocator, content) catch null;
 }
 
 /// Evaluate If-Match / If-None-Match preconditions for a write to `path`.
@@ -2580,6 +2795,240 @@ fn checkPutPreconditions(allocator: Allocator, req: *const Request, res: *Respon
     return true;
 }
 
+// ============================================================================
+// OBJECT ATTRIBUTES (Content-Type, user metadata, checksums)
+// ============================================================================
+// Standalone objects are plain files; their S3 attributes live in a sidecar
+// `<object path>.zs3attrs` so `ls` stays clean and old data dirs keep working
+// (a missing sidecar means "binary/octet-stream", no metadata). Format is one
+// `name: value` line per attribute; names are matched case-insensitively.
+
+const DEFAULT_CONTENT_TYPE = "binary/octet-stream";
+
+/// Guess a Content-Type from a key's extension. Used only when no sidecar
+/// exists — i.e. for files zs3 did not write (the "point at an existing
+/// tree" case). Explicitly stored Content-Types always win.
+pub fn sniffContentType(key: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, key, '.') orelse return DEFAULT_CONTENT_TYPE;
+    // Only the final path component's extension counts ("archive.tar.gz" -> gz).
+    if (std.mem.indexOfScalar(u8, key[dot..], '/') != null) return DEFAULT_CONTENT_TYPE;
+    const ext = key[dot + 1 ..];
+    if (ext.len == 0 or ext.len > 8) return DEFAULT_CONTENT_TYPE;
+    var lower_buf: [8]u8 = undefined;
+    const lower = std.ascii.lowerString(&lower_buf, ext);
+    const table = [_]struct { ext: []const u8, ct: []const u8 }{
+        .{ .ext = "html", .ct = "text/html" },
+        .{ .ext = "htm", .ct = "text/html" },
+        .{ .ext = "css", .ct = "text/css" },
+        .{ .ext = "js", .ct = "application/javascript" },
+        .{ .ext = "mjs", .ct = "application/javascript" },
+        .{ .ext = "json", .ct = "application/json" },
+        .{ .ext = "xml", .ct = "application/xml" },
+        .{ .ext = "txt", .ct = "text/plain" },
+        .{ .ext = "md", .ct = "text/markdown" },
+        .{ .ext = "csv", .ct = "text/csv" },
+        .{ .ext = "png", .ct = "image/png" },
+        .{ .ext = "jpg", .ct = "image/jpeg" },
+        .{ .ext = "jpeg", .ct = "image/jpeg" },
+        .{ .ext = "gif", .ct = "image/gif" },
+        .{ .ext = "svg", .ct = "image/svg+xml" },
+        .{ .ext = "webp", .ct = "image/webp" },
+        .{ .ext = "ico", .ct = "image/x-icon" },
+        .{ .ext = "mp4", .ct = "video/mp4" },
+        .{ .ext = "webm", .ct = "video/webm" },
+        .{ .ext = "mp3", .ct = "audio/mpeg" },
+        .{ .ext = "wav", .ct = "audio/wav" },
+        .{ .ext = "ogg", .ct = "audio/ogg" },
+        .{ .ext = "pdf", .ct = "application/pdf" },
+        .{ .ext = "wasm", .ct = "application/wasm" },
+        .{ .ext = "woff", .ct = "font/woff" },
+        .{ .ext = "woff2", .ct = "font/woff2" },
+        .{ .ext = "ttf", .ct = "font/ttf" },
+        .{ .ext = "zip", .ct = "application/zip" },
+        .{ .ext = "gz", .ct = "application/gzip" },
+        .{ .ext = "tar", .ct = "application/x-tar" },
+    };
+    for (table) |entry| {
+        if (std.mem.eql(u8, lower, entry.ext)) return entry.ct;
+    }
+    return DEFAULT_CONTENT_TYPE;
+}
+
+const AttrEntry = struct { name: []const u8, value: []const u8 };
+
+const ObjectAttrs = struct {
+    content_type: []const u8,
+    entries: []AttrEntry = &.{},
+
+    fn deinit(self: *const ObjectAttrs, allocator: Allocator) void {
+        allocator.free(self.content_type);
+        for (self.entries) |e| {
+            allocator.free(e.name);
+            allocator.free(e.value);
+        }
+        allocator.free(self.entries);
+    }
+};
+
+fn isAttrHeader(name: []const u8) bool {
+    // Headers persisted on the object and echoed back on GET/HEAD.
+    if (std.mem.startsWith(u8, name, "x-amz-meta-")) return true;
+    if (std.mem.startsWith(u8, name, "x-amz-checksum-")) return true;
+    if (std.mem.eql(u8, name, "x-amz-checksum-type")) return true;
+    if (std.mem.eql(u8, name, "x-amz-sdk-checksum-algorithm")) return true;
+    return false;
+}
+
+/// Collect attributes from a request: Content-Type plus persisted headers.
+fn collectRequestAttrs(allocator: Allocator, req: *const Request) !ObjectAttrs {
+    const ct = req.header("content-type") orelse DEFAULT_CONTENT_TYPE;
+    var entries: std.ArrayListUnmanaged(AttrEntry) = .empty;
+    errdefer {
+        for (entries.items) |e| {
+            allocator.free(e.name);
+            allocator.free(e.value);
+        }
+        entries.deinit(allocator);
+    }
+    var it = req.headers.iterator();
+    while (it.next()) |kv| {
+        if (isAttrHeader(kv.key_ptr.*)) {
+            try entries.append(allocator, .{
+                .name = try allocator.dupe(u8, kv.key_ptr.*),
+                .value = try allocator.dupe(u8, kv.value_ptr.*),
+            });
+        }
+    }
+    return .{
+        .content_type = try allocator.dupe(u8, ct),
+        .entries = try entries.toOwnedSlice(allocator),
+    };
+}
+
+fn attrsSidecarPath(allocator: Allocator, obj_path: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}.zs3attrs", .{obj_path});
+}
+
+/// Persist attributes next to a standalone object. Skips the write when there
+/// is nothing non-default to store, keeping plain PUTs to a single file.
+fn saveStandaloneAttrs(allocator: Allocator, obj_path: []const u8, attrs: *const ObjectAttrs) void {
+    const non_default_ct = !std.mem.eql(u8, attrs.content_type, DEFAULT_CONTENT_TYPE);
+    if (!non_default_ct and attrs.entries.len == 0) {
+        // Remove any stale sidecar (e.g. overwrite with bare PUT after a
+        // metadata PUT, or a CopyObject with REPLACE and no metadata).
+        const old = attrsSidecarPath(allocator, obj_path) catch return;
+        defer allocator.free(old);
+        std.Io.Dir.cwd().deleteFile(app_io, old) catch {};
+        return;
+    }
+    const sidecar = attrsSidecarPath(allocator, obj_path) catch return;
+    defer allocator.free(sidecar);
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    buf.appendSlice(allocator, "content-type: ") catch return;
+    buf.appendSlice(allocator, attrs.content_type) catch return;
+    buf.append(allocator, '\n') catch return;
+    for (attrs.entries) |e| {
+        buf.appendSlice(allocator, e.name) catch return;
+        buf.appendSlice(allocator, ": ") catch return;
+        buf.appendSlice(allocator, e.value) catch return;
+        buf.append(allocator, '\n') catch return;
+    }
+    var af = std.Io.Dir.cwd().createFileAtomic(app_io, sidecar, .{ .make_path = true, .replace = true }) catch return;
+    defer af.deinit(app_io);
+    af.file.writeStreamingAll(app_io, buf.items) catch return;
+    if (enable_fsync) fsyncFile(af.file);
+    af.replace(app_io) catch {};
+    if (enable_fsync) fsyncParentDir(sidecar);
+}
+
+fn loadStandaloneAttrs(allocator: Allocator, obj_path: []const u8, key: []const u8) !ObjectAttrs {
+    const sidecar = try attrsSidecarPath(allocator, obj_path);
+    defer allocator.free(sidecar);
+    var file = std.Io.Dir.cwd().openFile(app_io, sidecar, .{}) catch {
+        // No sidecar: this object was not written through the S3 API (or was
+        // written bare). Sniff the extension so pre-existing trees serve
+        // sensible Content-Types instead of binary/octet-stream.
+        return .{ .content_type = try allocator.dupe(u8, sniffContentType(key)) };
+    };
+    defer file.close(app_io);
+    const content = try readToEndAlloc(file, allocator, 64 * 1024);
+    defer allocator.free(content);
+    return parseAttrsContent(allocator, content);
+}
+
+fn parseAttrsContent(allocator: Allocator, content: []const u8) !ObjectAttrs {
+    var ct: []const u8 = try allocator.dupe(u8, DEFAULT_CONTENT_TYPE);
+    errdefer allocator.free(ct);
+    var entries: std.ArrayListUnmanaged(AttrEntry) = .empty;
+    errdefer {
+        for (entries.items) |e| {
+            allocator.free(e.name);
+            allocator.free(e.value);
+        }
+        entries.deinit(allocator);
+    }
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+        const name = std.mem.trim(u8, trimmed[0..colon], " \t");
+        const value = std.mem.trim(u8, trimmed[colon + 1 ..], " \t");
+        if (name.len == 0) continue;
+        if (std.mem.eql(u8, name, "content-type")) {
+            allocator.free(ct);
+            ct = try allocator.dupe(u8, value);
+        } else {
+            try entries.append(allocator, .{
+                .name = try allocator.dupe(u8, name),
+                .value = try allocator.dupe(u8, value),
+            });
+        }
+    }
+    return .{ .content_type = ct, .entries = try entries.toOwnedSlice(allocator) };
+}
+
+fn deleteStandaloneAttrs(allocator: Allocator, obj_path: []const u8) void {
+    const sidecar = attrsSidecarPath(allocator, obj_path) catch return;
+    defer allocator.free(sidecar);
+    std.Io.Dir.cwd().deleteFile(app_io, sidecar) catch {};
+}
+
+/// Apply stored attributes to a GET/HEAD response.
+fn applyAttrsToResponse(res: *Response, attrs: *const ObjectAttrs) void {
+    res.setHeader("Content-Type", attrs.content_type);
+    for (attrs.entries) |e| {
+        res.setHeader(e.name, e.value);
+    }
+}
+
+/// Variant for 206 Partial Content: checksums describe the whole object, not
+/// the range, so (like S3) they are omitted on ranged responses. Returning the
+/// full-object checksum would fail SDK validation of the range bytes.
+fn applyAttrsToRangeResponse(res: *Response, attrs: *const ObjectAttrs) void {
+    res.setHeader("Content-Type", attrs.content_type);
+    for (attrs.entries) |e| {
+        if (std.mem.startsWith(u8, e.name, "x-amz-checksum-")) continue;
+        if (std.mem.eql(u8, e.name, "x-amz-checksum-type")) continue;
+        if (std.mem.eql(u8, e.name, "x-amz-sdk-checksum-algorithm")) continue;
+        res.setHeader(e.name, e.value);
+    }
+}
+
+/// Echo request checksums back on a PUT/CopyObject response, mirroring S3.
+fn echoRequestChecksums(req: *const Request, res: *Response) void {
+    var it = req.headers.iterator();
+    while (it.next()) |kv| {
+        const name: []const u8 = kv.key_ptr.*;
+        if (std.mem.startsWith(u8, name, "x-amz-checksum-") or
+            std.mem.eql(u8, name, "x-amz-sdk-checksum-algorithm"))
+        {
+            res.setHeader(name, kv.value_ptr.*);
+        }
+    }
+}
+
 fn handlePutObject(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
     // Keys ending with '/' are folder markers — store as ".folder_marker" file
     const effective_key = if (key.len > 0 and key[key.len - 1] == '/')
@@ -2610,18 +3059,29 @@ fn handlePutObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
         return;
     };
 
+    if (enable_fsync) fsyncFile(af.file);
     af.replace(app_io) catch {
         sendError(res, 500, "InternalError", "Cannot write file");
         return;
     };
+    if (enable_fsync) fsyncParentDir(path);
 
-    // Use fast hash for ETag (wyhash is ~10x faster than SHA256)
-    const hash = std.hash.Wyhash.hash(0, req.body);
-    const etag = std.fmt.allocPrint(allocator, "\"{x}\"", .{hash}) catch {
+    // Persist Content-Type / x-amz-meta-* / checksums alongside the object.
+    const attrs = collectRequestAttrs(allocator, req) catch null;
+    if (attrs) |a| {
+        saveStandaloneAttrs(allocator, path, &a);
+        echoRequestChecksums(req, res);
+        a.deinit(allocator);
+    }
+
+    // ETag is the MD5 of the content, so `aws s3 sync` and `rclone check`
+    // agree with local md5sum.
+    const etag = md5Etag(allocator, req.body) catch {
         sendError(res, 500, "InternalError", "ETag failed");
         return;
     };
 
+    metrics.put_bytes += req.body.len;
     res.ok();
     res.setHeader("ETag", etag);
 }
@@ -2664,8 +3124,7 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
         };
         file.close(app_io);
 
-        const hash = std.hash.Wyhash.hash(0, content);
-        const etag = std.fmt.allocPrint(allocator, "\"{x}\"", .{hash}) catch {
+        const etag = md5Etag(allocator, content) catch {
             sendError(res, 500, "InternalError", "ETag failed");
             return;
         };
@@ -2735,8 +3194,7 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     };
     file.close(app_io);
 
-    const hash = std.hash.Wyhash.hash(0, content);
-    const etag = std.fmt.allocPrint(allocator, "\"{x}\"", .{hash}) catch {
+    const etag = md5Etag(allocator, content) catch {
         sendError(res, 500, "InternalError", "ETag failed");
         return;
     };
@@ -2766,6 +3224,8 @@ fn deleteObjectInternal(ctx: *const S3Context, allocator: Allocator, bucket: []c
         error.FileNotFound => {},
         else => std.log.warn("delete failed: {}", .{err}),
     };
+    // Remove the attribute sidecar (Content-Type / user metadata) with it.
+    deleteStandaloneAttrs(allocator, path);
 
     // Clean up empty parent directories up to bucket level
     const bucket_path = ctx.bucketPath(allocator, bucket) catch return;
@@ -2796,12 +3256,15 @@ fn handleDeleteObjects(ctx: *const S3Context, allocator: Allocator, req: *Reques
         const key = body[key_start .. key_start + end];
 
         if (key.len > 0 and isValidKey(key)) {
+            // Legacy fallback: a decoded name may refer to a still-encoded file.
+            const rkey = resolveLegacyKey(ctx, allocator, bucket, key, key) catch continue;
             // In distributed mode, also delete from metadata index
             if (ctx.distributed) |dist| {
-                dist.meta_index.delete(allocator, bucket, key);
+                dist.meta_index.delete(allocator, bucket, rkey);
+                deleteDistAttrs(allocator, dist, bucket, rkey);
             }
 
-            const path = ctx.objectPath(allocator, bucket, key) catch continue;
+            const path = ctx.objectPath(allocator, bucket, rkey) catch continue;
             defer allocator.free(path);
 
             deleteObjectInternal(ctx, allocator, bucket, path);
@@ -2818,6 +3281,367 @@ fn handleDeleteObjects(ctx: *const S3Context, allocator: Allocator, req: *Reques
 
     res.ok();
     res.setXmlBody(try xml.toOwnedSlice(allocator));
+}
+
+// ============================================================================
+// COPY (CopyObject + UploadPartCopy)
+// ============================================================================
+// Server-side copy is what `aws s3 mv/sync`, `rclone move`, and the Terraform
+// S3 backend are built on. The source is named by the x-amz-copy-source
+// header: "[ / ]src-bucket/src-key" (URL-encoded, optional ?versionId=
+// suffix which is accepted and ignored — zs3 keeps no versions).
+
+const CopySource = struct {
+    bucket: []const u8,
+    key: []const u8, // decoded (canonical) form
+    raw: []const u8, // verbatim header form, for the legacy fallback
+};
+
+fn parseCopySource(allocator: Allocator, header: []const u8) !CopySource {
+    var src = std.mem.trim(u8, header, " \t");
+    if (src.len > 0 and src[0] == '/') src = src[1..];
+    // Strip ?versionId=... (accepted, ignored: no versions stored).
+    if (std.mem.indexOfScalar(u8, src, '?')) |q| src = src[0..q];
+    const slash = std.mem.indexOfScalar(u8, src, '/') orelse return error.InvalidCopySource;
+    // x-amz-copy-source is URL-encoded per spec: split raw, then decode each
+    // segment (a literal %2F inside a key survives as data).
+    const bucket = try uriDecodePath(allocator, src[0..slash]);
+    errdefer allocator.free(bucket);
+    const raw_key = src[slash + 1 ..];
+    var key_buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer key_buf.deinit(allocator);
+    var seg_iter = std.mem.splitScalar(u8, raw_key, '/');
+    var first_seg = true;
+    while (seg_iter.next()) |seg| {
+        if (!first_seg) try key_buf.append(allocator, '/');
+        first_seg = false;
+        const dec = try uriDecodePath(allocator, seg);
+        defer allocator.free(dec);
+        try key_buf.appendSlice(allocator, dec);
+    }
+    const key = try key_buf.toOwnedSlice(allocator);
+    const raw = try allocator.dupe(u8, raw_key);
+    if (!isValidBucketName(bucket) or !isValidKey(key)) {
+        allocator.free(bucket);
+        allocator.free(key);
+        allocator.free(raw);
+        return error.InvalidCopySource;
+    }
+    return .{ .bucket = bucket, .key = key, .raw = raw };
+}
+
+/// Parse x-amz-copy-source-range ("bytes=first-last" or "first-last").
+fn parseCopyRange(header: []const u8, src_len: u64) ?Range {
+    var spec = std.mem.trim(u8, header, " \t");
+    if (std.mem.startsWith(u8, spec, "bytes=")) spec = spec[6..];
+    const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return null;
+    const first = std.fmt.parseInt(u64, spec[0..dash], 10) catch return null;
+    const last = std.fmt.parseInt(u64, spec[dash + 1 ..], 10) catch return null;
+    if (src_len == 0 or first > last or last >= src_len) return null;
+    return .{ .start = first, .end = last };
+}
+
+/// Read an object's bytes through either backend (standalone file or
+/// distributed inline/CAS/peer fetch), for server-side copy.
+fn readSourceBytes(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, key: []const u8) ![]const u8 {
+    if (ctx.distributed) |dist| {
+        const meta = try dist.meta_index.getFull(allocator, bucket, key) orelse
+            fetchMetaFromPeers(ctx, allocator, bucket, key) orelse return error.NoSuchKey;
+        // Note: callers pass the request arena, which frees inline_data; the
+        // explicit free below keeps non-arena callers clean too.
+        if (meta.inline_data) |data| {
+            defer allocator.free(data);
+            return allocator.dupe(u8, data);
+        }
+        if (meta.size == 0) return allocator.dupe(u8, "");
+        if (dist.cas.retrieve(allocator, meta.hash)) |cached| {
+            defer allocator.free(cached);
+            return allocator.dupe(u8, cached);
+        } else |_| {}
+        const providers = dist.kademlia.findProviders(meta.hash);
+        for (providers) |provider_id| {
+            const peer = dist.kademlia.findPeerById(provider_id) orelse continue;
+            const data = fetchFromPeer(allocator, peer.address, meta.hash) catch continue;
+            if (!std.mem.eql(u8, &CAS.computeHash(data), &meta.hash)) {
+                allocator.free(data);
+                continue;
+            }
+            _ = dist.cas.store(allocator, data) catch {};
+            return data;
+        }
+        var peers: [MAX_BROADCAST_PEERS]PeerInfo = undefined;
+        const n = dist.kademlia.collectPeers(&peers);
+        for (peers[0..n]) |peer| {
+            const data = fetchFromPeer(allocator, peer.address, meta.hash) catch continue;
+            if (!std.mem.eql(u8, &CAS.computeHash(data), &meta.hash)) {
+                allocator.free(data);
+                continue;
+            }
+            _ = dist.cas.store(allocator, data) catch {};
+            return data;
+        }
+        return error.NoSuchKey;
+    }
+    const path = try ctx.objectPath(allocator, bucket, key);
+    defer allocator.free(path);
+    if (std.Io.Dir.cwd().openFile(app_io, path, .{})) |file| {
+        defer file.close(app_io);
+        // A directory fd opens successfully but reads fail — fall through to
+        // the folder-marker lookup instead of erroring out.
+        if (readToEndAlloc(file, allocator, MAX_BODY_SIZE)) |data| {
+            return data;
+        } else |_| {}
+    } else |_| {}
+    // Folder-marker fallback: keys ending in '/' are stored as ".folder_marker".
+    if (key.len > 0 and key[key.len - 1] == '/') {
+        const marker_key = try std.fmt.allocPrint(allocator, "{s}.folder_marker", .{key});
+        defer allocator.free(marker_key);
+        const marker_path = try ctx.objectPath(allocator, bucket, marker_key);
+        defer allocator.free(marker_path);
+        var mfile = std.Io.Dir.cwd().openFile(app_io, marker_path, .{}) catch return error.NoSuchKey;
+        defer mfile.close(app_io);
+        return readToEndAlloc(mfile, allocator, MAX_BODY_SIZE) catch error.NoSuchKey;
+    }
+    return error.NoSuchKey;
+}
+
+fn copyObjectXml(allocator: Allocator, etag: []const u8, tag: []const u8) ![]const u8 {
+    var xml: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer xml.deinit(allocator);
+    try xml.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    try xml.appendSlice(allocator, tag);
+    try xml.appendSlice(allocator, "<LastModified>");
+    var iso_buf: [20]u8 = undefined;
+    formatIso8601(&iso_buf, std.Io.Clock.real.now(app_io).toSeconds());
+    try xml.appendSlice(allocator, &iso_buf);
+    try xml.appendSlice(allocator, "</LastModified><ETag>");
+    try xml.appendSlice(allocator, etag);
+    try xml.appendSlice(allocator, "</ETag>");
+    if (std.mem.eql(u8, tag, "<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">")) {
+        try xml.appendSlice(allocator, "</CopyObjectResult>");
+    } else {
+        try xml.appendSlice(allocator, "</CopyPartResult>");
+    }
+    return xml.toOwnedSlice(allocator);
+}
+
+/// PUT /{bucket}/{key} with x-amz-copy-source: server-side copy.
+fn handleCopyObject(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
+    const copy_src_header = req.header("x-amz-copy-source") orelse {
+        sendError(res, 400, "InvalidRequest", "Missing x-amz-copy-source");
+        return;
+    };
+    const src = parseCopySource(allocator, copy_src_header) catch {
+        sendError(res, 400, "InvalidArgument", "Invalid x-amz-copy-source");
+        return;
+    };
+    defer allocator.free(src.bucket);
+    defer allocator.free(src.key);
+    defer allocator.free(src.raw);
+
+    // Legacy fallback for the source, same rule as request paths.
+    const src_key = try resolveLegacyKey(ctx, allocator, src.bucket, src.key, src.raw);
+
+    const data = readSourceBytes(ctx, allocator, src.bucket, src_key) catch {
+        sendError(res, 404, "NoSuchKey", "Copy source not found");
+        return;
+    };
+    defer allocator.free(data);
+
+    // Folder-marker destinations are stored as ".folder_marker" files, like PUT.
+    const effective_key = if (key.len > 0 and key[key.len - 1] == '/')
+        try std.fmt.allocPrint(allocator, "{s}.folder_marker", .{key})
+    else
+        try allocator.dupe(u8, key);
+    defer allocator.free(effective_key);
+
+    // MetadataDirective: COPY (default) inherits source attributes, REPLACE
+    // uses the request's headers.
+    const directive = req.header("x-amz-metadata-directive") orelse "COPY";
+    const replace = std.ascii.eqlIgnoreCase(directive, "REPLACE");
+
+    if (ctx.distributed) |dist| {
+        const hash = CAS.computeHash(data);
+        if (data.len <= INLINE_THRESHOLD) {
+            try dist.meta_index.putWithData(allocator, bucket, effective_key, hash, data.len, data);
+        } else {
+            _ = try dist.cas.store(allocator, data);
+            try dist.meta_index.put(allocator, bucket, effective_key, hash, data.len);
+            dist.kademlia.announce(hash) catch {};
+            dist.replication.schedule(hash) catch {};
+        }
+        if (replace) {
+            if (collectRequestAttrs(allocator, req)) |a| {
+                defer a.deinit(allocator);
+                writeDistAttrs(allocator, dist, bucket, effective_key, &a);
+            } else |_| {}
+        } else if (readDistAttrs(allocator, dist, src.bucket, src_key) orelse fetchAttrsFromPeers(ctx, allocator, src.bucket, src_key)) |sa| {
+            defer sa.deinit(allocator);
+            writeDistAttrs(allocator, dist, bucket, effective_key, &sa);
+        }
+        propagateObjectMeta(ctx, allocator, bucket, effective_key);
+        propagateObjectAttrs(ctx, allocator, bucket, effective_key);
+        if (data.len > INLINE_THRESHOLD) {
+            dist.worker.enqueue(.{ .blob = .{ .hash = hash } });
+        }
+        const etag = try md5Etag(allocator, data);
+        defer allocator.free(etag);
+        metrics.put_bytes += data.len;
+        echoRequestChecksums(req, res);
+        res.ok();
+        res.setXmlBody(try copyObjectXml(allocator, etag, "<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"));
+        return;
+    }
+
+    const dst_path = try ctx.objectPath(allocator, bucket, effective_key);
+    defer allocator.free(dst_path);
+    if (!checkPutPreconditions(allocator, req, res, dst_path)) return;
+
+    var af = std.Io.Dir.cwd().createFileAtomic(app_io, dst_path, .{ .make_path = true, .replace = true }) catch {
+        sendError(res, 500, "InternalError", "Cannot create file");
+        return;
+    };
+    defer af.deinit(app_io);
+    af.file.writeStreamingAll(app_io, data) catch {
+        sendError(res, 500, "InternalError", "Cannot write file");
+        return;
+    };
+    if (enable_fsync) fsyncFile(af.file);
+    af.replace(app_io) catch {
+        sendError(res, 500, "InternalError", "Cannot write file");
+        return;
+    };
+    if (enable_fsync) fsyncParentDir(dst_path);
+
+    if (replace) {
+        if (collectRequestAttrs(allocator, req)) |a| {
+            defer a.deinit(allocator);
+            saveStandaloneAttrs(allocator, dst_path, &a);
+        } else |_| {}
+    } else {
+        const src_path = try ctx.objectPath(allocator, src.bucket, src_key);
+        defer allocator.free(src_path);
+        if (loadStandaloneAttrs(allocator, src_path, src_key)) |sa| {
+            defer sa.deinit(allocator);
+            saveStandaloneAttrs(allocator, dst_path, &sa);
+        } else |_| {
+            // Folder-marker sources keep their sidecar next to the marker file.
+            if (src_key.len > 0 and src_key[src_key.len - 1] == '/') {
+                const smarker = std.fmt.allocPrint(allocator, "{s}.folder_marker", .{src_key}) catch null;
+                if (smarker) |sm| {
+                    defer allocator.free(sm);
+                    if (ctx.objectPath(allocator, src.bucket, sm)) |smp| {
+                        defer allocator.free(smp);
+                        if (loadStandaloneAttrs(allocator, smp, src_key)) |sa| {
+                            defer sa.deinit(allocator);
+                            saveStandaloneAttrs(allocator, dst_path, &sa);
+                        } else |_| {}
+                    } else |_| {}
+                }
+            }
+        }
+    }
+
+    const etag = try md5Etag(allocator, data);
+    defer allocator.free(etag);
+    metrics.put_bytes += data.len;
+    echoRequestChecksums(req, res);
+    res.ok();
+    res.setXmlBody(try copyObjectXml(allocator, etag, "<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"));
+}
+
+/// PUT /{bucket}/{key}?uploadId=..&partNumber=.. with x-amz-copy-source:
+/// server-side copy of (a byte range of) an object into a multipart part.
+fn handleUploadPartCopy(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
+    _ = bucket;
+    _ = key;
+    const upload_id = getQueryParam(req.query, "uploadId") orelse {
+        sendError(res, 400, "InvalidRequest", "Missing uploadId");
+        return;
+    };
+    if (!isValidUploadId(upload_id)) {
+        sendError(res, 400, "InvalidArgument", "Invalid uploadId");
+        return;
+    }
+    const part_number_str = getQueryParam(req.query, "partNumber") orelse {
+        sendError(res, 400, "InvalidRequest", "Missing partNumber");
+        return;
+    };
+    const part_number = std.fmt.parseInt(u32, part_number_str, 10) catch {
+        sendError(res, 400, "InvalidArgument", "Invalid partNumber");
+        return;
+    };
+    if (part_number < 1 or part_number > 10000) {
+        sendError(res, 400, "InvalidArgument", "Invalid partNumber");
+        return;
+    }
+    const copy_src_header = req.header("x-amz-copy-source") orelse {
+        sendError(res, 400, "InvalidRequest", "Missing x-amz-copy-source");
+        return;
+    };
+    const src = parseCopySource(allocator, copy_src_header) catch {
+        sendError(res, 400, "InvalidArgument", "Invalid x-amz-copy-source");
+        return;
+    };
+    defer allocator.free(src.bucket);
+    defer allocator.free(src.key);
+    defer allocator.free(src.raw);
+
+    // Legacy fallback for the source, same rule as request paths.
+    const src_key = try resolveLegacyKey(ctx, allocator, src.bucket, src.key, src.raw);
+
+    const data = readSourceBytes(ctx, allocator, src.bucket, src_key) catch {
+        sendError(res, 404, "NoSuchKey", "Copy source not found");
+        return;
+    };
+    defer allocator.free(data);
+
+    const slice = if (req.header("x-amz-copy-source-range")) |range_header|
+        (parseCopyRange(range_header, data.len) orelse {
+            sendError(res, 416, "InvalidRange", "Copy source range is not satisfiable");
+            return;
+        })
+    else
+        Range{ .start = 0, .end = if (data.len == 0) 0 else data.len - 1 };
+    const part_data = if (data.len == 0) data[0..0] else data[slice.start .. slice.end + 1];
+
+    const parts_dir = std.fmt.allocPrint(allocator, "{s}/.uploads/{s}", .{ ctx.data_dir, upload_id }) catch {
+        sendError(res, 500, "InternalError", "Allocation failed");
+        return;
+    };
+    defer allocator.free(parts_dir);
+    // Upload must have been initiated; otherwise this is a NoSuchUpload, not a 500.
+    var up_dir = std.Io.Dir.cwd().openDir(app_io, parts_dir, .{}) catch {
+        sendError(res, 404, "NoSuchUpload", "Upload not found");
+        return;
+    };
+    up_dir.close(app_io);
+
+    const part_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ parts_dir, part_number_str }) catch {
+        sendError(res, 500, "InternalError", "Allocation failed");
+        return;
+    };
+    defer allocator.free(part_path);
+
+    var file = std.Io.Dir.cwd().createFile(app_io, part_path, .{}) catch {
+        sendError(res, 500, "InternalError", "Cannot create part file");
+        return;
+    };
+    defer file.close(app_io);
+    file.writeStreamingAll(app_io, part_data) catch {
+        sendError(res, 500, "InternalError", "Cannot write part");
+        return;
+    };
+    if (enable_fsync) {
+        fsyncFile(file);
+        fsyncParentDir(part_path);
+    }
+
+    const etag = try md5Etag(allocator, part_data);
+    defer allocator.free(etag);
+
+    res.ok();
+    res.setXmlBody(try copyObjectXml(allocator, etag, "<CopyPartResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"));
 }
 
 fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
@@ -2855,8 +3679,7 @@ fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, req: *Request, 
     };
     defer allocator.free(content);
 
-    const hash = std.hash.Wyhash.hash(0, content);
-    const etag = std.fmt.allocPrint(allocator, "\"{x}\"", .{hash}) catch {
+    const etag = md5Etag(allocator, content) catch {
         sendError(res, 500, "InternalError", "ETag failed");
         return;
     };
@@ -2891,6 +3714,10 @@ fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, req: *Request, 
     res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("ETag", etag);
     res.setHeader("Last-Modified", last_modified);
+    // NB: no deinit — headers borrow attrs memory (arena-freed after write).
+    if (loadStandaloneAttrs(allocator, path, key)) |attrs| {
+        applyAttrsToResponse(res, &attrs);
+    } else |_| {}
 }
 
 fn handleListObjects(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8) !void {
@@ -3165,6 +3992,11 @@ fn handleListBuckets(ctx: *const S3Context, allocator: Allocator, res: *Response
     while (try iter.next(app_io)) |entry| {
         if (entry.kind != .directory) continue;
         if (entry.name[0] == '.') continue;
+        // Only list directories that are usable as buckets. An existing tree
+        // can contain anything (`Backups`, `media_archive`); advertising them
+        // as buckets and then rejecting every operation is worse than hiding
+        // them. (A bucket created through the API always passes validation.)
+        if (!isValidBucketName(entry.name)) continue;
 
         try xml.appendSlice(allocator, "<Bucket><Name>");
         try xmlEscape(allocator, &xml, entry.name);
@@ -3259,11 +4091,82 @@ fn handleUploadPart(ctx: *const S3Context, allocator: Allocator, req: *Request, 
         return;
     };
 
-    const etag_hash = SigV4.hash(req.body);
-    const etag = try std.fmt.allocPrint(allocator, "\"{x}\"", .{etag_hash});
+    const etag = try md5Etag(allocator, req.body);
 
     res.ok();
     res.setHeader("ETag", etag);
+}
+
+/// GET /{bucket}/{key}?uploadId=.. : list uploaded parts.
+fn handleListParts(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
+    const upload_id = getQueryParam(req.query, "uploadId") orelse {
+        sendError(res, 400, "InvalidRequest", "Missing uploadId");
+        return;
+    };
+    if (!isValidUploadId(upload_id)) {
+        sendError(res, 400, "InvalidArgument", "Invalid uploadId");
+        return;
+    }
+    const parts_dir = std.fmt.allocPrint(allocator, "{s}/.uploads/{s}", .{ ctx.data_dir, upload_id }) catch {
+        sendError(res, 500, "InternalError", "Allocation failed");
+        return;
+    };
+    defer allocator.free(parts_dir);
+
+    var dir = std.Io.Dir.cwd().openDir(app_io, parts_dir, .{ .iterate = true }) catch {
+        sendError(res, 404, "NoSuchUpload", "Upload not found");
+        return;
+    };
+    defer dir.close(app_io);
+
+    var nums: std.ArrayListUnmanaged(u32) = .empty;
+    defer nums.deinit(allocator);
+    var iter = dir.iterate();
+    while (try iter.next(app_io)) |entry| {
+        if (entry.kind == .file and entry.name[0] != '.') {
+            const num = std.fmt.parseInt(u32, entry.name, 10) catch continue;
+            try nums.append(allocator, num);
+        }
+    }
+    std.mem.sort(u32, nums.items, {}, std.sort.asc(u32));
+
+    var xml: std.ArrayListUnmanaged(u8) = .empty;
+    defer xml.deinit(allocator);
+    try xml.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    try xml.appendSlice(allocator, "<ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    try xml.appendSlice(allocator, "<Bucket>");
+    try xmlEscape(allocator, &xml, bucket);
+    try xml.appendSlice(allocator, "</Bucket><Key>");
+    try xmlEscape(allocator, &xml, key);
+    try xml.appendSlice(allocator, "</Key><UploadId>");
+    try xml.appendSlice(allocator, upload_id);
+    try xml.appendSlice(allocator, "</UploadId>");
+    for (nums.items) |num| {
+        var num_buf: [16]u8 = undefined;
+        const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{num}) catch continue;
+        const part_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ parts_dir, num_str }) catch continue;
+        defer allocator.free(part_path);
+        var pf = std.Io.Dir.cwd().openFile(app_io, part_path, .{}) catch continue;
+        defer pf.close(app_io);
+        const stat = pf.stat(app_io) catch continue;
+        const data = readToEndAlloc(pf, allocator, MAX_BODY_SIZE) catch continue;
+        defer allocator.free(data);
+        const petag = md5Etag(allocator, data) catch continue;
+        defer allocator.free(petag);
+        try xml.appendSlice(allocator, "<Part><PartNumber>");
+        try xml.appendSlice(allocator, num_str);
+        try xml.appendSlice(allocator, "</PartNumber><ETag>");
+        try xml.appendSlice(allocator, petag);
+        try xml.appendSlice(allocator, "</ETag><Size>");
+        var size_buf: [32]u8 = undefined;
+        const size_str = std.fmt.bufPrint(&size_buf, "{d}", .{stat.size}) catch "0";
+        try xml.appendSlice(allocator, size_str);
+        try xml.appendSlice(allocator, "</Size></Part>");
+    }
+    try xml.appendSlice(allocator, "</ListPartsResult>");
+
+    res.ok();
+    res.setXmlBody(try xml.toOwnedSlice(allocator));
 }
 
 fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
@@ -3353,6 +4256,16 @@ fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Re
     std.Io.Dir.cwd().deleteTree(app_io, parts_dir) catch |err| {
         std.log.warn("failed to cleanup upload dir: {}", .{err});
     };
+    if (enable_fsync) {
+        final_file.sync(app_io) catch {};
+        fsyncParentDir(final_path);
+    }
+
+    // Persist any Content-Type / metadata sent on CompleteMultipartUpload.
+    if (collectRequestAttrs(allocator, req)) |a| {
+        defer a.deinit(allocator);
+        saveStandaloneAttrs(allocator, final_path, &a);
+    } else |_| {}
 
     // In distributed mode, index the assembled file so distributed GET can find it
     if (ctx.distributed) |dist| {
@@ -3735,6 +4648,68 @@ fn handlePeerProtocol(ctx: *const S3Context, dist: *DistributedContext, allocato
         };
         res.ok();
         res.body = content;
+    } else if (std.mem.eql(u8, path, "attrs")) {
+        // Replicated attribute entry pushed from a peer
+        // Body: "<bucket>\n<key>\n<raw attrs content>" (empty content = delete)
+        if (!std.mem.eql(u8, req.method, "POST")) {
+            sendError(res, 405, "MethodNotAllowed", "Use POST");
+            return;
+        }
+        const bucket_end = std.mem.indexOfScalar(u8, req.body, '\n') orelse {
+            sendError(res, 400, "InvalidRequest", "Missing bucket");
+            return;
+        };
+        const bucket = req.body[0..bucket_end];
+        const key_end = std.mem.indexOfScalarPos(u8, req.body, bucket_end + 1, '\n') orelse {
+            sendError(res, 400, "InvalidRequest", "Missing key");
+            return;
+        };
+        const key = req.body[bucket_end + 1 .. key_end];
+        const content = req.body[key_end + 1 ..];
+
+        if (!isValidBucketName(bucket) or !isValidKey(key)) {
+            sendError(res, 400, "InvalidRequest", "Invalid bucket or key");
+            return;
+        }
+        applyRemoteAttrs(ctx, allocator, bucket, key, content) catch {
+            sendError(res, 400, "InvalidRequest", "Invalid attrs entry");
+            return;
+        };
+        res.ok();
+    } else if (std.mem.eql(u8, path, "attrs_get")) {
+        // Attribute lookup for a peer's read-through fallback
+        // Body: "<bucket>\n<key>", response: raw attrs content (empty = none)
+        if (!std.mem.eql(u8, req.method, "POST")) {
+            sendError(res, 405, "MethodNotAllowed", "Use POST");
+            return;
+        }
+        const bucket_end = std.mem.indexOfScalar(u8, req.body, '\n') orelse {
+            sendError(res, 400, "InvalidRequest", "Missing bucket");
+            return;
+        };
+        const bucket = req.body[0..bucket_end];
+        const key = req.body[bucket_end + 1 ..];
+
+        if (!isValidBucketName(bucket) or !isValidKey(key)) {
+            sendError(res, 400, "InvalidRequest", "Invalid bucket or key");
+            return;
+        }
+        const apath = distAttrsPath(allocator, dist.meta_index.data_dir, bucket, key) catch {
+            sendError(res, 400, "InvalidRequest", "Invalid bucket or key");
+            return;
+        };
+        defer allocator.free(apath);
+        var afile = std.Io.Dir.cwd().openFile(app_io, apath, .{}) catch {
+            sendError(res, 404, "NotFound", "No attributes for key");
+            return;
+        };
+        defer afile.close(app_io);
+        const acontent = readToEndAlloc(afile, allocator, MAX_META_RESPONSE) catch {
+            sendError(res, 500, "InternalError", "Read failed");
+            return;
+        };
+        res.ok();
+        res.body = acontent;
     } else if (std.mem.eql(u8, path, "index")) {
         // Full index dump for a joining peer
         if (!std.mem.eql(u8, req.method, "GET")) {
@@ -3823,15 +4798,14 @@ fn handleDistributedPut(ctx: *const S3Context, allocator: Allocator, req: *Reque
     // Compute content hash
     const hash = CAS.computeHash(req.body);
 
-    // Honor If-Match / If-None-Match against the existing object's hash (its ETag).
+    // Honor If-Match / If-None-Match against the existing object's MD5 ETag.
+    // Content is loaded only when a conditional header is present.
     const if_match = req.header("if-match");
     const if_none_match = req.header("if-none-match");
     if (if_match != null or if_none_match != null) {
-        const existing = dist.meta_index.get(allocator, bucket, key) catch null;
-        const existing_etag = if (existing) |m| blk: {
-            const e = try std.fmt.allocPrint(allocator, "\"{x}\"", .{m.hash});
-            break :blk e;
-        } else null;
+        const existing_bytes = readSourceBytes(ctx, allocator, bucket, key) catch null;
+        defer if (existing_bytes) |b| allocator.free(b);
+        const existing_etag = if (existing_bytes) |b| md5Etag(allocator, b) catch null else null;
         defer if (existing_etag) |e| allocator.free(e);
 
         if (if_match) |im| {
@@ -3867,13 +4841,21 @@ fn handleDistributedPut(ctx: *const S3Context, allocator: Allocator, req: *Reque
     // Propagate the namespace entry to peers synchronously (small, keeps
     // cross-node reads consistent); replicate CAS blobs in the background
     propagateObjectMeta(ctx, allocator, bucket, key);
+    // Persist Content-Type / metadata and propagate best-effort.
+    if (collectRequestAttrs(allocator, req)) |a| {
+        defer a.deinit(allocator);
+        writeDistAttrs(allocator, dist, bucket, key, &a);
+        propagateObjectAttrs(ctx, allocator, bucket, key);
+        echoRequestChecksums(req, res);
+    } else |_| {}
     if (req.body.len > INLINE_THRESHOLD) {
         dist.worker.enqueue(.{ .blob = .{ .hash = hash } });
     }
 
-    // Return ETag as content hash
-    const etag = try std.fmt.allocPrint(allocator, "\"{x}\"", .{hash});
+    // Return ETag as the MD5 of the content (matches standalone mode).
+    const etag = try md5Etag(allocator, req.body);
 
+    metrics.put_bytes += req.body.len;
     res.ok();
     res.setHeader("ETag", etag);
 }
@@ -3882,17 +4864,23 @@ fn handleDistributedPut(ctx: *const S3Context, allocator: Allocator, req: *Reque
 fn handleDistributedGet(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
     const dist = ctx.distributed.?;
 
-    // Lookup full metadata (includes inline data if present),
-    // falling back to a peer lookup when the entry isn't known locally
+    // Lookup metadata (for Last-Modified and the existence check),
+    // falling back to a peer lookup when the entry isn't known locally.
     const meta = try dist.meta_index.getFull(allocator, bucket, key) orelse
         fetchMetaFromPeers(ctx, allocator, bucket, key) orelse {
             sendError(res, 404, "NoSuchKey", "Object not found");
             return;
         };
-    // Note: inline_data is arena-allocated and will be freed with the request arena
+    // Note: inline_data/bytes are arena-allocated, freed after the write.
 
-    // Conditional requests: If-Match mismatch → 412, If-None-Match match → 304.
-    const etag = std.fmt.allocPrint(allocator, "\"{x}\"", .{meta.hash}) catch {
+    // Load bytes through inline/CAS/provider/peer fallback.
+    const data = readSourceBytes(ctx, allocator, bucket, key) catch {
+        sendError(res, 404, "NoSuchKey", "Content not available from any provider");
+        return;
+    };
+
+    // ETag is the MD5 of the content, matching standalone mode.
+    const etag = md5Etag(allocator, data) catch {
         sendError(res, 500, "InternalError", "ETag failed");
         return;
     };
@@ -3910,57 +4898,15 @@ fn handleDistributedGet(ctx: *const S3Context, allocator: Allocator, req: *Reque
         }
     }
 
-    // Check for inline data first (small objects stored in metadata)
-    if (meta.inline_data) |data| {
-        return serveContent(allocator, req, res, data, &meta.hash, meta.created);
-    }
+    // NB: no deinit on dattrs — serveContent headers borrow it (arena).
+    const dattrs = readDistAttrs(allocator, dist, bucket, key) orelse fetchAttrsFromPeers(ctx, allocator, bucket, key);
+    const dattrs_ptr: ?*const ObjectAttrs = if (dattrs) |*a| a else null;
 
-    // Empty objects have no inline data and no CAS entry
-    if (meta.size == 0) {
-        return serveContent(allocator, req, res, "", &meta.hash, meta.created);
-    }
-
-    // Try local CAS
-    if (dist.cas.retrieve(allocator, meta.hash)) |data| {
-        return serveContent(allocator, req, res, data, &meta.hash, meta.created);
-    } else |_| {}
-
-    // Content not local - try known providers first, verifying content hashes
-    const providers = dist.kademlia.findProviders(meta.hash);
-    for (providers) |provider_id| {
-        const peer = dist.kademlia.findPeerById(provider_id) orelse continue;
-        if (fetchVerifyServe(dist, allocator, req, res, peer.address, &meta)) return;
-    }
-
-    // No usable provider record (e.g. this node joined after the announce) -
-    // sweep all known peers; the blob endpoint 404s harmlessly on peers without it
-    var peers: [MAX_BROADCAST_PEERS]PeerInfo = undefined;
-    const peer_count = dist.kademlia.collectPeers(&peers);
-    for (peers[0..peer_count]) |peer| {
-        if (fetchVerifyServe(dist, allocator, req, res, peer.address, &meta)) return;
-    }
-
-    sendError(res, 404, "NoSuchKey", "Content not available from any provider");
-}
-
-/// Fetch a blob from one peer, verify its hash, cache it, and serve it.
-/// Returns false (without touching the response) if the peer can't supply it.
-fn fetchVerifyServe(dist: *DistributedContext, allocator: Allocator, req: *Request, res: *Response, address: net.IpAddress, meta: *const MetaIndex.ObjectMeta) bool {
-    const data = fetchFromPeer(allocator, address, meta.hash) catch return false;
-    const fetched_hash = CAS.computeHash(data);
-    if (!std.mem.eql(u8, &fetched_hash, &meta.hash)) {
-        allocator.free(data);
-        return false;
-    }
-    // Cache locally for future reads and record ourselves as provider
-    _ = dist.cas.store(allocator, data) catch {};
-    dist.kademlia.announce(meta.hash) catch {};
-    serveContent(allocator, req, res, data, &meta.hash, meta.created);
-    return true;
+    return serveContent(allocator, req, res, data, etag, meta.created, dattrs_ptr);
 }
 
 /// Serve content with range request support
-fn serveContent(allocator: Allocator, req: *Request, res: *Response, data: []const u8, hash: *const ContentHash, created: i64) void {
+fn serveContent(allocator: Allocator, req: *Request, res: *Response, data: []const u8, etag: []const u8, created: i64, attrs: ?*const ObjectAttrs) void {
     const last_modified = allocHttpDate(allocator, created) catch {
         sendError(res, 500, "InternalError", "Date format failed");
         return;
@@ -3979,6 +4925,8 @@ fn serveContent(allocator: Allocator, req: *Request, res: *Response, data: []con
             res.setHeader("Content-Range", content_range);
             res.setHeader("Accept-Ranges", "bytes");
             res.setHeader("Last-Modified", last_modified);
+            if (attrs) |a| applyAttrsToRangeResponse(res, a) else res.setHeader("Content-Type", DEFAULT_CONTENT_TYPE);
+            metrics.get_bytes += range.end - range.start + 1;
             res.body = data[range.start .. range.end + 1];
             return;
         }
@@ -3987,12 +4935,10 @@ fn serveContent(allocator: Allocator, req: *Request, res: *Response, data: []con
     res.ok();
     res.setHeader("Accept-Ranges", "bytes");
 
-    const etag = std.fmt.allocPrint(allocator, "\"{x}\"", .{hash.*}) catch {
-        sendError(res, 500, "InternalError", "ETag failed");
-        return;
-    };
     res.setHeader("ETag", etag);
     res.setHeader("Last-Modified", last_modified);
+    if (attrs) |a| applyAttrsToResponse(res, a) else res.setHeader("Content-Type", DEFAULT_CONTENT_TYPE);
+    metrics.get_bytes += data.len;
     res.body = data;
 }
 
@@ -4107,6 +5053,67 @@ fn propagateObjectMeta(ctx: *const S3Context, allocator: Allocator, bucket: []co
     broadcastToPeers(dist, allocator, "POST", "/_zs3/meta", body);
 }
 
+/// Push the local attribute entry for bucket/key to all peers. An empty
+/// content means "no attributes" (e.g. after a delete), telling peers to drop
+/// their copy so stale Content-Types don't survive.
+fn propagateObjectAttrs(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, key: []const u8) void {
+    const dist = ctx.distributed orelse return;
+    const path = distAttrsPath(allocator, dist.meta_index.data_dir, bucket, key) catch return;
+    defer allocator.free(path);
+    var content: []const u8 = "";
+    var owned: ?[]u8 = null;
+    if (std.Io.Dir.cwd().openFile(app_io, path, .{})) |file| {
+        defer file.close(app_io);
+        owned = readToEndAlloc(file, allocator, 64 * 1024) catch null;
+        if (owned) |o| content = o;
+    } else |_| {}
+    defer if (owned) |o| allocator.free(o);
+
+    const body = std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}", .{ bucket, key, content }) catch return;
+    defer allocator.free(body);
+    broadcastToPeers(dist, allocator, "POST", "/_zs3/attrs", body);
+}
+
+/// Apply an attribute entry received from a peer. Attributes carry no
+/// timestamp; the meta entry (which has LWW) is the source of ordering truth
+/// and is always pushed before its attributes.
+fn applyRemoteAttrs(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, key: []const u8, content: []const u8) !void {
+    const dist = ctx.distributed.?;
+    if (content.len == 0) {
+        deleteDistAttrs(allocator, dist, bucket, key);
+        return;
+    }
+    // Validate shape before storing.
+    const parsed = try parseAttrsContent(allocator, content);
+    parsed.deinit(allocator);
+    const path = try distAttrsPath(allocator, dist.meta_index.data_dir, bucket, key);
+    defer allocator.free(path);
+    if (std.fs.path.dirname(path)) |dir| {
+        std.Io.Dir.cwd().createDirPath(app_io, dir) catch {};
+    }
+    var file = try std.Io.Dir.cwd().createFile(app_io, path, .{});
+    defer file.close(app_io);
+    try file.writeStreamingAll(app_io, content);
+}
+
+/// Read-through fallback for attributes: ask peers, cache locally.
+fn fetchAttrsFromPeers(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, key: []const u8) ?ObjectAttrs {
+    const dist = ctx.distributed.?;
+    const body = std.fmt.allocPrint(allocator, "{s}\n{s}", .{ bucket, key }) catch return null;
+    defer allocator.free(body);
+
+    var peers: [MAX_BROADCAST_PEERS]PeerInfo = undefined;
+    const n = dist.kademlia.collectPeers(&peers);
+    for (peers[0..n]) |peer| {
+        const content = peerRequest(allocator, peer.address, "POST", "/_zs3/attrs_get", body, MAX_META_RESPONSE) catch continue;
+        defer allocator.free(content);
+        if (content.len == 0) continue;
+        applyRemoteAttrs(ctx, allocator, bucket, key, content) catch continue;
+        return readDistAttrs(allocator, dist, bucket, key);
+    }
+    return null;
+}
+
 /// Tell all peers that `provider` has the content for `hash`
 fn broadcastAnnounce(dist: *DistributedContext, allocator: Allocator, hash: ContentHash, provider: NodeId) void {
     var hash_hex: [40]u8 = undefined;
@@ -4173,7 +5180,9 @@ fn fetchMetaFromPeers(ctx: *const S3Context, allocator: Allocator, bucket: []con
 }
 
 /// Pull the full metadata index from a peer (join-time sync).
-/// Wire format per entry: "<bucket>\n<key>\n<content_len>\n" + content bytes.
+/// Wire format per entry: "<kind>\n<bucket>\n<key>\n<content_len>\n" + content
+/// bytes, where kind is "meta" or "attrs". Entries without a kind line (from
+/// older peers) are treated as "meta".
 fn syncIndexFromPeer(allocator: Allocator, ctx: *const S3Context, peer: PeerInfo) void {
     const body = peerRequest(allocator, peer.address, "GET", "/_zs3/index", "", MAX_INDEX_SYNC_SIZE) catch |err| {
         std.log.warn("Index sync from peer failed: {t}", .{err});
@@ -4184,18 +5193,38 @@ fn syncIndexFromPeer(allocator: Allocator, ctx: *const S3Context, peer: PeerInfo
     var applied: usize = 0;
     var offset: usize = 0;
     while (offset < body.len) {
-        const bucket_end = std.mem.indexOfScalarPos(u8, body, offset, '\n') orelse break;
-        const bucket = body[offset..bucket_end];
-        const key_end = std.mem.indexOfScalarPos(u8, body, bucket_end + 1, '\n') orelse break;
-        const key = body[bucket_end + 1 .. key_end];
-        const len_end = std.mem.indexOfScalarPos(u8, body, key_end + 1, '\n') orelse break;
-        const content_len = std.fmt.parseInt(usize, body[key_end + 1 .. len_end], 10) catch break;
-        if (len_end + 1 + content_len > body.len) break;
-        const content = body[len_end + 1 ..][0..content_len];
-        offset = len_end + 1 + content_len;
+        const l1_end = std.mem.indexOfScalarPos(u8, body, offset, '\n') orelse break;
+        const l1 = body[offset..l1_end];
+        const l2_end = std.mem.indexOfScalarPos(u8, body, l1_end + 1, '\n') orelse break;
+        const l2 = body[l1_end + 1 .. l2_end];
+        const l3_end = std.mem.indexOfScalarPos(u8, body, l2_end + 1, '\n') orelse break;
+        const l3 = body[l2_end + 1 .. l3_end];
+
+        // New format has 4 header lines (kind first); old format has 3.
+        var kind: []const u8 = "meta";
+        var bucket: []const u8 = l1;
+        var key: []const u8 = l2;
+        var len_str: []const u8 = l3;
+        var content_off = l3_end + 1;
+        if (std.mem.eql(u8, l1, "meta") or std.mem.eql(u8, l1, "attrs")) {
+            const l4_end = std.mem.indexOfScalarPos(u8, body, l3_end + 1, '\n') orelse break;
+            kind = l1;
+            bucket = l2;
+            key = l3;
+            len_str = body[l3_end + 1 .. l4_end];
+            content_off = l4_end + 1;
+        }
+        const content_len = std.fmt.parseInt(usize, len_str, 10) catch break;
+        if (content_off + content_len > body.len) break;
+        const content = body[content_off..][0..content_len];
+        offset = content_off + content_len;
 
         if (!isValidBucketName(bucket) or !isValidKey(key)) continue;
-        applyRemoteMeta(ctx, allocator, bucket, key, content) catch continue;
+        if (std.mem.eql(u8, kind, "attrs")) {
+            applyRemoteAttrs(ctx, allocator, bucket, key, content) catch continue;
+        } else {
+            applyRemoteMeta(ctx, allocator, bucket, key, content) catch continue;
+        }
         applied += 1;
     }
     std.log.info("Synced {d} metadata entries from bootstrap peer", .{applied});
@@ -4244,10 +5273,23 @@ fn dumpMetaDir(dist: *const DistributedContext, allocator: Allocator, bucket: []
             const content = (dist.meta_index.readRaw(allocator, bucket, key) catch continue) orelse continue;
             defer allocator.free(content);
 
-            const frame = try std.fmt.allocPrint(allocator, "{s}\n{s}\n{d}\n", .{ bucket, key, content.len });
+            const frame = try std.fmt.allocPrint(allocator, "meta\n{s}\n{s}\n{d}\n", .{ bucket, key, content.len });
             defer allocator.free(frame);
             try out.appendSlice(allocator, frame);
             try out.appendSlice(allocator, content);
+        } else if (std.mem.endsWith(u8, entry.name, ".attrs")) {
+            const key = full_name[0 .. full_name.len - 6];
+            const apath = try distAttrsPath(allocator, dist.meta_index.data_dir, bucket, key);
+            defer allocator.free(apath);
+            var afile = std.Io.Dir.cwd().openFile(app_io, apath, .{}) catch continue;
+            defer afile.close(app_io);
+            const acontent = readToEndAlloc(afile, allocator, MAX_META_RESPONSE) catch continue;
+            defer allocator.free(acontent);
+
+            const frame = try std.fmt.allocPrint(allocator, "attrs\n{s}\n{s}\n{d}\n", .{ bucket, key, acontent.len });
+            defer allocator.free(frame);
+            try out.appendSlice(allocator, frame);
+            try out.appendSlice(allocator, acontent);
         }
     }
 }
@@ -4256,7 +5298,9 @@ fn dumpMetaDir(dist: *const DistributedContext, allocator: Allocator, bucket: []
 fn handleDistributedDelete(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, key: []const u8) !void {
     const dist = ctx.distributed.?;
     dist.meta_index.delete(allocator, bucket, key);
+    deleteDistAttrs(allocator, dist, bucket, key);
     propagateObjectMeta(ctx, allocator, bucket, key);
+    propagateObjectAttrs(ctx, allocator, bucket, key);
     res.noContent();
 }
 
@@ -4451,7 +5495,13 @@ fn handleDistributedHead(ctx: *const S3Context, allocator: Allocator, req: *Requ
         sendError(res, 500, "InternalError", "Format failed");
         return;
     };
-    const etag = std.fmt.allocPrint(allocator, "\"{x}\"", .{meta.hash}) catch {
+    // ETag is the MD5 of the content, matching standalone mode. HEAD loads
+    // the bytes (local CAS/inline, or peer fetch) to hash them.
+    const head_data = readSourceBytes(ctx, allocator, bucket, key) catch {
+        sendError(res, 404, "NoSuchKey", "Content not available from any provider");
+        return;
+    };
+    const etag = md5Etag(allocator, head_data) catch {
         sendError(res, 500, "InternalError", "ETag failed");
         return;
     };
