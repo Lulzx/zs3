@@ -2225,6 +2225,48 @@ fn parseRequestFromBuf(allocator: Allocator, data: []const u8, stream: net.Strea
 }
 
 fn hasAuth(data: []const u8) bool {
+    if (hasAuthHeader(data)) return true;
+    // Query-string SigV4 (presigned URLs): the request line carries
+    // X-Amz-Signature=... instead of an Authorization header.
+    return hasQueryAuth(data);
+}
+
+/// Requests servable without credentials: the /_zs3/ subtree (peer protocol,
+/// console, metrics), GET /metrics, and CORS preflights.
+fn isPublicRequest(data: []const u8) bool {
+    if (std.mem.indexOf(u8, data, "/_zs3/") != null) return true;
+    const line_end = std.mem.indexOf(u8, data, "\r\n") orelse return false;
+    const line = data[0..line_end];
+    var parts = std.mem.splitScalar(u8, line, ' ');
+    const method = parts.next() orelse return false;
+    const target = parts.next() orelse return false;
+    if (std.mem.eql(u8, method, "OPTIONS")) return true;
+    var path = target;
+    if (std.mem.indexOfScalar(u8, path, '?')) |q| path = path[0..q];
+    return std.mem.eql(u8, path, "/metrics");
+}
+
+fn hasQueryAuth(data: []const u8) bool {
+    // Scan only the request line (up to the first CRLF) for the presigned marker.
+    const line_end = std.mem.indexOf(u8, data, "\r\n") orelse data.len;
+    const line = data[0..line_end];
+    const needle = "X-Amz-Signature=";
+    if (line.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= line.len) : (i += 1) {
+        var match = true;
+        for (needle, 0..) |c, j| {
+            if (std.ascii.toLower(line[i + j]) != std.ascii.toLower(c)) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+fn hasAuthHeader(data: []const u8) bool {
     if (data.len < 14) return false;
     const needle = "authorization:";
     const end = data.len - 13;
@@ -2575,6 +2617,107 @@ pub const SigV4 = struct {
         return acl_ctx;
     }
 
+    /// Verify query-string SigV4 (presigned URLs). The signature covers the
+    /// method, path, and all X-Amz-* query params except X-Amz-Signature
+    /// itself, with payload UNSIGNED-PAYLOAD. Expiry (X-Amz-Date + X-Amz-Expires)
+    /// is enforced against the server clock.
+    fn verifyPresigned(ctx: *const S3Context, req: *const Request, allocator: Allocator) ACLCtx {
+        var acl_ctx = ACLCtx{
+            .authenticated = false,
+            .role = null,
+        };
+        const signature = getQueryParam(req.query, "X-Amz-Signature") orelse return acl_ctx;
+        const algorithm = getQueryParam(req.query, "X-Amz-Algorithm") orelse return acl_ctx;
+        if (!std.mem.eql(u8, algorithm, "AWS4-HMAC-SHA256")) return acl_ctx;
+        const credential_scope = getQueryParam(req.query, "X-Amz-Credential") orelse return acl_ctx;
+        const amz_date = getQueryParam(req.query, "X-Amz-Date") orelse return acl_ctx;
+        const expires_str = getQueryParam(req.query, "X-Amz-Expires") orelse return acl_ctx;
+        const signed_headers = getQueryParam(req.query, "X-Amz-SignedHeaders") orelse return acl_ctx;
+
+        // Credential is URL-encoded (slashes become %2F); decode before splitting.
+        const cred_decoded = uriDecode(allocator, credential_scope) catch return acl_ctx;
+        defer allocator.free(cred_decoded);
+        var cred_iter = std.mem.splitScalar(u8, cred_decoded, '/');
+        const access_key = cred_iter.next() orelse return acl_ctx;
+        const date_stamp = cred_iter.next() orelse return acl_ctx;
+        const region = cred_iter.next() orelse return acl_ctx;
+        const service = cred_iter.next() orelse return acl_ctx;
+
+        // Enforce expiry: request time + expires must still be in the future.
+        const expires_secs = std.fmt.parseInt(i64, expires_str, 10) catch return acl_ctx;
+        const req_time = parseAmzDate(amz_date) orelse return acl_ctx;
+        const now = std.Io.Clock.real.now(app_io).toSeconds();
+        if (now > req_time + expires_secs) return acl_ctx;
+
+        const credential = ctx.access_control_map.get(access_key) orelse return acl_ctx;
+
+        // Canonical query without the signature itself.
+        const query_no_sig = stripQueryParam(allocator, req.query, "X-Amz-Signature") catch return acl_ctx;
+        defer allocator.free(query_no_sig);
+        const sorted_query = sortQueryString(allocator, query_no_sig) catch return acl_ctx;
+        defer allocator.free(sorted_query);
+
+        const canonical = buildCanonicalRequestWithQuery(allocator, req, signed_headers, "UNSIGNED-PAYLOAD", sorted_query) catch return acl_ctx;
+        defer allocator.free(canonical);
+
+        const string_to_sign = buildStringToSign(allocator, amz_date, date_stamp, region, service, canonical) catch return acl_ctx;
+        defer allocator.free(string_to_sign);
+
+        const calculated_sig = calculateSignature(allocator, credential.secret_key, date_stamp, region, service, string_to_sign) catch return acl_ctx;
+        defer allocator.free(calculated_sig);
+
+        if (std.mem.eql(u8, calculated_sig, signature)) {
+            acl_ctx.authenticated = true;
+            acl_ctx.role = credential.role;
+        }
+        return acl_ctx;
+    }
+
+    /// Parse an X-Amz-Date like 20250102T150405Z to Unix seconds (UTC).
+    fn parseAmzDate(s: []const u8) ?i64 {
+        if (s.len < 16) return null;
+        // Basic format YYYYMMDDTHHMMSSZ
+        const year = std.fmt.parseInt(i32, s[0..4], 10) catch return null;
+        const month = std.fmt.parseInt(u8, s[4..6], 10) catch return null;
+        const day = std.fmt.parseInt(u8, s[6..8], 10) catch return null;
+        if (s[8] != 'T') return null;
+        const hour = std.fmt.parseInt(u8, s[9..11], 10) catch return null;
+        const min = std.fmt.parseInt(u8, s[11..13], 10) catch return null;
+        const sec = std.fmt.parseInt(u8, s[13..15], 10) catch return null;
+        if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or min > 59 or sec > 60) return null;
+        const days = daysFromCivil(year, month, day);
+        return days * 86400 + @as(i64, hour) * 3600 + @as(i64, min) * 60 + sec;
+    }
+
+    fn daysFromCivil(y: i32, m: u8, d: u8) i64 {
+        const yy: i64 = if (m <= 2) @as(i64, y) - 1 else y;
+        const era: i64 = @divFloor(if (yy >= 0) yy else yy - 399, 400);
+        const yoe: i64 = yy - era * 400;
+        const mp: i64 = @as(i64, m) + (if (m > 2) @as(i64, -3) else @as(i64, 9));
+        const doy: i64 = @divFloor(153 * mp + 2, 5) + @as(i64, d) - 1;
+        const doe: i64 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+        return era * 146097 + doe - 719468;
+    }
+
+    /// Return the query string with one parameter removed (used to drop
+    /// X-Amz-Signature before canonicalizing a presigned request).
+    fn stripQueryParam(allocator: Allocator, query: []const u8, key: []const u8) ![]const u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        var first = true;
+        var iter = std.mem.splitScalar(u8, query, '&');
+        while (iter.next()) |pair| {
+            if (pair.len == 0) continue;
+            const eq = std.mem.indexOfScalar(u8, pair, '=');
+            const name = if (eq) |e| pair[0..e] else pair;
+            if (std.mem.eql(u8, name, key)) continue;
+            if (!first) try out.append(allocator, '&');
+            first = false;
+            try out.appendSlice(allocator, pair);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
     pub fn parseAuthHeader(header: []const u8) ?ParsedAuth {
         if (!std.mem.startsWith(u8, header, "AWS4-HMAC-SHA256 ")) return null;
 
@@ -2627,6 +2770,48 @@ pub const SigV4 = struct {
         while (header_iter.next()) |header_name| {
             const value = req.header(header_name) orelse "";
             try result.appendSlice(allocator, header_name);
+            try result.append(allocator, ':');
+            try result.appendSlice(allocator, std.mem.trim(u8, value, " \t"));
+            try result.append(allocator, '\n');
+        }
+        try result.append(allocator, '\n');
+
+        try result.appendSlice(allocator, signed_headers);
+        try result.append(allocator, '\n');
+
+        try result.appendSlice(allocator, payload_hash);
+
+        return result.toOwnedSlice(allocator);
+    }
+
+    fn buildCanonicalRequestWithQuery(
+        allocator: Allocator,
+        req: *const Request,
+        signed_headers: []const u8,
+        payload_hash: []const u8,
+        sorted_query: []const u8,
+    ) ![]const u8 {
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer result.deinit(allocator);
+
+        try result.appendSlice(allocator, req.method);
+        try result.append(allocator, '\n');
+
+        const canonical_path = if (req.path.len == 0) "/" else req.path;
+        try result.appendSlice(allocator, canonical_path);
+        try result.append(allocator, '\n');
+
+        try result.appendSlice(allocator, sorted_query);
+        try result.append(allocator, '\n');
+
+        // Signed headers are lowercase per SigV4; presigned URLs sign `host`
+        // at minimum. Values come from the live request headers.
+        var header_iter = std.mem.splitScalar(u8, signed_headers, ';');
+        while (header_iter.next()) |header_name| {
+            var lower_buf: [128]u8 = undefined;
+            const lower = if (header_name.len <= lower_buf.len) std.ascii.lowerString(&lower_buf, header_name) else header_name;
+            const value = req.header(lower) orelse req.header(header_name) orelse "";
+            try result.appendSlice(allocator, lower);
             try result.append(allocator, ':');
             try result.appendSlice(allocator, std.mem.trim(u8, value, " \t"));
             try result.append(allocator, '\n');
