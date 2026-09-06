@@ -1449,6 +1449,7 @@ const DistributedContext = struct {
 pub fn main(init: std.process.Init) !void {
     app_io = init.io;
     const allocator = init.gpa;
+    proc_env = init.environ_map;
 
     // Parse CLI arguments
     var distributed_enabled = false;
@@ -1463,7 +1464,40 @@ pub fn main(init: std.process.Init) !void {
     var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.skip(); // Skip program name
+
+    // Subcommands run without starting the server: snapshot / clone / snapshots.
+    // Peek at the first argument before option parsing.
+    var argv_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv_list.deinit(allocator);
     while (args.next()) |arg| {
+        argv_list.append(allocator, arg) catch {
+            return error.OutOfMemory;
+        };
+    }
+    if (argv_list.items.len > 0) {
+        const sub = argv_list.items[0];
+        if (std.mem.eql(u8, sub, "snapshot")) {
+            runSnapshot(allocator, argv_list.items[1..]) catch |e| {
+                if (e != error.BadArgs) std.debug.print("snapshot failed: {t}\n", .{e});
+                std.process.exit(1);
+            };
+            return;
+        } else if (std.mem.eql(u8, sub, "clone")) {
+            runClone(allocator, argv_list.items[1..]) catch |e| {
+                if (e != error.BadArgs) std.debug.print("clone failed: {t}\n", .{e});
+                std.process.exit(1);
+            };
+            return;
+        } else if (std.mem.eql(u8, sub, "snapshots")) {
+            runSnapshotsList(allocator, argv_list.items[1..]) catch |e| {
+                if (e != error.BadArgs) std.debug.print("snapshots failed: {t}\n", .{e});
+                std.process.exit(1);
+            };
+            return;
+        }
+    }
+
+    for (argv_list.items) |arg| {
         if (std.mem.eql(u8, arg, "--distributed") or std.mem.eql(u8, arg, "-d")) {
             distributed_enabled = true;
         } else if (std.mem.startsWith(u8, arg, "--data-dir=")) {
@@ -1522,13 +1556,35 @@ pub fn main(init: std.process.Init) !void {
             \\  --acl={s}
             \\      The credentials for access
             \\
+            \\  --fsync / --no-fsync, --fast
+            \\      fsync file contents on acknowledged writes (default: on).
+            \\      --fast disables fsync for benchmarks; acknowledged writes may
+            \\      then be lost on crash or power loss.
+            \\
             \\  --help, -h
             \\      Show this help
+            \\
+            \\Snapshots:
+            \\  snapshot  chunk a bucket into content-addressed chunks and store
+            \\            a manifest at .zs3snapshots/<name>.json (only missing
+            \\            chunks are uploaded)
+            \\  clone     fetch a snapshot manifest and materialize it into DIR,
+            \\            downloading only chunks the local cache lacks
+            \\            (default cache: DIR/.zs3/blobs)
+            \\  snapshots list snapshot names in a bucket
+            \\
+            \\  Snapshot flags: --endpoint=URL (or ZS3_ENDPOINT), --bucket=NAME,
+            \\    --name=NAME, --dest=DIR, --cache=DIR, --access-key=K
+            \\    (or AWS_ACCESS_KEY_ID), --secret-key=S (or AWS_SECRET_ACCESS_KEY),
+            \\    --region=R (default us-east-1), --chunk-bytes=N (default 4MB)
             \\
             \\Examples:
             \\  zs3                                    # Standalone mode
             \\  zs3 --distributed                      # Distributed, auto-discover via mDNS
             \\  zs3 -d --bootstrap=10.0.0.1:9000       # Distributed with bootstrap peer
+            \\  zs3 --fast                             # Benchmark mode (no fsync)
+            \\  zs3 snapshot --bucket=artifacts --name=v1
+            \\  zs3 clone --bucket=artifacts --name=v1 --dest=./v1
             \\
         , .{ GOSSIP_INTERVAL_MS, port, data_dir, raw_acl_list });
         return;
@@ -4259,7 +4315,14 @@ fn collectKeys(allocator: Allocator, base_path: []const u8, current_prefix: []co
 
     var iter = dir.iterate();
     while (try iter.next(app_io)) |entry| {
-        if (entry.name[0] == '.') continue;
+        // The snapshot tree stays hidden unless this listing deliberately
+        // targets it via prefix=".zs3snapshots/". Everything else lists —
+        // including dot-prefixed user keys and .folder_marker files (which
+        // translate back to trailing-slash keys below) — except attribute
+        // sidecars, which are implementation detail, not S3 objects.
+        if (entry.kind == .directory and std.mem.eql(u8, entry.name, ".zs3snapshots") and
+            !std.mem.startsWith(u8, filter_prefix, SNAP_PREFIX)) continue;
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zs3attrs")) continue;
 
         const full_key = if (current_prefix.len > 0)
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ current_prefix, entry.name })
@@ -5836,7 +5899,8 @@ fn collectMetaKeys(allocator: Allocator, base_path: []const u8, current_prefix: 
 
     var iter = dir.iterate();
     while (try iter.next(app_io)) |entry| {
-        if (entry.name[0] == '.') continue;
+        // Same snapshot-prefix carve-out as standalone collectKeys.
+        if (entry.name[0] == '.' and !std.mem.startsWith(u8, filter_prefix, SNAP_PREFIX)) continue;
 
         const full_name = if (current_prefix.len > 0)
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ current_prefix, entry.name })
@@ -6009,4 +6073,841 @@ fn sendError(res: *Response, status: u16, code: []const u8, message: []const u8)
     res.setHeader("Content-Type", "application/xml");
 
     res.body = std.fmt.allocPrint(res.allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{s}</Code><Message>{s}</Message></Error>", .{ code, message }) catch return;
+}
+
+// ============================================================================
+// SNAPSHOTS + CLONE ("git clone for object storage")
+// ============================================================================
+// A snapshot is a manifest (stored as a regular object under
+// `.zs3snapshots/<name>.json`) mapping bucket/key names to immutable BLAKE3
+// content hashes plus the chunk list each object is split into. Chunks are
+// stored as objects under `.zs3snapshots/chunks/<hex>` and content-addressed,
+// so a second snapshot only PUTs chunks the bucket lacks, and a clone only
+// GETs chunks the local cache lacks. Re-cloning a warm cache transfers only
+// the manifest (bytes, not megabytes).
+//
+// Manifest JSON (generated and consumed here; keys are JSON-escaped):
+// {"version":1,"bucket":"b","name":"n","created":169...,"chunk_bytes":4194304,
+//  "objects":[{"key":"...","size":N,"hash":"<blake3-32-hex>","chunks":["..."]}]}
+
+const SNAP_PREFIX = ".zs3snapshots/";
+const SNAP_CHUNK_PREFIX = ".zs3snapshots/chunks/";
+const DEFAULT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+const SnapArgs = struct {
+    endpoint: []const u8 = "http://127.0.0.1:9000",
+    bucket: []const u8 = "",
+    name: []const u8 = "",
+    dest: []const u8 = "",
+    cache: []const u8 = "",
+    access: []const u8 = "",
+    secret: []const u8 = "",
+    region: []const u8 = "us-east-1",
+    chunk_bytes: usize = DEFAULT_CHUNK_BYTES,
+};
+
+// Process environment for snapshot/clone credential lookup (no libc getenv,
+// so the static musl build stays pure). Set once in main().
+var proc_env: ?*const std.process.Environ.Map = null;
+
+fn getenvStr(name: []const u8) ?[]const u8 {
+    const m = proc_env orelse return null;
+    return m.get(name);
+}
+
+fn parseSnapArgs(allocator: Allocator, args: []const []const u8) !SnapArgs {
+    var out = SnapArgs{};
+    _ = allocator;
+    // Env fallbacks so `zs3 clone` works with standard S3 env vars.
+    if (getenvStr("ZS3_ENDPOINT")) |v| out.endpoint = v;
+    if (getenvStr("AWS_ACCESS_KEY_ID")) |v| out.access = v;
+    if (getenvStr("AWS_SECRET_ACCESS_KEY")) |v| out.secret = v;
+    if (getenvStr("AWS_DEFAULT_REGION")) |v| out.region = v;
+    for (args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--endpoint=")) {
+            out.endpoint = arg[11..];
+        } else if (std.mem.startsWith(u8, arg, "--bucket=")) {
+            out.bucket = arg[9..];
+        } else if (std.mem.startsWith(u8, arg, "--name=")) {
+            out.name = arg[7..];
+        } else if (std.mem.startsWith(u8, arg, "--dest=")) {
+            out.dest = arg[7..];
+        } else if (std.mem.startsWith(u8, arg, "--cache=")) {
+            out.cache = arg[8..];
+        } else if (std.mem.startsWith(u8, arg, "--access-key=")) {
+            out.access = arg[13..];
+        } else if (std.mem.startsWith(u8, arg, "--secret-key=")) {
+            out.secret = arg[13..];
+        } else if (std.mem.startsWith(u8, arg, "--region=")) {
+            out.region = arg[9..];
+        } else if (std.mem.startsWith(u8, arg, "--chunk-bytes=")) {
+            out.chunk_bytes = std.fmt.parseInt(usize, arg[14..], 10) catch DEFAULT_CHUNK_BYTES;
+        } else {
+            std.debug.print("Unknown snapshot option: {s}\n", .{arg});
+            return error.BadArgs;
+        }
+    }
+    if (out.access.len == 0) out.access = "minioadmin";
+    if (out.secret.len == 0) out.secret = "minioadmin";
+    return out;
+}
+
+fn blake3Hex32(data: []const u8, out: *[64]u8) void {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(data);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    bytesToHex(&digest, out);
+}
+
+fn jsonEscape(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
+    try out.append(allocator, '"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => {
+                if (c < 0x20) {
+                    var buf: [6]u8 = undefined;
+                    const text = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch continue;
+                    try out.appendSlice(allocator, text);
+                } else {
+                    try out.append(allocator, c);
+                }
+            },
+        }
+    }
+    try out.append(allocator, '"');
+}
+
+fn xmlUnescape(allocator: Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '&') {
+            if (std.mem.startsWith(u8, s[i..], "&lt;")) {
+                try out.append(allocator, '<');
+                i += 4;
+            } else if (std.mem.startsWith(u8, s[i..], "&gt;")) {
+                try out.append(allocator, '>');
+                i += 4;
+            } else if (std.mem.startsWith(u8, s[i..], "&amp;")) {
+                try out.append(allocator, '&');
+                i += 5;
+            } else if (std.mem.startsWith(u8, s[i..], "&quot;")) {
+                try out.append(allocator, '"');
+                i += 6;
+            } else if (std.mem.startsWith(u8, s[i..], "&apos;")) {
+                try out.append(allocator, '\'');
+                i += 6;
+            } else {
+                try out.append(allocator, s[i]);
+                i += 1;
+            }
+        } else {
+            try out.append(allocator, s[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Minimal S3 client (header SigV4) for snapshot/clone. HTTP only; put a
+/// proxy in front for TLS, same as the server side.
+const S3Client = struct {
+    allocator: Allocator,
+    host: []const u8,
+    port: u16,
+    bucket: []const u8,
+    region: []const u8,
+    access: []const u8,
+    secret: []const u8,
+
+    const Resp = struct {
+        status: u16,
+        body: []u8,
+    };
+
+    fn connect(self: *const S3Client) !net.Stream {
+        if (net.IpAddress.parseLiteral(self.host)) |addr| {
+            var a = addr;
+            a.setPort(self.port);
+            return a.connect(app_io, .{ .mode = .stream }) catch error.ConnectionFailed;
+        } else |_| {}
+        const hn = net.HostName.init(self.host) catch return error.BadHost;
+        var lookup_buffer: [8]net.HostName.LookupResult = undefined;
+        var lookup_queue: std.Io.Queue(net.HostName.LookupResult) = .init(&lookup_buffer);
+        hn.lookup(app_io, &lookup_queue, .{ .port = self.port }) catch return error.DnsFailed;
+        while (lookup_queue.getOne(app_io)) |result| switch (result) {
+            .address => |addr| {
+                return addr.connect(app_io, .{ .mode = .stream }) catch continue;
+            },
+            .canonical_name => continue,
+        } else |_| {}
+        return error.ConnectionFailed;
+    }
+
+    const QueryPair = struct { name: []const u8, value: []const u8 };
+
+    fn request(self: *const S3Client, method: []const u8, key: []const u8, query: []const QueryPair, body: []const u8, content_type: ?[]const u8) !Resp {
+        // Path: /bucket[/key-segments...], each segment URI-encoded.
+        var path_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer path_buf.deinit(self.allocator);
+        try path_buf.append(self.allocator, '/');
+        try path_buf.appendSlice(self.allocator, self.bucket);
+        if (key.len > 0) {
+            try path_buf.append(self.allocator, '/');
+            var seg_iter = std.mem.splitScalar(u8, key, '/');
+            var first = true;
+            while (seg_iter.next()) |seg| {
+                if (!first) try path_buf.append(self.allocator, '/');
+                first = false;
+                const enc_seg = try uriEncode(self.allocator, seg, true);
+                defer self.allocator.free(enc_seg);
+                try path_buf.appendSlice(self.allocator, enc_seg);
+            }
+        }
+        const path = path_buf.items;
+
+        // Canonical query: encoded name=value pairs, sorted by name.
+        var qbuf: std.ArrayListUnmanaged(u8) = .empty;
+        defer qbuf.deinit(self.allocator);
+        var order: [8]usize = undefined;
+        for (query, 0..) |_, i| order[i] = i;
+        std.mem.sort(usize, order[0..query.len], query, struct {
+            fn lessThan(q: []const QueryPair, a: usize, b: usize) bool {
+                return std.mem.order(u8, q[a].name, q[b].name) == .lt;
+            }
+        }.lessThan);
+        for (order[0..query.len], 0..) |qi, i| {
+            if (i > 0) try qbuf.append(self.allocator, '&');
+            const en = try uriEncode(self.allocator, query[qi].name, true);
+            defer self.allocator.free(en);
+            const ev = try uriEncode(self.allocator, query[qi].value, true);
+            defer self.allocator.free(ev);
+            try qbuf.appendSlice(self.allocator, en);
+            try qbuf.append(self.allocator, '=');
+            try qbuf.appendSlice(self.allocator, ev);
+        }
+
+        const now_secs = std.Io.Clock.real.now(app_io).toSeconds();
+        var dt_buf: [16]u8 = undefined;
+        formatAmzDate(&dt_buf, now_secs);
+        const amz_date = dt_buf[0..16];
+        const date_stamp = dt_buf[0..8];
+
+        const payload_hash_bin = SigV4.hash(body);
+        var payload_hex: [64]u8 = undefined;
+        _ = std.fmt.bufPrint(&payload_hex, "{x}", .{payload_hash_bin}) catch unreachable;
+
+        // Canonical request (must match the server's builder exactly).
+        var canon: std.ArrayListUnmanaged(u8) = .empty;
+        defer canon.deinit(self.allocator);
+        try canon.appendSlice(self.allocator, method);
+        try canon.append(self.allocator, '\n');
+        try canon.appendSlice(self.allocator, path);
+        try canon.append(self.allocator, '\n');
+        try canon.appendSlice(self.allocator, qbuf.items);
+        try canon.append(self.allocator, '\n');
+        try canon.appendSlice(self.allocator, "host:");
+        try canon.appendSlice(self.allocator, self.host);
+        if (self.port != 80) {
+            const ps = try std.fmt.allocPrint(self.allocator, ":{d}", .{self.port});
+            defer self.allocator.free(ps);
+            try canon.appendSlice(self.allocator, ps);
+        }
+        try canon.append(self.allocator, '\n');
+        try canon.appendSlice(self.allocator, "x-amz-content-sha256:");
+        try canon.appendSlice(self.allocator, &payload_hex);
+        try canon.append(self.allocator, '\n');
+        try canon.appendSlice(self.allocator, "x-amz-date:");
+        try canon.appendSlice(self.allocator, amz_date);
+        try canon.append(self.allocator, '\n');
+        try canon.append(self.allocator, '\n');
+        try canon.appendSlice(self.allocator, "host;x-amz-content-sha256;x-amz-date");
+        try canon.append(self.allocator, '\n');
+        try canon.appendSlice(self.allocator, &payload_hex);
+
+        const sts = try SigV4.buildStringToSign(self.allocator, amz_date, date_stamp, self.region, "s3", canon.items);
+        defer self.allocator.free(sts);
+        const sig = try SigV4.calculateSignature(self.allocator, self.secret, date_stamp, self.region, "s3", sts);
+        defer self.allocator.free(sig);
+
+        var req_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer req_buf.deinit(self.allocator);
+        const req_line = try std.fmt.allocPrint(self.allocator, "{s} {s}{s}{s} HTTP/1.1\r\n", .{
+            method, path, if (qbuf.items.len > 0) "?" else "", qbuf.items,
+        });
+        defer self.allocator.free(req_line);
+        try req_buf.appendSlice(self.allocator, req_line);
+        const host_hdr = if (self.port != 80)
+            try std.fmt.allocPrint(self.allocator, "Host: {s}:{d}\r\n", .{ self.host, self.port })
+        else
+            try std.fmt.allocPrint(self.allocator, "Host: {s}\r\n", .{self.host});
+        defer self.allocator.free(host_hdr);
+        try req_buf.appendSlice(self.allocator, host_hdr);
+        const auth_hdr = try std.fmt.allocPrint(self.allocator, "Authorization: AWS4-HMAC-SHA256 Credential={s}/{s}/{s}/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={s}\r\n", .{
+            self.access, date_stamp, self.region, sig,
+        });
+        defer self.allocator.free(auth_hdr);
+        try req_buf.appendSlice(self.allocator, auth_hdr);
+        const date_hdr = try std.fmt.allocPrint(self.allocator, "x-amz-date: {s}\r\nx-amz-content-sha256: {s}\r\n", .{ amz_date, payload_hex });
+        defer self.allocator.free(date_hdr);
+        try req_buf.appendSlice(self.allocator, date_hdr);
+        if (content_type) |ct| {
+            const ct_hdr = try std.fmt.allocPrint(self.allocator, "Content-Type: {s}\r\n", .{ct});
+            defer self.allocator.free(ct_hdr);
+            try req_buf.appendSlice(self.allocator, ct_hdr);
+        }
+        const cl_hdr = try std.fmt.allocPrint(self.allocator, "Content-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len});
+        defer self.allocator.free(cl_hdr);
+        try req_buf.appendSlice(self.allocator, cl_hdr);
+        try req_buf.appendSlice(self.allocator, body);
+
+        var stream = try self.connect();
+        defer stream.close(app_io);
+        try streamWriteAll(stream, req_buf.items);
+
+        // Read headers, then exactly Content-Length (server always sends it).
+        var resp: std.ArrayListUnmanaged(u8) = .empty;
+        defer resp.deinit(self.allocator);
+        var chunk: [32 * 1024]u8 = undefined;
+        var header_len: ?usize = null;
+        var content_len: usize = 0;
+        var status: u16 = 0;
+        while (header_len == null) {
+            const n = streamRead(stream, &chunk) catch break;
+            if (n == 0) break;
+            try resp.appendSlice(self.allocator, chunk[0..n]);
+            if (std.mem.indexOf(u8, resp.items, "\r\n\r\n")) |he| {
+                header_len = he + 4;
+                // Status line: HTTP/1.1 200 OK
+                var line_iter = std.mem.splitScalar(u8, resp.items[0..he], '\n');
+                if (line_iter.next()) |status_line| {
+                    var sp = std.mem.splitScalar(u8, std.mem.trim(u8, status_line, " \t\r"), ' ');
+                    _ = sp.next();
+                    if (sp.next()) |code| status = std.fmt.parseInt(u16, code, 10) catch 0;
+                }
+                // Content-Length scan (case-insensitive).
+                var h_iter = std.mem.splitSequence(u8, resp.items[0..he], "\r\n");
+                while (h_iter.next()) |hline| {
+                    if (hline.len > 15 and std.ascii.eqlIgnoreCase(hline[0..15], "content-length:")) {
+                        content_len = std.fmt.parseInt(usize, std.mem.trim(u8, hline[15..], " \t"), 10) catch 0;
+                    }
+                }
+            } else if (resp.items.len > MAX_HEADER_SIZE + 1024) {
+                return error.ResponseTooLarge;
+            }
+        }
+        const hl = header_len orelse return error.InvalidResponse;
+        while (resp.items.len - hl < content_len) {
+            const n = streamRead(stream, &chunk) catch break;
+            if (n == 0) break;
+            try resp.appendSlice(self.allocator, chunk[0..n]);
+            if (resp.items.len > MAX_BODY_SIZE) return error.ResponseTooLarge;
+        }
+        const out_body = try self.allocator.dupe(u8, resp.items[hl..@min(hl + content_len, resp.items.len)]);
+        return .{ .status = status, .body = out_body };
+    }
+
+    fn get(self: *const S3Client, key: []const u8) ![]u8 {
+        const r = try self.request("GET", key, &.{}, "", null);
+        defer self.allocator.free(r.body);
+        if (r.status != 200) return error.RequestFailed;
+        return self.allocator.dupe(u8, r.body);
+    }
+
+    fn put(self: *const S3Client, key: []const u8, body: []const u8, content_type: ?[]const u8) !void {
+        const r = try self.request("PUT", key, &.{}, body, content_type);
+        defer self.allocator.free(r.body);
+        if (r.status != 200) return error.RequestFailed;
+    }
+
+    fn head(self: *const S3Client, key: []const u8) bool {
+        const r = self.request("HEAD", key, &.{}, "", null) catch return false;
+        defer self.allocator.free(r.body);
+        return r.status == 200;
+    }
+};
+
+/// Format Unix seconds as X-Amz-Date (YYYYMMDDTHHMMSSZ).
+fn formatAmzDate(buf: *[16]u8, timestamp: i64) void {
+    const secs: u64 = if (timestamp > 0) @intCast(timestamp) else 0;
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const day = es.getEpochDay();
+    const yd = day.calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    _ = std.fmt.bufPrint(buf, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
+        yd.year,
+        @intFromEnum(md.month),
+        md.day_index + 1,
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+        ds.getSecondsIntoMinute(),
+    }) catch unreachable;
+}
+
+fn splitEndpoint(endpoint: []const u8) !struct { host: []const u8, port: u16 } {
+    var rest = endpoint;
+    if (std.mem.startsWith(u8, rest, "http://")) {
+        rest = rest[7..];
+    } else if (std.mem.startsWith(u8, rest, "https://")) {
+        return error.TlsNotSupported;
+    } else {
+        return error.BadEndpoint;
+    }
+    // Strip any trailing path.
+    if (std.mem.indexOfScalar(u8, rest, '/')) |s| rest = rest[0..s];
+    if (std.mem.lastIndexOfScalar(u8, rest, ':')) |c| {
+        const port = std.fmt.parseInt(u16, rest[c + 1 ..], 10) catch return error.BadEndpoint;
+        return .{ .host = rest[0..c], .port = port };
+    }
+    return .{ .host = rest, .port = 80 };
+}
+
+/// List all keys under a prefix (handles ListObjectsV2 pagination).
+fn s3ListAll(client: *const S3Client, allocator: Allocator, prefix: []const u8) !std.ArrayListUnmanaged([]const u8) {
+    var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (keys.items) |k| allocator.free(k);
+        keys.deinit(allocator);
+    }
+    var token: ?[]const u8 = null;
+    defer if (token) |t| allocator.free(t);
+    while (true) {
+        var qbuf: [3]S3Client.QueryPair = undefined;
+        var qn: usize = 0;
+        qbuf[qn] = .{ .name = "list-type", .value = "2" };
+        qn += 1;
+        qbuf[qn] = .{ .name = "prefix", .value = prefix };
+        qn += 1;
+        if (token) |t| {
+            qbuf[qn] = .{ .name = "continuation-token", .value = t };
+            qn += 1;
+        }
+        const r = try client.request("GET", "", qbuf[0..qn], "", null);
+        defer allocator.free(r.body);
+        if (r.status != 200) return error.RequestFailed;
+
+        var search: []const u8 = r.body;
+        while (std.mem.indexOf(u8, search, "<Key>")) |s| {
+            const ks = s + 5;
+            const e = std.mem.indexOf(u8, search[ks..], "</Key>") orelse break;
+            const raw = search[ks .. ks + e];
+            const unesc = try xmlUnescape(allocator, raw);
+            try keys.append(allocator, unesc);
+            search = search[ks + e + 6 ..];
+        }
+        const trunc = std.mem.indexOf(u8, r.body, "<IsTruncated>true</IsTruncated>") != null;
+        if (!trunc) break;
+        const ns = std.mem.indexOf(u8, r.body, "<NextContinuationToken>") orelse break;
+        const nks = ns + 23;
+        const ne = std.mem.indexOf(u8, r.body[nks..], "</NextContinuationToken>") orelse break;
+        if (token) |t| allocator.free(t);
+        token = try xmlUnescape(allocator, r.body[nks .. nks + ne]);
+    }
+    return keys;
+}
+
+fn runSnapshot(allocator: Allocator, args: []const []const u8) !void {
+    const sa = try parseSnapArgs(allocator, args);
+    if (sa.bucket.len == 0 or sa.name.len == 0) {
+        std.debug.print("Usage: zs3 snapshot --bucket=BUCKET --name=NAME [--endpoint=URL] [--chunk-bytes=N]\n", .{});
+        return error.BadArgs;
+    }
+    if (std.mem.indexOf(u8, sa.name, "/") != null) {
+        std.debug.print("Snapshot name must not contain '/'\n", .{});
+        return error.BadArgs;
+    }
+    const ep = try splitEndpoint(sa.endpoint);
+    var client = S3Client{
+        .allocator = allocator,
+        .host = ep.host,
+        .port = ep.port,
+        .bucket = sa.bucket,
+        .region = sa.region,
+        .access = sa.access,
+        .secret = sa.secret,
+    };
+
+    var keys = try s3ListAll(&client, allocator, "");
+    defer {
+        for (keys.items) |k| allocator.free(k);
+        keys.deinit(allocator);
+    }
+
+    var manifest: std.ArrayListUnmanaged(u8) = .empty;
+    defer manifest.deinit(allocator);
+    try manifest.appendSlice(allocator, "{\"version\":1,\"bucket\":");
+    try jsonEscape(allocator, &manifest, sa.bucket);
+    try manifest.appendSlice(allocator, ",\"name\":");
+    try jsonEscape(allocator, &manifest, sa.name);
+    const now = std.Io.Clock.real.now(app_io).toSeconds();
+    const created = try std.fmt.allocPrint(allocator, ",\"created\":{d},\"chunk_bytes\":{d},\"objects\":[", .{ now, sa.chunk_bytes });
+    defer allocator.free(created);
+    try manifest.appendSlice(allocator, created);
+
+    var objects: usize = 0;
+    var total_bytes: usize = 0;
+    var uploaded_chunks: usize = 0;
+    var reused_chunks: usize = 0;
+    var first = true;
+    for (keys.items) |key| {
+        if (std.mem.startsWith(u8, key, SNAP_PREFIX)) continue;
+        const data = client.get(key) catch |e| {
+            std.debug.print("skip {s}: GET failed ({t})\n", .{ key, e });
+            continue;
+        };
+        defer allocator.free(data);
+
+        var whole_hex: [64]u8 = undefined;
+        blake3Hex32(data, &whole_hex);
+
+        // Chunk, dedup-upload, collect hashes.
+        var chunk_hexes: std.ArrayListUnmanaged([64]u8) = .empty;
+        defer chunk_hexes.deinit(allocator);
+        var off: usize = 0;
+        if (data.len == 0) {
+            // Empty objects have no chunks; the manifest entry alone suffices.
+        }
+        while (off < data.len) {
+            const end = @min(off + sa.chunk_bytes, data.len);
+            var chex: [64]u8 = undefined;
+            blake3Hex32(data[off..end], &chex);
+            try chunk_hexes.append(allocator, chex);
+            const chunk_key = try std.fmt.allocPrint(allocator, "{s}{s}", .{ SNAP_CHUNK_PREFIX, chex });
+            defer allocator.free(chunk_key);
+            if (client.head(chunk_key)) {
+                reused_chunks += 1;
+            } else {
+                client.put(chunk_key, data[off..end], "application/octet-stream") catch |e| {
+                    std.debug.print("PUT chunk failed ({t})\n", .{e});
+                    return e;
+                };
+                uploaded_chunks += 1;
+            }
+            off = end;
+        }
+
+        if (!first) try manifest.append(allocator, ',');
+        first = false;
+        try manifest.appendSlice(allocator, "{\"key\":");
+        try jsonEscape(allocator, &manifest, key);
+        const meta = try std.fmt.allocPrint(allocator, ",\"size\":{d},\"hash\":\"{s}\",\"chunks\":[", .{ data.len, whole_hex });
+        defer allocator.free(meta);
+        try manifest.appendSlice(allocator, meta);
+        for (chunk_hexes.items, 0..) |chex, i| {
+            if (i > 0) try manifest.append(allocator, ',');
+            try manifest.append(allocator, '"');
+            try manifest.appendSlice(allocator, &chex);
+            try manifest.append(allocator, '"');
+        }
+        try manifest.appendSlice(allocator, "]}");
+        objects += 1;
+        total_bytes += data.len;
+    }
+    try manifest.appendSlice(allocator, "]}");
+
+    const manifest_key = try std.fmt.allocPrint(allocator, "{s}{s}.json", .{ SNAP_PREFIX, sa.name });
+    defer allocator.free(manifest_key);
+    try client.put(manifest_key, manifest.items, "application/json");
+    std.debug.print("snapshot {s}: {d} objects, {d} bytes, {d} chunks uploaded, {d} reused -> {s}/{s}\n", .{
+        sa.name, objects, total_bytes, uploaded_chunks, reused_chunks, sa.bucket, manifest_key,
+    });
+}
+
+fn runSnapshotsList(allocator: Allocator, args: []const []const u8) !void {
+    const sa = try parseSnapArgs(allocator, args);
+    if (sa.bucket.len == 0) {
+        std.debug.print("Usage: zs3 snapshots --bucket=BUCKET [--endpoint=URL]\n", .{});
+        return error.BadArgs;
+    }
+    const ep = try splitEndpoint(sa.endpoint);
+    var client = S3Client{
+        .allocator = allocator,
+        .host = ep.host,
+        .port = ep.port,
+        .bucket = sa.bucket,
+        .region = sa.region,
+        .access = sa.access,
+        .secret = sa.secret,
+    };
+    var keys = try s3ListAll(&client, allocator, SNAP_PREFIX);
+    defer {
+        for (keys.items) |k| allocator.free(k);
+        keys.deinit(allocator);
+    }
+    for (keys.items) |key| {
+        if (std.mem.endsWith(u8, key, ".json") and !std.mem.startsWith(u8, key[SNAP_PREFIX.len..], "chunks/")) {
+            std.debug.print("{s}\n", .{key[SNAP_PREFIX.len .. key.len - 5]});
+        }
+    }
+}
+
+// Manifest parser: extracts objects in order. Format is writer-controlled.
+const SnapObject = struct {
+    key: []const u8,
+    size: usize,
+    hash: [64]u8,
+    chunks: [][]const u8,
+};
+
+fn skipWs(s: []const u8, i: *usize) void {
+    while (i.* < s.len and (s[i.*] == ' ' or s[i.*] == '\n' or s[i.*] == '\r' or s[i.*] == '\t')) i.* += 1;
+}
+
+fn parseJsonString(allocator: Allocator, s: []const u8, i: *usize) ![]const u8 {
+    // s[i] == '"'
+    i.* += 1;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    while (i.* < s.len) {
+        const c = s[i.*];
+        if (c == '"') {
+            i.* += 1;
+            return out.toOwnedSlice(allocator);
+        } else if (c == '\\') {
+            i.* += 1;
+            if (i.* >= s.len) return error.BadManifest;
+            const e = s[i.*];
+            switch (e) {
+                '"', '\\', '/' => try out.append(allocator, e),
+                'n' => try out.append(allocator, '\n'),
+                'r' => try out.append(allocator, '\r'),
+                't' => try out.append(allocator, '\t'),
+                'b' => try out.append(allocator, 0x08),
+                'f' => try out.append(allocator, 0x0c),
+                'u' => {
+                    if (i.* + 4 >= s.len) return error.BadManifest;
+                    const cp = std.fmt.parseInt(u21, s[i.* + 1 .. i.* + 5], 16) catch return error.BadManifest;
+                    var buf: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(cp, &buf) catch return error.BadManifest;
+                    try out.appendSlice(allocator, buf[0..n]);
+                    i.* += 4;
+                },
+                else => return error.BadManifest,
+            }
+            i.* += 1;
+        } else {
+            try out.append(allocator, c);
+            i.* += 1;
+        }
+    }
+    return error.BadManifest;
+}
+
+fn parseManifest(allocator: Allocator, body: []const u8) ![]SnapObject {
+    var objects: std.ArrayListUnmanaged(SnapObject) = .empty;
+    errdefer {
+        for (objects.items) |*o| {
+            allocator.free(o.key);
+            for (o.chunks) |c| allocator.free(c);
+            allocator.free(o.chunks);
+        }
+        objects.deinit(allocator);
+    }
+    // Find "objects":[ ... ] and parse each {"key","size","hash","chunks"}.
+    const arr_start = std.mem.indexOf(u8, body, "\"objects\"") orelse return error.BadManifest;
+    var i = arr_start + 9;
+    skipWs(body, &i);
+    if (i >= body.len or body[i] != ':') return error.BadManifest;
+    i += 1;
+    skipWs(body, &i);
+    if (i >= body.len or body[i] != '[') return error.BadManifest;
+    i += 1;
+    while (true) {
+        skipWs(body, &i);
+        if (i >= body.len) return error.BadManifest;
+        if (body[i] == ']') {
+            i += 1;
+            break;
+        }
+        if (body[i] == ',') {
+            i += 1;
+            continue;
+        }
+        if (body[i] != '{') return error.BadManifest;
+        i += 1;
+        var key: ?[]const u8 = null;
+        var size: usize = 0;
+        var hash: [64]u8 = undefined;
+        var chunks: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            if (key) |k| allocator.free(k);
+            for (chunks.items) |c| allocator.free(c);
+            chunks.deinit(allocator);
+        }
+        while (true) {
+            skipWs(body, &i);
+            if (i >= body.len) return error.BadManifest;
+            if (body[i] == '}') {
+                i += 1;
+                break;
+            }
+            if (body[i] == ',') {
+                i += 1;
+                continue;
+            }
+            if (body[i] != '"') return error.BadManifest;
+            const field = try parseJsonString(allocator, body, &i);
+            defer allocator.free(field);
+            skipWs(body, &i);
+            if (i >= body.len or body[i] != ':') return error.BadManifest;
+            i += 1;
+            skipWs(body, &i);
+            if (std.mem.eql(u8, field, "key")) {
+                if (i >= body.len or body[i] != '"') return error.BadManifest;
+                key = try parseJsonString(allocator, body, &i);
+            } else if (std.mem.eql(u8, field, "size")) {
+                const start = i;
+                while (i < body.len and body[i] >= '0' and body[i] <= '9') i += 1;
+                size = std.fmt.parseInt(usize, body[start..i], 10) catch return error.BadManifest;
+            } else if (std.mem.eql(u8, field, "hash")) {
+                if (i >= body.len or body[i] != '"') return error.BadManifest;
+                const h = try parseJsonString(allocator, body, &i);
+                defer allocator.free(h);
+                if (h.len != 64) return error.BadManifest;
+                @memcpy(&hash, h);
+            } else if (std.mem.eql(u8, field, "chunks")) {
+                if (i >= body.len or body[i] != '[') return error.BadManifest;
+                i += 1;
+                while (true) {
+                    skipWs(body, &i);
+                    if (i >= body.len) return error.BadManifest;
+                    if (body[i] == ']') {
+                        i += 1;
+                        break;
+                    }
+                    if (body[i] == ',') {
+                        i += 1;
+                        continue;
+                    }
+                    if (body[i] != '"') return error.BadManifest;
+                    const c = try parseJsonString(allocator, body, &i);
+                    try chunks.append(allocator, c);
+                }
+            } else {
+                // Skip unknown field value (string/number/array/object, one level).
+                if (i < body.len and body[i] == '"') {
+                    const tmp = try parseJsonString(allocator, body, &i);
+                    allocator.free(tmp);
+                } else {
+                    while (i < body.len and body[i] != ',' and body[i] != '}') i += 1;
+                }
+            }
+        }
+        try objects.append(allocator, .{
+            .key = key orelse return error.BadManifest,
+            .size = size,
+            .hash = hash,
+            .chunks = try chunks.toOwnedSlice(allocator),
+        });
+    }
+    return objects.toOwnedSlice(allocator);
+}
+
+fn runClone(allocator: Allocator, args: []const []const u8) !void {
+    const sa = try parseSnapArgs(allocator, args);
+    if (sa.bucket.len == 0 or sa.name.len == 0 or sa.dest.len == 0) {
+        std.debug.print("Usage: zs3 clone --bucket=BUCKET --name=NAME --dest=DIR [--endpoint=URL] [--cache=DIR]\n", .{});
+        return error.BadArgs;
+    }
+    const ep = try splitEndpoint(sa.endpoint);
+    var client = S3Client{
+        .allocator = allocator,
+        .host = ep.host,
+        .port = ep.port,
+        .bucket = sa.bucket,
+        .region = sa.region,
+        .access = sa.access,
+        .secret = sa.secret,
+    };
+    const manifest_key = try std.fmt.allocPrint(allocator, "{s}{s}.json", .{ SNAP_PREFIX, sa.name });
+    defer allocator.free(manifest_key);
+    const manifest_body = client.get(manifest_key) catch {
+        std.debug.print("snapshot '{s}' not found in bucket '{s}' (run `zs3 snapshots --bucket={s}` to list)\n", .{ sa.name, sa.bucket, sa.bucket });
+        return error.SnapshotNotFound;
+    };
+    defer allocator.free(manifest_body);
+
+    const objects = try parseManifest(allocator, manifest_body);
+    defer {
+        for (objects) |*o| {
+            allocator.free(o.key);
+            for (o.chunks) |c| allocator.free(c);
+            allocator.free(o.chunks);
+        }
+        allocator.free(objects);
+    }
+
+    const cache_dir = if (sa.cache.len > 0)
+        try allocator.dupe(u8, sa.cache)
+    else
+        try std.fmt.allocPrint(allocator, "{s}/.zs3/blobs", .{sa.dest});
+    defer allocator.free(cache_dir);
+
+    var transferred: usize = 0;
+    var reused: usize = 0;
+    var files: usize = 0;
+    for (objects) |obj| {
+        // Assemble from cache, fetching only missing chunks.
+        var assembled: std.ArrayListUnmanaged(u8) = .empty;
+        defer assembled.deinit(allocator);
+        for (obj.chunks) |chex| {
+            const blob_path = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ cache_dir, chex[0..2], chex[2..] });
+            defer allocator.free(blob_path);
+            if (std.Io.Dir.cwd().openFile(app_io, blob_path, .{})) |file| {
+                defer file.close(app_io);
+                const stat = try file.stat(app_io);
+                const prev = assembled.items.len;
+                try assembled.appendNTimes(allocator, 0, stat.size);
+                _ = try file.readPositionalAll(app_io, assembled.items[prev..], 0);
+                reused += stat.size;
+            } else |_| {
+                const chunk_key = try std.fmt.allocPrint(allocator, "{s}{s}", .{ SNAP_CHUNK_PREFIX, chex });
+                defer allocator.free(chunk_key);
+                const data = try client.get(chunk_key);
+                defer allocator.free(data);
+                var af = try std.Io.Dir.cwd().createFileAtomic(app_io, blob_path, .{ .make_path = true, .replace = true });
+                defer af.deinit(app_io);
+                try af.file.writeStreamingAll(app_io, data);
+                if (enable_fsync) fsyncFile(af.file);
+                try af.replace(app_io);
+                try assembled.appendSlice(allocator, data);
+                transferred += data.len;
+            }
+        }
+        // Verify whole-object hash before materializing.
+        var whole_hex: [64]u8 = undefined;
+        blake3Hex32(assembled.items, &whole_hex);
+        if (!std.mem.eql(u8, &whole_hex, &obj.hash)) {
+            std.debug.print("WARNING: hash mismatch for {s}, skipping\n", .{obj.key});
+            continue;
+        }
+        const dest_path = try std.fs.path.join(allocator, &.{ sa.dest, obj.key });
+        defer allocator.free(dest_path);
+        var out = try std.Io.Dir.cwd().createFileAtomic(app_io, dest_path, .{ .make_path = true, .replace = true });
+        defer out.deinit(app_io);
+        try out.file.writeStreamingAll(app_io, assembled.items);
+        if (enable_fsync) fsyncFile(out.file);
+        try out.replace(app_io);
+        if (enable_fsync) fsyncParentDir(dest_path);
+        files += 1;
+    }
+    // Keep a copy of the manifest beside the cache for auditability.
+    const meta_path = try std.fmt.allocPrint(allocator, "{s}/.zs3/manifest.json", .{sa.dest});
+    defer allocator.free(meta_path);
+    if (std.fs.path.dirname(meta_path)) |dir| {
+        std.Io.Dir.cwd().createDirPath(app_io, dir) catch {};
+    }
+    if (std.Io.Dir.cwd().createFile(app_io, meta_path, .{})) |file| {
+        defer file.close(app_io);
+        file.writeStreamingAll(app_io, manifest_body) catch {};
+    } else |_| {}
+    std.debug.print("clone {s}: {d} files, {d} bytes transferred, {d} reused from cache\n", .{ sa.name, files, transferred, reused });
 }
