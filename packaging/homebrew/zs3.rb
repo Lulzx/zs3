@@ -16,7 +16,7 @@ class Zs3 < Formula
   desc "Local, dev, and edge S3 storage in a static binary"
   homepage "https://github.com/Lulzx/zs3"
   url "https://github.com/Lulzx/zs3/releases/download/v0.3.0/zs3-aarch64-macos"
-  sha256 "REPLACE_WITH_RELEASE_SHA256"
+  sha256 "55c3a69962186c1880f36c8f032c4536e3011f208a1f5d59babf96b6719efbc5"
   version "0.3.0"
   license "WTFPL"
 
