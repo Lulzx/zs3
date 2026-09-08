@@ -73,7 +73,7 @@ follows [Semantic Versioning](https://semver.org/).
 - **Request paths are percent-decoded.** Keys with spaces, `+`, `#`, or
   non-ASCII characters are stored under their real names, so `ls` shows what
   you PUT and LIST returns decoded keys. Data dirs written before this change
-  keep working via a read fallback (see `docs/deployment.md#migrating`).
+  keep working via a read fallback (see `docs/deployment.md#migrating-a-pre-020-data-directory`).
 - **ListBuckets hides unusable directories.** Only directories with valid
   bucket names are listed; the rest are skipped instead of advertised-then-rejected.
 - **Content-Type sniffing for foreign files.** Objects without a stored

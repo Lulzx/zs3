@@ -59,5 +59,5 @@ const MAX_BUCKET_LENGTH = 63;                  // characters
 
 ## TLS
 
-zs3 serves plain HTTP. Terminate TLS in a reverse proxy; [deployment.md](deployment.md)
-has Caddy and nginx configs.
+zs3 serves plain HTTP. Terminate TLS in a reverse proxy.
+[deployment.md](deployment.md) has Caddy and nginx configs.

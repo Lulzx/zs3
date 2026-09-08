@@ -1,7 +1,7 @@
 # zs3
 
-Turn any directory into an S3 server. One static binary, no runtime, no
-control plane, no dependency tree.
+Turn any directory into an S3 server. zs3 is a 500KB static binary that
+speaks the S3 API over files you already have.
 
 ```bash
 zs3 --data-dir=/srv/media
@@ -10,9 +10,9 @@ aws --endpoint-url http://localhost:9000 s3 ls s3://photos/
 
 Each top-level directory under `--data-dir` is a bucket, and your files stay
 files: `photos/2024/img.jpg` is `/srv/media/photos/2024/img.jpg`, so you can
-`ls` a bucket and `cp` into one. zs3 runs standalone;
-`zs3 snapshot` and `zs3 clone` move content-addressed bucket snapshots between
-machines, transferring only the blocks the destination lacks.
+`ls` a bucket and `cp` into one. To move data to another machine,
+`zs3 snapshot` and `zs3 clone` copy content-addressed bucket snapshots,
+transferring only the blocks the destination lacks.
 
 Start with the [documentation index](docs/README.md), or jump to
 [configuration](docs/configuration.md), the [API subset](docs/api.md),
@@ -34,8 +34,8 @@ chmod +x zs3 && ./zs3
 brew tap Lulzx/zs3 && brew install zs3
 ```
 
-Or build it. Requires Zig 0.16.0, which is where the `std.Io` APIs zs3 uses
-were added; 0.15.x does not compile it.
+To build from source you need Zig 0.16.0. zs3 uses the `std.Io` APIs added in
+that release, so 0.15.x does not compile it.
 
 ```bash
 zig build -Doptimize=ReleaseSmall     # native
@@ -43,7 +43,7 @@ zig build -Dtarget=x86_64-linux-musl \
   -Dcpu=baseline -Doptimize=ReleaseSmall   # static Linux, ~440KB
 ```
 
-## Size
+## How it compares
 
 Most local object-storage usage is PUT, GET, DELETE, LIST, and SigV4. zs3 does
 that job instead of chasing parity with a production storage platform.
@@ -55,8 +55,8 @@ that job instead of chasing parity with a production storage platform.
 | RAM idle | 3MB | ~100MB | 200MB+ |
 | Dependencies | 0 | ~200 crates | many |
 
-It is also fast: 7-124x lower latency than RustFS and Garage on the same
-machine. Tables in [docs/benchmarks.md](docs/benchmarks.md).
+On the same machine it answers requests 7-124x faster than RustFS and Garage,
+depending on the operation. Tables in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Quick start
 
@@ -85,7 +85,7 @@ upload, download, delete). It signs requests in-browser with keys you enter,
 kept in localStorage. `http://localhost:9000/metrics` serves Prometheus
 counters.
 
-## What works
+## Supported S3 surface
 
 SigV4 in both header and presigned query-string form. PUT, GET, HEAD, DELETE,
 LIST v2, HeadBucket, DeleteObjects, multipart upload, CopyObject and
@@ -109,33 +109,34 @@ zs3 clone --bucket=artifacts --name=v1 --dest=./v1
 zs3 snapshots --bucket=artifacts
 ```
 
-A warm re-clone transfers close to nothing. Format and behavior in
-[docs/snapshots.md](docs/snapshots.md).
+A re-clone against a warm cache transfers the manifest and nothing else.
+Format and behavior in [docs/snapshots.md](docs/snapshots.md).
 
-## What doesn't
+## Not supported
 
 Versioning, lifecycle policies, bucket ACLs, object tagging, encryption, TLS
 (terminate it in a proxy). If you need those, use MinIO or AWS. zs3 trades
 feature parity for size and auditability.
 
-There is also a peer-to-peer distributed mode in the binary. It works, and it
-is frozen: snapshots are the supported way to move data between machines.
-Details in [docs/distributed.md](docs/distributed.md), reasoning in
-[docs/vision.md](docs/vision.md).
+The binary also carries a working peer-to-peer distributed mode, which is
+frozen at its current state. Snapshots are the supported way to move data
+between machines. Details in [docs/distributed.md](docs/distributed.md),
+reasoning in [docs/vision.md](docs/vision.md).
 
-## Where it fits
+## Uses
 
 Local dev in place of a MinIO service in Compose, CI artifact storage, agent
 artifacts, self-hosted backups, edge and embedded appliances, and reading the
 source to see how S3 works. The SigV4 implementation is about 150 lines:
 canonical request, string to sign, HMAC chain, compare.
 
-## Contributing
+## Working on zs3
 
-Tests and how to run them: [docs/testing.md](docs/testing.md). Security
-posture and size limits: [docs/security.md](docs/security.md). Changes worth
-knowing about: [CHANGELOG.md](CHANGELOG.md).
+[docs/testing.md](docs/testing.md) covers the unit, integration, and
+client-compatibility suites. [docs/security.md](docs/security.md) covers what
+the server validates and where the size limits sit.
+[CHANGELOG.md](CHANGELOG.md) records what changed per release.
 
 ## License
 
-[WTFPL](LICENSE). Read it, fork it, break it.
+[WTFPL](LICENSE).

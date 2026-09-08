@@ -167,6 +167,35 @@ tar -czf backup.tar.gz data/
 tar -xzf backup.tar.gz
 ```
 
+## Migrating a pre-0.2.0 data directory
+
+Before 0.2.0, zs3 stored keys under their percent-encoded names, so a key
+`my file.txt` was stored on disk as `my%20file.txt`. From 0.2.0 the request path
+is decoded first and the key is stored under its real name.
+
+Existing data keeps working. A GET, HEAD, or DELETE first looks for the
+decoded name, and falls back to the encoded one if only that file exists, so
+old and new objects can sit in the same bucket. New writes always use the
+decoded name.
+
+Only keys containing characters that get encoded are affected: spaces, `+`,
+`#`, and anything non-ASCII. To normalize a directory in one pass, rename the
+encoded files:
+
+```bash
+cd data/mybucket
+python3 - <<'EOS'
+import os, urllib.parse
+for dirpath, _, files in os.walk("."):
+    for f in files:
+        d = urllib.parse.unquote(f)
+        if d != f and not os.path.exists(os.path.join(dirpath, d)):
+            os.rename(os.path.join(dirpath, f), os.path.join(dirpath, d))
+EOS
+```
+
+Stop the server first, and back the directory up before running it.
+
 ## Monitoring
 
 zs3 logs to stderr:

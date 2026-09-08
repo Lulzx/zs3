@@ -16,8 +16,8 @@
 
 ## TLS
 
-zs3 speaks plain HTTP. Terminate TLS in a reverse proxy; see
-[Deployment](deployment.md) for Caddy and nginx configs.
+zs3 speaks plain HTTP. Terminate TLS in a reverse proxy. [Deployment](deployment.md)
+has Caddy and nginx configs.
 
 Presigned URLs embed the endpoint scheme, so generate them against the public
 `https://` URL. The signature verifies the same behind the proxy.
