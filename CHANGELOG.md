@@ -34,8 +34,33 @@ follows [Semantic Versioning](https://semver.org/).
   Homebrew tap template in `packaging/homebrew/`.
 - **`--fast` benchmark mode.** fsync-on-write is now the default (see Fixed);
   `--fast`/`--no-fsync` restores the no-fsync fast path.
+- **Relaunch notes.** `docs/launch.md`: prepared answers on durability, the
+  Garage / `rclone serve s3` comparison, SigV4 correctness, and
+  single-file maintainability, for the "turn any directory into an S3
+  server" relaunch.
+
+### Changed
+
+- **Live mesh frozen.** Distributed mode stays in the binary but receives no
+  new work; `zs3 snapshot` / `zs3 clone` over the content-addressed store is
+  the supported way to move data between machines. Decision and reasoning in
+  `docs/vision.md` (now current — the snapshot/clone section reflects what
+  shipped) and the README.
 
 ### Fixed
+
+- **Embedded console completed.** The shipped `console.html` ended mid-script
+  (helpers defined, zero UI wiring), so the page rendered but could not list
+  buckets, browse, upload, inspect, or delete. The missing application logic
+  is now implemented against the existing markup: connection dialog with
+  remembered credentials and auto-connect, bucket sidebar + mobile picker,
+  create/delete bucket, prefix navigation with breadcrumbs and LIST
+  pagination, client-side filter, multi-file upload (file picker and
+  drag-drop) with signed `Content-Type`, object inspector (HEAD metadata
+  grid, download, copy S3 URI, text/image preview, delete), keyboard
+  shortcuts, and theme toggle. Verified headless end-to-end (18/18 checks:
+  connect → create → upload → inspect → preview → delete → bucket delete →
+  reload auto-connect).
 
 - **fsync-on-write (durability).** Acknowledged PUT/CopyObject/
   multipart-complete/snapshot writes fsync file contents and best-effort

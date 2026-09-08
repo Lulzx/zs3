@@ -22,16 +22,27 @@ service machinery.
 - Standalone objects are ordinary files; distributed objects are BLAKE3-addressed
   blobs behind a small path index.
 
-### Next: cloneable artifact history
+### Now: cloneable artifact history
 
-`zs3 clone` will move content-addressed snapshots between machines and agents.
-A snapshot is a manifest from bucket/key names to immutable content hashes, so
-copying a workspace can reuse blocks already present at the destination and
-retain a stable identity for every artifact.
+`zs3 snapshot` and `zs3 clone` move content-addressed snapshots between
+machines and agents. A snapshot is a manifest from bucket/key names to
+immutable BLAKE3 digests, so copying a workspace reuses blocks already present
+at the destination and retains a stable identity for every artifact. Format
+and behavior: [snapshots.md](snapshots.md).
 
-This is a planned public workflow. The current distributed storage layer
-already provides content addressing and deduplication, but there is no public
-`zs3 clone` command or snapshot manifest format yet.
+### The live mesh is frozen
+
+Distributed mode still works and is still in the binary, but it is frozen:
+no new DHT, gossip, quorum-read, or background-replication work. The reason
+is scope, not quality. A live mesh that claims replication semantics is a
+distributed object store, which is the correctness weight class zs3 was
+started to avoid; its design notes would need quorum math, partition
+behavior, and conflict-resolution guarantees to be taken seriously. Content
+addressing plus an offline `clone` command keeps the interesting half —
+immutable digests, dedup, stable artifact identity — while the filesystem
+stays the source of truth and the failure modes stay local and legible. If
+the mesh earns a future, it comes back as an explicitly scoped feature, not
+as an adjective in the README.
 
 ### Next: evidence buckets
 

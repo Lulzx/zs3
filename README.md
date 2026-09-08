@@ -3,11 +3,12 @@
 **SQLite for objects.** Local, dev, and edge S3 storage in a small static
 binary with no runtime, control plane, or dependency tree.
 
-Run one file, point an existing S3 client at it, and keep the data on disk. zs3
-is standalone by default and adds content-addressed, peer-to-peer storage when
-you ask for distributed mode. `zs3 snapshot` / `zs3 clone` move
+Run one file, point an existing S3 client at it, and keep the data on disk.
+zs3 is standalone by default. `zs3 snapshot` / `zs3 clone` move
 content-addressed bucket snapshots between machines, transferring only the
-blocks the destination lacks.
+blocks the destination lacks. An experimental distributed mode remains in the
+binary but is frozen; snapshots and clone are the supported path for moving
+data between machines.
 
 [Replace MinIO in Docker Compose](docs/replace-minio.md) ·
 [Product direction](docs/vision.md) · [API subset](docs/api.md) ·
@@ -21,7 +22,7 @@ storage platform.
 
 | | zs3 | RustFS | MinIO |
 |---|-----|--------|-------|
-| Lines (server: `wc -l main.zig acl.zig build.zig`) | ~6,900 | ~80,000 | 200,000 |
+| Lines (server: `wc -l main.zig acl.zig build.zig`) | ~7,050 | ~80,000 | 200,000 |
 | Binary (static Linux musl, `ReleaseSmall`) | ~440KB x86-64 / ~400KB aarch64 | ~50MB | 100MB |
 | RAM idle | 3MB | ~100MB | 200MB+ |
 | Dependencies | 0 | ~200 crates | many |
@@ -128,6 +129,13 @@ localStorage only).
 
 All nodes share the same S3 API. PUT on any node, GET from any node.
 
+> **Status: frozen.** Distributed mode works and ships in the binary, but
+> active development has stopped here. Live replication, DHT discovery, and
+> gossip carry the correctness obligations of a distributed object store,
+> which is not the job zs3 is optimized for. Use `zs3 snapshot` / `zs3
+> clone` to move data between machines instead. The notes below describe the
+> mode as it exists today.
+
 How the namespace stays in sync: every PUT/DELETE pushes the bucket/key
 metadata entry (and inline data for small objects) to all known peers
 before acknowledging, so cross-node reads are immediately consistent.
@@ -225,11 +233,27 @@ multipart-complete, and snapshot writes. Atomic rename means a concurrent GET
 never sees a half-written object; fsync means an acknowledged write survives a
 crash or power loss.
 
-The benchmark numbers below were measured with `--fast` (no fsync). On Apple
-Silicon the durable default costs roughly 10% on small PUTs (PUT 1KB 0.64ms
-vs 0.57ms) and nothing measurable on reads — fsync-slow disks (spinning rust,
-some NFS) will show a bigger gap. If you only need "it's on your disk", run
-`zs3 --fast`.
+The benchmark numbers below were measured with `--fast` (no fsync). If you
+only need "it's on your disk", run `zs3 --fast`.
+
+Both durability modes, measured side by side on the same machine (Apple
+Silicon, macOS, sequential, 100 iterations):
+
+| Operation | `--fast` (no fsync) | default (fsync) |
+|-----------|--------------------:|----------------:|
+| PUT 1KB   | 0.59ms | 0.59ms |
+| PUT 64KB  | 0.68ms | 0.74ms |
+| PUT 1MB   | 2.99ms | 3.05ms |
+| GET 1KB   | 0.39ms | 0.37ms |
+| GET 1MB   | 2.00ms | 2.05ms |
+| DELETE    | 0.36ms | 0.37ms |
+
+On this hardware the durable default is within noise of `--fast` for small
+PUTs and reads; the honest headline is that the comparison numbers below were
+taken in the faster mode, and the durable mode costs single-digit percent
+there. fsync-slow disks (spinning rust, some NFS) will show a bigger gap.
+Reproduce with `python3 benchmark.py --only zs3` against a server with and
+without `--fast`.
 
 ## When NOT to use this
 
@@ -282,6 +306,26 @@ brew tap Lulzx/zs3 && brew install zs3
 ```
 
 `docker build -t zs3 .` builds the image locally with Zig 0.16.0.
+
+### Compose
+
+Drop-in replacement for a MinIO service in `docker-compose.yml`:
+
+```yaml
+services:
+  object-storage:
+    image: ghcr.io/lulzx/zs3
+    command: ["--data-dir=/data", "--acl=admin:local-access:local-secret"]
+    ports:
+      - "9000:9000"
+    volumes:
+      - object-data:/data
+
+volumes:
+  object-data:
+```
+
+Full migration guide: [docs/replace-minio.md](docs/replace-minio.md).
 
 ## Testing
 

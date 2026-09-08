@@ -40,7 +40,7 @@ function writeSetting(key,value){if(value===null)localStorage.removeItem("zs3."+
 let curBucket="",curPrefix="", entries=[],selected=null,bucketNames=[],generation=0,inspectGeneration=0,pageTokens=[undefined],pageIndex=0,nextToken=null,previewUrl=null,uploading=false,deleteAction=null;
 const bytes=n=>{n=Number(n);if(n<1024)return n+" B";const units=["KB","MB","GB","TB"];let i=-1;do{n/=1024;i++}while(n>=1024&&i<units.length-1);return n.toFixed(1)+" "+units[i]};
 function activity(method,path,result){const row=el("li");row.append(el("time",new Date().toLocaleTimeString([],{hour12:false})),el("span",method+" "+path),el("span",result,"muted"));$("activity").prepend(row);while($("activity").children.length>60)$("activity").lastChild.remove();$("latest").textContent=method+" "+path;$("latestResult").textContent=result;}
-async function signedFetch(method,path,query={},body){const start=performance.now();try{const r=await rawSignedFetch(method,path,query,body);activity(method,path+(Object.keys(query).length?"?"+new URLSearchParams(query):""),r.status+" OK · "+Math.round(performance.now()-start)+" ms");return r}catch(e){activity(method,path,"FAILED · "+Math.round(performance.now()-start)+" ms");throw e}}
+async function signedFetch(method,path,query={},body,contentType){const start=performance.now();try{const r=await rawSignedFetch(method,path,query,body,contentType);activity(method,path+(Object.keys(query).length?"?"+new URLSearchParams(query):""),r.status+" OK · "+Math.round(performance.now()-start)+" ms");return r}catch(e){activity(method,path,"FAILED · "+Math.round(performance.now()-start)+" ms");throw e}}
 const enc = new TextEncoder();
 function hex(buf) { return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join(""); }
 async function sha256Hex(data) { return hex(await crypto.subtle.digest("SHA-256", data)); }
@@ -57,7 +57,7 @@ function amzDates() {
 function uriEncodePath(path) {
   return path.split("/").map(s => encodeURIComponent(s).replace(/[!'()*]/g, c => "%" + c.charCodeAt(0).toString(16).toUpperCase())).join("/");
 }
-async function rawSignedFetch(method, path, query, body) {
+async function rawSignedFetch(method, path, query, body, contentType) {
   const endpoint = $("endpoint").value.replace(/\/$/, "");
   const region = $("region").value || "us-east-1";
   const ak = $("ak").value, sk = $("sk").value;
@@ -82,6 +82,7 @@ async function rawSignedFetch(method, path, query, body) {
     method,
     headers: {
       "Authorization": "AWS4-HMAC-SHA256 Credential=" + ak + "/" + scope + ", SignedHeaders=" + signedHeaders + ", Signature=" + sig,
+      ...(contentType ? { "Content-Type": contentType } : {}),
       "x-amz-date": datetime,
       "x-amz-content-sha256": payloadHash,
     },
@@ -95,4 +96,327 @@ async function rawSignedFetch(method, path, query, body) {
 }
 function parseXml(text) { return new DOMParser().parseFromString(text, "application/xml"); }
 function tags(doc, name) { return [...doc.getElementsByTagName(name)].map(e => e.textContent); }
+function xmlText(parent, name) { const e = parent.getElementsByTagName(name)[0]; return e ? e.textContent : ""; }
+function parseError(doc) { if (doc.getElementsByTagName("parsererror").length) throw new Error("invalid XML from server"); const code = xmlText(doc, "Code"); if (code) throw new Error(code + ": " + xmlText(doc, "Message")); }
+// ---------- theme ----------
+function applyTheme() { const dark = readSetting("theme") === "dark"; document.documentElement.dataset.theme = dark ? "dark" : ""; $("theme").textContent = dark ? "Light" : "Dark"; $("theme").setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme"); }
+$("theme").onclick = () => { writeSetting("theme", readSetting("theme") === "dark" ? "light" : "dark"); applyTheme(); };
+// ---------- connection ----------
+function connValues() { return { endpoint: $("endpoint").value.trim().replace(/\/$/, ""), region: $("region").value.trim() || "us-east-1", ak: $("ak").value.trim(), sk: $("sk").value }; }
+function setConnected(ok, detail) { const s = $("status"); s.textContent = ok ? "connected" + (detail ? " · " + detail : "") : "not connected"; s.classList.toggle("connected", ok); }
+$("connection").onclick = () => { $("connectionError").hidden = true; $("connectionDialog").showModal(); };
+$("cancelConnection").onclick = () => $("connectionDialog").close();
+$("connectionForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const v = connValues();
+  if (!v.endpoint || !v.ak || !v.sk) { const c = $("connectionError"); c.textContent = "Endpoint, access key, and secret key are required."; c.hidden = false; return; }
+  $("save").disabled = true;
+  try {
+    await loadBuckets(true);
+    if ($("remember").checked) { writeSetting("endpoint", v.endpoint); writeSetting("region", v.region); writeSetting("ak", v.ak); writeSetting("sk", v.sk); }
+    else { writeSetting("endpoint", v.endpoint); writeSetting("region", v.region); writeSetting("ak", null); writeSetting("sk", null); }
+    $("endpointLabel").textContent = v.endpoint; $("regionLabel").textContent = v.region;
+    setConnected(true, bucketNames.length + " bucket" + (bucketNames.length === 1 ? "" : "s"));
+    $("connectionDialog").close();
+  } catch (ex) { const c = $("connectionError"); c.textContent = "Could not connect: " + ex.message; c.hidden = false; setConnected(false); }
+  $("save").disabled = false;
+});
+// ---------- buckets ----------
+async function listBuckets() {
+  const r = await signedFetch("GET", "/");
+  const doc = parseXml(await r.text());
+  parseError(doc);
+  return [...doc.getElementsByTagName("Bucket")].map(b => xmlText(b, "Name")).filter(Boolean);
+}
+async function loadBuckets(silent) {
+  const gen = generation;
+  try {
+    bucketNames = await listBuckets();
+    if (gen !== generation) return;
+    clearErr();
+    renderBuckets();
+  } catch (e) { if (!silent) err("ListBuckets failed: " + e.message); setConnected(false); throw e; }
+}
+function renderBuckets() {
+  const nav = $("buckets"); nav.replaceChildren();
+  $("bucketCount").textContent = String(bucketNames.length);
+  const sel = $("bucketSelect"); sel.replaceChildren(el("option", "Select a bucket")); sel.options[0].value = "";
+  if (!bucketNames.length) { nav.append(el("p", "No buckets yet. Create one to begin.", "muted")); }
+  for (const name of bucketNames) {
+    const b = el("button", name, "bucket plain"); b.type = "button";
+    if (name === curBucket) b.classList.add("active");
+    b.onclick = () => selectBucket(name);
+    nav.append(b);
+    const o = el("option", name); o.value = name; if (name === curBucket) o.selected = true; sel.append(o);
+  }
+  $("deleteBucket").disabled = !curBucket;
+}
+function selectBucket(name) {
+  curBucket = name; curPrefix = ""; selected = null;
+  pageTokens = [undefined]; pageIndex = 0; nextToken = null;
+  hideInspector(); renderBuckets(); updateToolbar(); renderCrumb();
+  generation++;
+  if (name) loadObjects();
+}
+$("refreshBuckets").onclick = () => loadBuckets().catch(() => {});
+$("bucketSelect").onchange = e => selectBucket(e.target.value);
+$("newBucketButton").onclick = $("mobileCreate").onclick = () => { $("bucketError").hidden = true; $("newBucket").value = ""; $("newBucketDialog").showModal(); };
+$("cancelBucket").onclick = () => $("newBucketDialog").close();
+$("newBucketForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const name = $("newBucket").value.trim();
+  $("createBucket").disabled = true;
+  try { await signedFetch("PUT", "/" + name); $("newBucketDialog").close(); await loadBuckets(); selectBucket(name); }
+  catch (ex) { const c = $("bucketError"); c.textContent = "Create bucket failed: " + ex.message; c.hidden = false; }
+  $("createBucket").disabled = false;
+});
+$("deleteBucket").onclick = () => { if (!curBucket) return; deleteAction = { kind: "bucket", name: curBucket }; $("confirmTitle").textContent = "Delete bucket?"; $("confirmText").textContent = "Permanently delete bucket " + curBucket + " and every object in it. This cannot be undone."; $("confirmError").hidden = true; $("confirmDialog").showModal(); };
+// ---------- object browser ----------
+const PAGE_SIZE = 100;
+function updateToolbar() {
+  const on = !!curBucket;
+  for (const id of ["up", "refreshObjects", "upload", "filter"]) $(id).disabled = !on;
+  $("up").disabled = !on || !curPrefix;
+}
+function renderCrumb() {
+  const c = $("crumb"); c.replaceChildren();
+  if (!curBucket) { c.append(el("span", "/ Select a bucket", "muted")); return; }
+  const root = el("button", curBucket); root.type = "button"; root.onclick = () => setPrefix(""); c.append(root);
+  const parts = curPrefix.split("/").filter(Boolean);
+  parts.forEach((seg, i) => {
+    c.append(el("span", "/", "slash"));
+    const b = el("button", seg); b.type = "button";
+    b.onclick = () => setPrefix(parts.slice(0, i + 1).join("/") + "/");
+    c.append(b);
+  });
+}
+function setPrefix(p) { curPrefix = p; selected = null; pageTokens = [undefined]; pageIndex = 0; nextToken = null; hideInspector(); updateToolbar(); renderCrumb(); generation++; filterAndRender(); loadObjects(); }
+$("up").onclick = () => { const parts = curPrefix.split("/").filter(Boolean); parts.pop(); setPrefix(parts.length ? parts.join("/") + "/" : ""); };
+$("refreshObjects").onclick = () => { generation++; loadObjects(); };
+function objectPath(key) { return "/" + curBucket + "/" + key; }
+async function loadObjects() {
+  if (!curBucket) return;
+  generation++; if (generation > 1e9) generation = 1;
+  const gen = generation;
+  const box = $("objects"); box.setAttribute("aria-busy", "true");
+  try {
+    const q = { "list-type": "2", prefix: curPrefix, delimiter: "/", "max-keys": String(PAGE_SIZE) };
+    const tok = pageTokens[pageIndex];
+    if (tok) q["continuation-token"] = tok;
+    const r = await signedFetch("GET", "/" + curBucket, q);
+    const doc = parseXml(await r.text());
+    parseError(doc);
+    if (gen !== generation) return;
+    const list = doc.getElementsByTagName("ListBucketResult")[0] || doc;
+    const out = [];
+    for (const cp of list.getElementsByTagName("CommonPrefixes")) {
+      const p = xmlText(cp, "Prefix"); if (p) out.push({ folder: true, key: p, name: p.slice(curPrefix.length) });
+    }
+    for (const c of list.getElementsByTagName("Contents")) {
+      const k = xmlText(c, "Key");
+      if (!k || k === curPrefix) continue;
+      if (k.endsWith("/") && !xmlText(c, "Size").replace(/^0+$/, "")) continue;
+      out.push({ folder: false, key: k, name: k.slice(curPrefix.length), size: Number(xmlText(c, "Size") || 0), modified: xmlText(c, "LastModified"), etag: xmlText(c, "ETag").replace(/^"|"$/g, "") });
+    }
+    out.sort((a, b) => (a.folder === b.folder) ? a.name.localeCompare(b.name) : (a.folder ? -1 : 1));
+    entries = out;
+    const trunc = xmlText(list, "IsTruncated") === "true";
+    nextToken = trunc ? xmlText(list, "NextContinuationToken") : null;
+    if (trunc && nextToken && pageTokens[pageIndex + 1] !== nextToken) pageTokens = pageTokens.slice(0, pageIndex + 1).concat(nextToken);
+    clearErr();
+  } catch (e) { if (gen === generation) err("List failed: " + e.message); }
+  if (gen === generation) { box.setAttribute("aria-busy", "false"); filterAndRender(); }
+}
+function visibleEntries() {
+  const f = $("filter").value.toLowerCase();
+  return f ? entries.filter(e => e.name.toLowerCase().includes(f)) : entries;
+}
+function filterAndRender() {
+  const box = $("objects"); box.replaceChildren();
+  const vis = visibleEntries();
+  $("previous").hidden = pageIndex === 0;
+  $("next").hidden = !nextToken;
+  const shown = vis.length + " object" + (vis.length === 1 ? "" : "s");
+  $("pageInfo").textContent = curBucket ? shown + (pageTokens.length > 1 ? " · page " + (pageIndex + 1) : "") + (curPrefix ? " · " + curPrefix : "") : "No bucket selected";
+  if (!curBucket) { box.append(emptyPane("Select a bucket on the left to browse its objects.", false)); return; }
+  if (!vis.length) { box.append(emptyPane(entries.length ? "No objects on this page match the filter." : (curPrefix ? "This folder is empty." : "This bucket is empty. Upload something to begin."), !entries.length)); return; }
+  const table = el("table");
+  const head = el("thead"); const hr = el("tr");
+  hr.append(el("th", "NAME"), Object.assign(el("th", "SIZE"), { className: "sizecol" }), Object.assign(el("th", "MODIFIED"), { className: "datecol" }));
+  hr.children[0].className = "namecol"; head.append(hr); table.append(head);
+  const body = el("tbody");
+  for (const entry of vis) {
+    const tr = el("tr", undefined, "object-row" + (entry.folder ? " folder" : "") + (selected && selected.key === entry.key ? " selected" : ""));
+    const nameCell = el("td"); const wrap = el("div", undefined, "object-name");
+    wrap.append(el("span", entry.folder ? "▸" : "·", "marker"));
+    const btn = el("button", entry.name); btn.type = "button";
+    btn.onclick = ev => { ev.stopPropagation(); openEntry(entry); };
+    wrap.append(btn); nameCell.append(wrap); tr.append(nameCell);
+    const sizeTd = el("td", entry.folder ? "" : bytes(entry.size)); sizeTd.className = "sizecol" + (entry.folder ? " muted" : ""); tr.append(sizeTd);
+    const dateTd = el("td", entry.folder ? "" : fmtDate(entry.modified)); dateTd.className = "datecol date-text"; tr.append(dateTd);
+    tr.onclick = () => selectEntry(entry, true);
+    tr.ondblclick = () => openEntry(entry);
+    entry.row = tr;
+    body.append(tr);
+  }
+  table.append(body); box.append(table);
+}
+function emptyPane(text, showDiagram) {
+  const d = el("div", undefined, "empty");
+  if (showDiagram) { const g = el("div", "○\n│\n└─ ∅", "diagram"); d.append(g); }
+  d.append(el("p", text));
+  return d;
+}
+function fmtDate(iso) { if (!iso) return ""; const d = new Date(iso); return isNaN(d) ? iso : d.toISOString().slice(0, 10) + " " + d.toISOString().slice(11, 19) + "Z"; }
+$("filter").addEventListener("input", () => filterAndRender());
+$("previous").onclick = () => { if (pageIndex > 0) { pageIndex--; loadObjects(); } };
+$("next").onclick = () => { if (nextToken) { pageIndex++; loadObjects(); } };
+function openEntry(entry) { if (entry.folder) setPrefix(entry.key); else selectEntry(entry, true); }
+function selectEntry(entry, inspect) {
+  selected = entry;
+  for (const row of document.querySelectorAll(".object-row")) row.classList.remove("selected");
+  if (entry.row) { entry.row.classList.add("selected"); entry.row.scrollIntoView({ block: "nearest" }); }
+  if (inspect && !entry.folder) showInspector(entry);
+  else if (entry.folder) hideInspector();
+}
+// ---------- upload ----------
+$("upload").onclick = () => $("file").click();
+$("file").addEventListener("change", e => { const f = [...e.target.files]; e.target.value = ""; if (f.length) uploadFiles(f); });
+let dragDepth = 0;
+$("dropZone").addEventListener("dragenter", e => { if (!curBucket) return; e.preventDefault(); dragDepth++; $("dropDestination").textContent = curBucket + "/" + (curPrefix || ""); $("dropOverlay").hidden = false; });
+$("dropZone").addEventListener("dragover", e => { if (curBucket) e.preventDefault(); });
+$("dropZone").addEventListener("dragleave", e => { e.preventDefault(); if (--dragDepth <= 0) { dragDepth = 0; $("dropOverlay").hidden = true; } });
+$("dropZone").addEventListener("drop", e => { e.preventDefault(); dragDepth = 0; $("dropOverlay").hidden = true; if (!curBucket) return; const f = [...(e.dataTransfer ? e.dataTransfer.files : [])]; if (f.length) uploadFiles(f); });
+async function uploadFiles(files) {
+  if (uploading || !curBucket) return;
+  uploading = true; $("upload").disabled = true;
+  try {
+    for (const f of files) {
+      const buf = await f.arrayBuffer();
+      await signedFetch("PUT", objectPath(curPrefix + f.name), {}, buf, f.type || undefined);
+    }
+    generation++; await loadObjects();
+  } catch (e) { err("Upload failed: " + e.message); }
+  uploading = false; $("upload").disabled = false;
+}
+// ---------- inspector ----------
+function hideInspector() { $("inspector").hidden = true; if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; } $("preview").hidden = true; $("preview").replaceChildren(); }
+async function showInspector(entry) {
+  const gen = ++inspectGeneration;
+  $("inspector").hidden = false;
+  $("inspectorName").textContent = entry.name;
+  $("metadata").replaceChildren(); $("preview").hidden = true; $("preview").replaceChildren();
+  $("moreMenu").open = false;
+  try {
+    const r = await signedFetch("HEAD", objectPath(entry.key));
+    if (gen !== inspectGeneration) return;
+    const meta = $("metadata");
+    const rows = [
+      ["KEY", entry.key],
+      ["SIZE", bytes(Number(r.headers.get("content-length") || entry.size || 0))],
+      ["TYPE", r.headers.get("content-type") || "—"],
+      ["ETAG", (r.headers.get("etag") || "").replace(/^"|"$/g, "") || "—"],
+      ["MODIFIED", fmtDate(r.headers.get("last-modified")) || "—"],
+    ];
+    for (const [k, v] of rows) { const dl = el("dl"); dl.append(el("dt", k), el("dd", v)); meta.append(dl); }
+    for (const [hk, hv] of r.headers.entries()) {
+      if (!hk.startsWith("x-amz-meta-")) continue;
+      const dl = el("dl"); dl.append(el("dt", "META " + hk.slice("x-amz-meta-".length).toUpperCase()), el("dd", hv)); meta.append(dl);
+    }
+    $("inspector").scrollIntoView({ block: "nearest" });
+  } catch (e) { if (gen === inspectGeneration) err("Inspect failed: " + e.message); }
+}
+$("closeInspector").onclick = () => { inspectGeneration++; selected = null; hideInspector(); for (const row of document.querySelectorAll(".object-row")) row.classList.remove("selected"); };
+$("download").onclick = async () => {
+  if (!selected || selected.folder) return;
+  try {
+    const r = await signedFetch("GET", objectPath(selected.key));
+    const blob = await r.blob();
+    const a = el("a"); a.href = URL.createObjectURL(blob); a.download = selected.name.split("/").pop();
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  } catch (e) { err("Download failed: " + e.message); }
+};
+$("copyUri").onclick = async () => {
+  if (!selected) return;
+  try { await navigator.clipboard.writeText("s3://" + curBucket + "/" + selected.key); }
+  catch (e) { err("Copy failed: " + e.message); }
+};
+$("previewButton").onclick = async () => {
+  if (!selected || selected.folder) return;
+  const pane = $("preview");
+  if (!pane.hidden) { pane.hidden = true; pane.replaceChildren(); return; }
+  try {
+    const r = await signedFetch("GET", objectPath(selected.key));
+    const ct = (r.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+    pane.replaceChildren();
+    if (ct.startsWith("image/")) {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      previewUrl = URL.createObjectURL(await r.blob());
+      const img = el("img"); img.src = previewUrl; img.alt = selected.name; pane.append(img);
+    } else if (ct.startsWith("text/") || ct.endsWith("+xml") || ["application/json", "application/xml", "application/javascript"].includes(ct)) {
+      const t = await r.text();
+      pane.append(el("pre", t.length > 262144 ? t.slice(0, 262144) + "\n… truncated" : t));
+    } else {
+      pane.append(el("p", "No inline preview for " + (ct || "this content type") + ". Use Download.", "muted"));
+    }
+    pane.hidden = false;
+  } catch (e) { err("Preview failed: " + e.message); }
+};
+$("deleteObject").onclick = () => { if (!selected || selected.folder) return; deleteAction = { kind: "object", key: selected.key }; $("confirmTitle").textContent = "Delete object?"; $("confirmText").textContent = "Permanently delete " + selected.key + " from " + curBucket + ". This cannot be undone."; $("confirmError").hidden = true; $("moreMenu").open = false; $("confirmDialog").showModal(); };
+$("cancelDelete").onclick = () => $("confirmDialog").close();
+$("confirmForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  if (!deleteAction) return;
+  $("confirmDelete").disabled = true;
+  try {
+    if (deleteAction.kind === "bucket") {
+      await signedFetch("DELETE", "/" + deleteAction.name);
+      $("confirmDialog").close();
+      selectBucket("");
+      await loadBuckets();
+      setConnected(true, bucketNames.length + " bucket" + (bucketNames.length === 1 ? "" : "s"));
+    } else {
+      await signedFetch("DELETE", objectPath(deleteAction.key));
+      $("confirmDialog").close();
+      inspectGeneration++; selected = null; hideInspector();
+      generation++; await loadObjects();
+    }
+  } catch (ex) { const c = $("confirmError"); c.textContent = "Delete failed: " + ex.message; c.hidden = false; }
+  deleteAction = null; $("confirmDelete").disabled = false;
+});
+// ---------- keyboard ----------
+document.addEventListener("keydown", e => {
+  const tag = (document.activeElement && document.activeElement.tagName) || "";
+  const typing = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+  if (e.key === "/" && !typing) { e.preventDefault(); if (!$("filter").disabled) $("filter").focus(); return; }
+  if (typing || !curBucket) return;
+  const vis = visibleEntries();
+  const idx = selected ? vis.indexOf(selected) : -1;
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    const next = e.key === "ArrowDown" ? Math.min(vis.length - 1, idx + 1) : Math.max(0, idx - 1);
+    if (vis[next]) selectEntry(vis[next], false);
+  } else if (e.key === "Enter" && selected) { e.preventDefault(); openEntry(selected); }
+});
+// ---------- boot ----------
+(function init() {
+  applyTheme();
+  const remembered = { endpoint: readSetting("endpoint"), region: readSetting("region"), ak: readSetting("ak"), sk: readSetting("sk") };
+  $("endpoint").value = remembered.endpoint || (location.protocol.startsWith("http") ? location.origin : "http://localhost:9000");
+  $("region").value = remembered.region || "us-east-1";
+  if (remembered.ak) { $("ak").value = remembered.ak; $("remember").checked = true; }
+  if (remembered.sk) { $("sk").value = remembered.sk; }
+  $("endpointLabel").textContent = $("endpoint").value;
+  $("regionLabel").textContent = $("region").value;
+  if (remembered.ak && remembered.sk) {
+    loadBuckets(true).then(() => {
+      setConnected(true, bucketNames.length + " bucket" + (bucketNames.length === 1 ? "" : "s"));
+      $("endpointLabel").textContent = $("endpoint").value; $("regionLabel").textContent = $("region").value;
+    }).catch(() => setConnected(false));
+  }
+})();
+</script>
+</body>
+</html>
 
