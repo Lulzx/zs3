@@ -4,7 +4,7 @@ All notable changes to zs3 are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and versioning
 follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] - 2026-09-09
 
 ### Added
 
@@ -87,6 +87,10 @@ follows [Semantic Versioning](https://semver.org/).
   the origin's CAS dir; replication itself was never broken (113/113 pass).
 - **Snapshot system objects hidden** from normal LIST (visible with
   `prefix=.zs3snapshots/`).
+- **`test_new.py` no longer hardcodes a developer's absolute binary path.**
+  It resolves `zs3` from `$ZS3_BIN` or the repo's `zig-out/bin`, so the CI
+  integration job runs the snapshot/clone checks instead of failing on a
+  missing file.
 
 ## [0.1.0] - 2026-08-09
 

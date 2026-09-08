@@ -6,7 +6,8 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 ENDPOINT = "http://localhost:9000"
-ZS3 = "/Users/lulzx/work/zs3/zig-out/bin/zs3"
+ZS3 = os.environ.get("ZS3_BIN") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "zig-out", "bin", "zs3")
 s3 = boto3.client("s3", endpoint_url=ENDPOINT,
     aws_access_key_id="minioadmin", aws_secret_access_key="minioadmin",
     config=Config(s3={"addressing_style": "path"}))
