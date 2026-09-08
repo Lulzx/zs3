@@ -12,9 +12,12 @@ pub fn build(b: *std.Build) !void {
     const parsed = try acl.parseCredentials(b.allocator, acl_list);
     b.allocator.free(parsed);
 
+    const tls = b.option(bool, "tls", "Build the https:// client for snapshot/clone (default true)") orelse true;
+
     const options = b.addOptions();
     options.addOption([]const u8, "acl_list", acl_list);
     options.addOption([]const u8, "data_dir", data_dir);
+    options.addOption(bool, "tls", tls);
 
     const exe = b.addExecutable(.{
         .name = "zs3",

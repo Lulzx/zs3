@@ -15,9 +15,9 @@
 class Zs3 < Formula
   desc "Local, dev, and edge S3 storage in a static binary"
   homepage "https://github.com/Lulzx/zs3"
-  url "https://github.com/Lulzx/zs3/releases/download/v0.2.0/zs3-aarch64-macos"
+  url "https://github.com/Lulzx/zs3/releases/download/v0.3.0/zs3-aarch64-macos"
   sha256 "REPLACE_WITH_RELEASE_SHA256"
-  version "0.2.0"
+  version "0.3.0"
   license "WTFPL"
 
   # macOS ARM64 binary; Intel Macs can build from source (requires Zig 0.16.0):

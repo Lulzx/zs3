@@ -167,6 +167,15 @@ tar -czf backup.tar.gz data/
 tar -xzf backup.tar.gz
 ```
 
+## Encryption key
+
+If any bucket uses SSE-S3 (bucket default encryption or
+`x-amz-server-side-encryption: AES256`), the master key lives in
+`<data-dir>/.zs3/sse.key` unless you pass `--sse-key-file` or set
+`ZS3_SSE_KEY`. Back it up separately from the data: without it the
+encrypted objects are unreadable, and a backup that includes it next to the
+data offers no protection at rest.
+
 ## Migrating a pre-0.2.0 data directory
 
 Before 0.2.0, zs3 stored keys under their percent-encoded names, so a key

@@ -31,9 +31,28 @@ Flags (also read from the environment):
 | `--secret-key=S` | `AWS_SECRET_ACCESS_KEY` | `minioadmin` |
 | `--region=R` | `AWS_DEFAULT_REGION` | `us-east-1` |
 | `--chunk-bytes=N` | | `4194304` (4MB) |
+| `--ca-file=PEM` | `ZS3_CA_FILE` | (system CA store only) |
+| `--insecure` | | off |
 
-HTTP only. For TLS endpoints, snapshot through a local TLS-terminating
-proxy (same story as the server side — see `deployment.md`).
+`http://` and `https://` endpoints both work. TLS verifies the server
+certificate against the system CA store, plus `--ca-file` for a private CA;
+`--insecure` skips verification for self-signed test servers. A build with
+`-Dtls=false` has no TLS client and needs a local TLS-terminating proxy.
+
+## Other S3 servers as the store
+
+The snapshot client only uses ListObjectsV2, HEAD, GET and PUT with
+path-style URLs and SigV4, so any S3 server can hold snapshots: MinIO,
+Garage, Ceph, R2, or AWS itself. Two differences from a zs3 store:
+
+- zs3 hides the `.zs3snapshots/` prefix from normal LIST responses; other
+  servers show it.
+- Each chunk is checked with a HEAD before upload, which is free locally
+  and a billed request per 4MB chunk on AWS.
+
+SSE-C objects cannot be snapshotted (the client has no key); SSE-S3
+objects are read decrypted and chunked as plaintext, and stored encrypted
+again only if the bucket's default encryption applies to the chunk PUTs.
 
 ## How it works
 

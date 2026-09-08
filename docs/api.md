@@ -192,6 +192,102 @@ DELETE /{bucket}/{key}?uploadId={id}
 
 Cancels upload and deletes uploaded parts.
 
+## Versioning
+
+`PUT /{bucket}?versioning` with `<VersioningConfiguration><Status>Enabled|Suspended</Status></VersioningConfiguration>`;
+`GET /{bucket}?versioning` returns it (an empty element when never set).
+
+With versioning enabled:
+
+- Every PUT, CopyObject and CompleteMultipartUpload returns
+  `x-amz-version-id`. The previous current object moves to
+  `.zs3versions/<key>.v/<version-id>` with its metadata sidecar.
+- Objects written before versioning was enabled are version `null`.
+- `DELETE /{bucket}/{key}` adds a delete marker (`x-amz-delete-marker: true`
+  plus its `x-amz-version-id`); GET/HEAD then return `404 NoSuchKey` with
+  `x-amz-delete-marker: true`.
+- `?versionId=` on GET, HEAD, DELETE, and in `x-amz-copy-source` selects a
+  version. DELETE with a version id removes it permanently and promotes the
+  next newest version; deleting the newest delete marker restores the key.
+  A missing version is `404 NoSuchVersion`; GET on a delete marker is `405`.
+- `GET /{bucket}?versions` (ListObjectVersions) supports `prefix`,
+  `delimiter`, `max-keys`, `key-marker`, `version-id-marker`.
+- `POST /{bucket}?delete` accepts `<VersionId>` per object and reports
+  `DeleteMarker` / `DeleteMarkerVersionId`.
+- Suspended: new writes are the `null` version and overwrite it in place;
+  existing versioned objects are kept.
+- A bucket with stored versions or delete markers is `409 BucketNotEmpty`.
+
+Distributed mode refuses to enable versioning (`501 NotImplemented`).
+
+## Tagging
+
+- `PUT/GET/DELETE /{bucket}/{key}?tagging` with the standard `<Tagging>`
+  body; `x-amz-tagging: k=v&k2=v2` on PUT/CopyObject/initiate multipart;
+  `x-amz-tagging-directive: COPY|REPLACE` on CopyObject; GET/HEAD return
+  `x-amz-tagging-count`.
+- `PUT/GET/DELETE /{bucket}?tagging` for bucket tags (`404 NoSuchTagSet`
+  when unset).
+- Up to 10 tags, keys 1-128 and values 0-256 characters, unique keys; else
+  `400 InvalidTag`.
+
+## ACLs
+
+Canned ACLs only. `x-amz-acl` on CreateBucket, PutObject, CopyObject and
+initiate multipart, or `PUT /{bucket}[/{key}]?acl` with either the header or
+an `AccessControlPolicy` body (reduced to its `AllUsers` grants; grants to
+other accounts are `400`). `GET ?acl` returns the policy with the owner's
+`FULL_CONTROL` plus `AllUsers` `READ`/`WRITE` grants when public.
+
+| ACL | Unsigned requests may |
+|-----|-----------------------|
+| `private` (default) | nothing |
+| `public-read` | GET/HEAD objects, LIST the bucket |
+| `public-read-write` | the above plus PUT/DELETE objects and `?delete` |
+
+An object with `public-read` is readable anonymously even in a private
+bucket. Anonymous callers can never create/delete buckets or change
+`?acl`, `?versioning`, `?lifecycle`, `?encryption`, or bucket tags. Other
+canned values (`authenticated-read`, `bucket-owner-*`, ...) are accepted and
+behave as `private`, since every signed request is the owner.
+
+## Lifecycle
+
+`PUT/GET/DELETE /{bucket}?lifecycle` with the standard
+`<LifecycleConfiguration>`. The configuration is stored verbatim and
+validated on PUT. Supported per rule: `Status`, `Filter` with `Prefix`,
+`Tag`, or `And` (or the legacy top-level `Prefix`), `Expiration` (`Days`,
+`Date`, or `ExpiredObjectDeleteMarker`), `NoncurrentVersionExpiration`
+(`NoncurrentDays`, measured from when the version became noncurrent), and
+`AbortIncompleteMultipartUpload` (`DaysAfterInitiation`). `Transition` and
+`NoncurrentVersionTransition` are `501 NotImplemented`.
+
+Rules run on a background thread every `--lifecycle-interval-s` seconds
+(default 3600). Expiring an object on a versioned bucket adds a delete
+marker, exactly like DELETE. `Days: 0` means "on the next pass".
+
+## Server-side encryption
+
+Objects are encrypted at rest as 64KB AES-256-GCM chunks behind a 52-byte
+header (format in [security.md](security.md)). The ETag is still the MD5 of
+the plaintext; HEAD, LIST and ListObjectVersions report plaintext sizes;
+range requests work.
+
+- **SSE-S3**: `x-amz-server-side-encryption: AES256` on PUT, CopyObject or
+  initiate multipart, or a bucket default via `PUT /{bucket}?encryption`
+  (`GET`/`DELETE` too; `404 ServerSideEncryptionConfigurationNotFoundError`
+  when unset). The master key comes from `--sse-key-file`, `ZS3_SSE_KEY`,
+  or is generated into `<data-dir>/.zs3/sse.key`.
+- **SSE-C**: `x-amz-server-side-encryption-customer-algorithm: AES256`,
+  `-customer-key` (base64, 32 bytes), `-customer-key-MD5`. The same headers
+  are required on GET/HEAD (`400 InvalidRequest` when missing,
+  `403 AccessDenied` for a wrong key), on every UploadPart and on
+  CompleteMultipartUpload, and as `x-amz-copy-source-server-side-encryption-customer-*`
+  when copying from an SSE-C object. Only the key's MD5 is stored.
+- `aws:kms` is `501 NotImplemented`.
+
+Distributed mode refuses encryption (`501 NotImplemented`).
+
 ## Error Responses
 
 All errors return XML:
@@ -214,6 +310,15 @@ All errors return XML:
 | BucketNotEmpty | 409 | Cannot delete non-empty bucket |
 | NoSuchUpload | 404 | Multipart upload not found |
 | InvalidRange | 416 | Copy source range not satisfiable |
+| NoSuchVersion | 404 | Version id does not exist |
+| InvalidTag | 400 | Tag set exceeds S3 limits |
+| NoSuchTagSet | 404 | Bucket has no tags |
+| MalformedACLError | 400 | Unparseable AccessControlPolicy |
+| IllegalVersioningConfigurationException | 400 | Status not Enabled/Suspended |
+| NoSuchLifecycleConfiguration | 404 | Bucket has no lifecycle rules |
+| ServerSideEncryptionConfigurationNotFoundError | 404 | No bucket default encryption |
+| InvalidDigest | 400 | SSE-C key MD5 mismatch |
+| NotImplemented | 501 | KMS, transitions, versioning/SSE in distributed mode |
 | MethodNotAllowed | 405 | HTTP method not supported |
 | InternalError | 500 | Server error |
 

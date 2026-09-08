@@ -151,6 +151,8 @@ wedge above.
 
 ## Out of scope
 
-Versioning, lifecycle policies, bucket policies, IAM. The "what it doesn't do"
-section of the README is an asset. Chasing parity trades away the only
-differentiated property.
+Bucket policies, IAM, KMS, storage classes, notifications. Versioning,
+lifecycle expiration, ACLs, tagging and SSE landed in 0.3.0 because each
+one is a few hundred lines over plain files; the ones above are not. The
+"what it doesn't do" section of the README is an asset. Chasing parity
+trades away the only differentiated property.

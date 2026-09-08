@@ -638,3 +638,167 @@ test "computeChecksum - crc64nvme standard check value" {
     // 0xae8b14860a799888 big-endian, base64-encoded.
     try std.testing.expectEqualStrings("rosUhgp5mIg=", got);
 }
+
+// ---------------------------------------------------------------------------
+// v0.3 features: tagging, ACLs, versioning, lifecycle, encryption, TLS client
+// ---------------------------------------------------------------------------
+
+test "parseTagQuery / tagsToQuery roundtrip and limits" {
+    const a = std.testing.allocator;
+    const tags = try main.parseTagQuery(a, "a=1&b=two%20words&empty=");
+    defer {
+        for (tags) |t| {
+            a.free(t.key);
+            a.free(t.value);
+        }
+        a.free(tags);
+    }
+    try std.testing.expectEqual(@as(usize, 3), tags.len);
+    try std.testing.expectEqualStrings("two words", tags[1].value);
+    try std.testing.expectEqualStrings("", tags[2].value);
+    const q = try main.tagsToQuery(a, tags);
+    defer a.free(q);
+    try std.testing.expectEqualStrings("a=1&b=two%20words&empty=", q);
+
+    // 11 tags, duplicate keys, oversized key: all rejected.
+    try std.testing.expectError(error.InvalidTag, main.parseTagQuery(a, "a=1&b=2&c=3&d=4&e=5&f=6&g=7&h=8&i=9&j=10&k=11"));
+    try std.testing.expectError(error.InvalidTag, main.parseTagQuery(a, "a=1&a=2"));
+    const long_key = "k" ** 129 ++ "=v";
+    try std.testing.expectError(error.InvalidTag, main.parseTagQuery(a, long_key));
+}
+
+test "parseTaggingXml decodes entities" {
+    const a = std.testing.allocator;
+    const tags = try main.parseTaggingXml(a, "<Tagging><TagSet><Tag><Key>env</Key><Value>a &amp; b &lt;c&gt;</Value></Tag></TagSet></Tagging>");
+    defer {
+        for (tags) |t| {
+            a.free(t.key);
+            a.free(t.value);
+        }
+        a.free(tags);
+    }
+    try std.testing.expectEqual(@as(usize, 1), tags.len);
+    try std.testing.expectEqualStrings("a & b <c>", tags[0].value);
+    try std.testing.expectError(error.MalformedXML, main.parseTaggingXml(a, "<Nope/>"));
+}
+
+test "xmlTagText and decodeHttpChunked" {
+    try std.testing.expectEqualStrings("NoSuchBucket", main.xmlTagText("<Error><Code> NoSuchBucket </Code></Error>", "Code").?);
+    try std.testing.expect(main.xmlTagText("<Error><Code>x</Code></Error>", "Message") == null);
+    const a = std.testing.allocator;
+    const body = try main.decodeHttpChunked(a, "5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\nTrailer: x\r\n\r\n");
+    defer a.free(body);
+    try std.testing.expectEqualStrings("hello world", body);
+}
+
+test "canned ACLs" {
+    try std.testing.expect(main.isCannedAcl("public-read"));
+    try std.testing.expect(!main.isCannedAcl("everyone"));
+    try std.testing.expectEqualStrings("private", main.normalizeCannedAcl("authenticated-read"));
+    try std.testing.expectEqualStrings("public-read-write", main.normalizeCannedAcl("public-read-write"));
+}
+
+test "version ids" {
+    try std.testing.expect(main.isValidVersionId("null"));
+    try std.testing.expect(main.isValidVersionId("18d377cc48500f7865eb0828111e29d9"));
+    try std.testing.expect(!main.isValidVersionId("18D377CC48500F7865EB0828111E29D9"));
+    try std.testing.expect(!main.isValidVersionId("../etc/passwd"));
+    try std.testing.expect(!main.isValidVersionId(""));
+}
+
+test "parseIso8601" {
+    try std.testing.expectEqual(@as(i64, 0), main.parseIso8601("1970-01-01").?);
+    try std.testing.expectEqual(@as(i64, 1577836800), main.parseIso8601("2020-01-01T00:00:00Z").?);
+    try std.testing.expectEqual(@as(i64, 1577836800 + 3661), main.parseIso8601("2020-01-01T01:01:01.000Z").?);
+    try std.testing.expect(main.parseIso8601("2020-13-01") == null);
+    try std.testing.expect(main.parseIso8601("nope") == null);
+}
+
+test "parseLifecycleXml" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const rules = try main.parseLifecycleXml(aa,
+        \\<LifecycleConfiguration><Rule><ID>old</ID><Status>Enabled</Status>
+        \\<Filter><And><Prefix>logs/</Prefix><Tag><Key>tier</Key><Value>tmp</Value></Tag></And></Filter>
+        \\<Expiration><Days>30</Days></Expiration>
+        \\<NoncurrentVersionExpiration><NoncurrentDays>7</NoncurrentDays></NoncurrentVersionExpiration>
+        \\</Rule><Rule><Status>Disabled</Status><Prefix>legacy/</Prefix><Expiration><Date>2030-01-01T00:00:00Z</Date></Expiration></Rule>
+        \\<Rule><ID>mpu</ID><Status>Enabled</Status><Filter/><AbortIncompleteMultipartUpload><DaysAfterInitiation>2</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>
+    );
+    try std.testing.expectEqual(@as(usize, 3), rules.len);
+    try std.testing.expectEqual(@as(?u32, 2), rules[2].abort_mpu_days);
+    // Tag filters cannot be combined with AbortIncompleteMultipartUpload (as in S3).
+    try std.testing.expectError(error.InvalidArgument, main.parseLifecycleXml(aa, "<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter><Tag><Key>a</Key><Value>b</Value></Tag></Filter><AbortIncompleteMultipartUpload><DaysAfterInitiation>2</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"));
+    try std.testing.expectEqualStrings("old", rules[0].id);
+    try std.testing.expectEqualStrings("logs/", rules[0].prefix);
+    try std.testing.expectEqual(@as(usize, 1), rules[0].tags.len);
+    try std.testing.expectEqual(@as(?u32, 30), rules[0].expiration_days);
+    try std.testing.expectEqual(@as(?u32, 7), rules[0].noncurrent_days);
+    try std.testing.expect(!rules[1].enabled);
+    try std.testing.expectEqualStrings("legacy/", rules[1].prefix);
+    try std.testing.expect(rules[1].expiration_date != null);
+
+    try std.testing.expectError(error.MalformedXML, main.parseLifecycleXml(aa, "<LifecycleConfiguration></LifecycleConfiguration>"));
+    try std.testing.expectError(error.InvalidArgument, main.parseLifecycleXml(aa, "<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter/></Rule></LifecycleConfiguration>"));
+    try std.testing.expectError(error.TransitionUnsupported, main.parseLifecycleXml(aa, "<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter/><Transition><Days>1</Days><StorageClass>GLACIER</StorageClass></Transition></Rule></LifecycleConfiguration>"));
+    // Days and Date together are contradictory.
+    try std.testing.expectError(error.InvalidArgument, main.parseLifecycleXml(aa, "<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter/><Expiration><Days>1</Days><Date>2030-01-01</Date></Expiration></Rule></LifecycleConfiguration>"));
+}
+
+test "sse: sizes, roundtrip, tamper detection, wrong key" {
+    const a = std.testing.allocator;
+    // The encryptor draws salt/nonce from the process Io.
+    main.app_io = std.testing.io;
+    try std.testing.expectEqual(@as(u64, 0), main.sseLogicalSize(main.SSE_HEADER_LEN));
+    try std.testing.expectEqual(@as(u64, 1), main.sseLogicalSize(main.SSE_HEADER_LEN + 1 + 16));
+    try std.testing.expectEqual(@as(u64, main.SSE_CHUNK), main.sseLogicalSize(main.SSE_HEADER_LEN + main.SSE_CHUNK + 16));
+    try std.testing.expectEqual(@as(u64, main.SSE_CHUNK + 1), main.sseLogicalSize(main.SSE_HEADER_LEN + main.SSE_CHUNK + 16 + 1 + 16));
+
+    const key = [_]u8{7} ** 32;
+    const other = [_]u8{8} ** 32;
+    var plain: [main.SSE_CHUNK * 2 + 123]u8 = undefined;
+    for (&plain, 0..) |*b, i| b.* = @truncate(i * 31);
+
+    const ct = try main.sseEncryptWith(a, &key, &plain, .s3);
+    defer a.free(ct);
+    try std.testing.expectEqualStrings("ZS3E", ct[0..4]);
+    try std.testing.expectEqual(plain.len, main.sseLogicalSize(ct.len));
+    try std.testing.expect(std.mem.indexOf(u8, ct, plain[0..64]) == null);
+
+    const back = try main.sseDecrypt(a, ct, &key);
+    defer a.free(back);
+    try std.testing.expectEqualSlices(u8, &plain, back);
+
+    try std.testing.expectError(error.AuthenticationFailed, main.sseDecrypt(a, ct, &other));
+    const tampered = try a.dupe(u8, ct);
+    defer a.free(tampered);
+    tampered[main.SSE_HEADER_LEN + 10] ^= 1;
+    try std.testing.expectError(error.AuthenticationFailed, main.sseDecrypt(a, tampered, &key));
+    try std.testing.expectError(error.BadCiphertext, main.sseDecrypt(a, "not ciphertext", &key));
+
+    // Empty object: header only.
+    const empty = try main.sseEncryptWith(a, &key, "", .s3);
+    defer a.free(empty);
+    try std.testing.expectEqual(main.SSE_HEADER_LEN, empty.len);
+    const empty_back = try main.sseDecrypt(a, empty, &key);
+    defer a.free(empty_back);
+    try std.testing.expectEqual(@as(usize, 0), empty_back.len);
+
+    // Two encryptions of the same data differ (fresh salt + nonce).
+    const ct2 = try main.sseEncryptWith(a, &key, &plain, .s3);
+    defer a.free(ct2);
+    try std.testing.expect(!std.mem.eql(u8, ct, ct2));
+}
+
+test "splitEndpoint handles http and https" {
+    const h = try main.splitEndpoint("http://127.0.0.1:9000");
+    try std.testing.expect(!h.tls and h.port == 9000);
+    const s = try main.splitEndpoint("https://s3.amazonaws.com/some/path");
+    try std.testing.expect(s.tls and s.port == 443);
+    try std.testing.expectEqualStrings("s3.amazonaws.com", s.host);
+    const sp = try main.splitEndpoint("https://minio.local:9443");
+    try std.testing.expect(sp.tls and sp.port == 9443);
+    try std.testing.expectError(error.BadEndpoint, main.splitEndpoint("ftp://x"));
+}

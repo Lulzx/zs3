@@ -97,18 +97,31 @@ data/
 │   └── folder/
 │       └── nested.txt
 ├── bucket2/
-│   └── ...
+│   ├── report.pdf
+│   ├── report.pdf.zs3attrs      # Content-Type, x-amz-meta-*, tags, ACL,
+│   │                            # version id, SSE state (only when needed)
+│   ├── .zs3bucket/              # acl, versioning, tagging, lifecycle.xml,
+│   │                            # encryption.xml, sse-used marker
+│   └── .zs3versions/
+│       └── report.pdf.v/
+│           ├── 18d3...29d9      # older version + its .zs3attrs
+│           └── 18d3...31ab.deletemarker
+├── .zs3/
+│   ├── sse.key                  # generated SSE-S3 master key (0600)
+│   └── object-acls              # marker: some object has a public ACL
 └── .uploads/
     └── {upload_id}/
         ├── 1
         ├── 2
-        └── .meta
+        ├── .meta                # bucket, key, SSE mode
+        └── .attrs               # attributes sent at initiate
 ```
 
 - Buckets are directories
-- Objects are files
+- Objects are files; the current version stays at its plain path
 - Nested keys create nested directories
 - Multipart uploads stored in `.uploads/` with metadata
+- `.zs3bucket/`, `.zs3versions/` and `*.zs3attrs` are hidden from LIST
 
 ## Memory Management
 
@@ -120,6 +133,13 @@ defer arena.deinit();
 ```
 
 All allocations during request handling use the arena. When the request completes, everything is freed at once.
+
+## Background work
+
+A lifecycle thread wakes every `--lifecycle-interval-s` seconds, parses each
+bucket's `lifecycle.xml`, and expires objects, noncurrent versions, delete
+markers and stale uploads. It only renames and unlinks, which are atomic, so
+it shares no locks with the request loop.
 
 ## Concurrency
 

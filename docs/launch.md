@@ -60,12 +60,11 @@ trailers, and range-request checksum semantics.
 
 ## Single-file maintainability
 
-~7,050 lines across `main.zig`/`acl.zig`/`build.zig`, standard library only,
+~10,000 lines across `main.zig`/`acl.zig`/`build.zig`, standard library only,
 no dependencies. That number is not the point — it is what makes the
 auditability claim testable in one sitting: every line that touches your
-bytes is in one file you can read. Versioning, lifecycle, IAM, and bucket
-policies are deliberately out of scope; the "what it doesn't do" list is
-part of the design.
+bytes is in one file you can read. IAM and bucket policies are deliberately
+out of scope; the "what it doesn't do" list is part of the design.
 
 ## Distributed mode
 

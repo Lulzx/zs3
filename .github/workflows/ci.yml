@@ -26,6 +26,7 @@ jobs:
         with:
           version: 0.16.0
       - run: zig build -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=ReleaseSmall
+      - run: zig build -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=ReleaseSmall -Dtls=false
       - run: ls -l zig-out/bin/zs3 && file zig-out/bin/zs3
 
   integration:
@@ -42,13 +43,14 @@ jobs:
       - run: zig build -Doptimize=ReleaseSmall
       - run: |
           rm -rf /tmp/zs3-ci && mkdir -p /tmp/zs3-ci
-          ./zig-out/bin/zs3 --data-dir=/tmp/zs3-ci --port=9000 &
+          ./zig-out/bin/zs3 --data-dir=/tmp/zs3-ci --port=9000 --lifecycle-interval-s=2 &
           echo $! > /tmp/zs3.pid
           sleep 1
       - run: python3 test_client.py
       - run: python3 test_comprehensive.py
       - run: python3 test_new.py
       - run: python3 test_foreign.py
+      - run: ZS3_DATA_DIR=/tmp/zs3-ci python3 test_features.py
       - run: python3 test_bootstrap.py
       - run: kill $(cat /tmp/zs3.pid) || true
 

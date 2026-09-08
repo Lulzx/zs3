@@ -5,7 +5,7 @@ const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const acl = @import("acl.zig");
-var app_io: std.Io = undefined;
+pub var app_io: std.Io = undefined;
 
 const MAX_HEADER_SIZE = 8 * 1024;
 const MAX_BODY_SIZE = 5 * 1024 * 1024 * 1024;
@@ -822,15 +822,7 @@ fn distAttrsPath(allocator: Allocator, data_dir: []const u8, bucket: []const u8,
 fn attrsToText(allocator: Allocator, attrs: *const ObjectAttrs) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "content-type: ");
-    try buf.appendSlice(allocator, attrs.content_type);
-    try buf.append(allocator, '\n');
-    for (attrs.entries) |e| {
-        try buf.appendSlice(allocator, e.name);
-        try buf.appendSlice(allocator, ": ");
-        try buf.appendSlice(allocator, e.value);
-        try buf.append(allocator, '\n');
-    }
+    try attrsToTextInto(allocator, &buf, attrs);
     return buf.toOwnedSlice(allocator);
 }
 
@@ -1477,18 +1469,21 @@ pub fn main(init: std.process.Init) !void {
     if (argv_list.items.len > 0) {
         const sub = argv_list.items[0];
         if (std.mem.eql(u8, sub, "snapshot")) {
+            defer client_ca_bundle.deinit(allocator);
             runSnapshot(allocator, argv_list.items[1..]) catch |e| {
                 if (e != error.BadArgs) std.debug.print("snapshot failed: {t}\n", .{e});
                 std.process.exit(1);
             };
             return;
         } else if (std.mem.eql(u8, sub, "clone")) {
+            defer client_ca_bundle.deinit(allocator);
             runClone(allocator, argv_list.items[1..]) catch |e| {
                 if (e != error.BadArgs) std.debug.print("clone failed: {t}\n", .{e});
                 std.process.exit(1);
             };
             return;
         } else if (std.mem.eql(u8, sub, "snapshots")) {
+            defer client_ca_bundle.deinit(allocator);
             runSnapshotsList(allocator, argv_list.items[1..]) catch |e| {
                 if (e != error.BadArgs) std.debug.print("snapshots failed: {t}\n", .{e});
                 std.process.exit(1);
@@ -1521,6 +1516,10 @@ pub fn main(init: std.process.Init) !void {
             enable_fsync = true;
         } else if (std.mem.eql(u8, arg, "--no-fsync") or std.mem.eql(u8, arg, "--fast")) {
             enable_fsync = false;
+        } else if (std.mem.startsWith(u8, arg, "--sse-key-file=")) {
+            sse_key_file_opt = arg[15..];
+        } else if (std.mem.startsWith(u8, arg, "--lifecycle-interval-s=")) {
+            lifecycle_interval_s = std.fmt.parseInt(u64, arg[23..], 10) catch LIFECYCLE_INTERVAL_S;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             show_help = true;
         }
@@ -1561,6 +1560,14 @@ pub fn main(init: std.process.Init) !void {
             \\      --fast disables fsync for benchmarks; acknowledged writes may
             \\      then be lost on crash or power loss.
             \\
+            \\  --sse-key-file=PATH
+            \\      SSE-S3 master key (64 hex chars). Default: ZS3_SSE_KEY env, or
+            \\      <data-dir>/.zs3/sse.key (generated on first use).
+            \\
+            \\  --lifecycle-interval-s={d}
+            \\      How often lifecycle rules (expiration, noncurrent version
+            \\      cleanup, incomplete multipart abort) are evaluated.
+            \\
             \\  --help, -h
             \\      Show this help
             \\
@@ -1576,7 +1583,9 @@ pub fn main(init: std.process.Init) !void {
             \\  Snapshot flags: --endpoint=URL (or ZS3_ENDPOINT), --bucket=NAME,
             \\    --name=NAME, --dest=DIR, --cache=DIR, --access-key=K
             \\    (or AWS_ACCESS_KEY_ID), --secret-key=S (or AWS_SECRET_ACCESS_KEY),
-            \\    --region=R (default us-east-1), --chunk-bytes=N (default 4MB)
+            \\    --region=R (default us-east-1), --chunk-bytes=N (default 4MB),
+            \\    --ca-file=PEM (or ZS3_CA_FILE) to trust a private CA for https://
+            \\    endpoints, --insecure to skip TLS verification
             \\
             \\Examples:
             \\  zs3                                    # Standalone mode
@@ -1586,7 +1595,7 @@ pub fn main(init: std.process.Init) !void {
             \\  zs3 snapshot --bucket=artifacts --name=v1
             \\  zs3 clone --bucket=artifacts --name=v1 --dest=./v1
             \\
-        , .{ GOSSIP_INTERVAL_MS, port, data_dir, raw_acl_list });
+        , .{ GOSSIP_INTERVAL_MS, port, data_dir, raw_acl_list, LIFECYCLE_INTERVAL_S });
         return;
     }
 
@@ -1668,6 +1677,15 @@ pub fn main(init: std.process.Init) !void {
         .access_control_map = access_control_map,
         .distributed = if (dist_ctx != null) &dist_ctx.? else null,
     };
+    sse_ctx = &ctx;
+    // Lifecycle rules run on their own thread; filesystem renames/unlinks are
+    // atomic so the request loop needs no lock.
+    const lifecycle_thread = std.Thread.spawn(.{}, lifecycleThreadMain, .{&ctx}) catch |err| blk: {
+        std.log.warn("lifecycle thread not started: {t}", .{err});
+        break :blk null;
+    };
+    if (lifecycle_thread) |t| t.detach();
+
     defer ctx.deinit();
 
     const address = net.IpAddress.parseIp4("0.0.0.0", port) catch unreachable;
@@ -2302,6 +2320,55 @@ fn isPublicRequest(data: []const u8) bool {
     return std.mem.eql(u8, path, "/metrics");
 }
 
+/// Cheap pre-parse gate for unsigned requests. Private deployments keep the
+/// fast 403 (no body read); a request is only routed for the real ACL check
+/// when its bucket has an ACL file or object ACLs have ever been used.
+fn mayBeAnonymousAllowed(ctx: *const S3Context, data: []const u8) bool {
+    const line_end = std.mem.indexOf(u8, data, "\r\n") orelse return false;
+    var parts = std.mem.splitScalar(u8, data[0..line_end], ' ');
+    _ = parts.next() orelse return false;
+    var target = parts.next() orelse return false;
+    if (std.mem.indexOfScalar(u8, target, '?')) |q| target = target[0..q];
+    if (target.len > 0 and target[0] == '/') target = target[1..];
+    const bucket = if (std.mem.indexOfScalar(u8, target, '/')) |sl| target[0..sl] else target;
+    if (bucket.len == 0 or !isValidBucketName(bucket)) return false;
+    var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+    const acl_path = std.fmt.bufPrint(&path_buf, "{s}/{s}/" ++ BUCKET_CFG_DIR ++ "/acl", .{ ctx.data_dir, bucket }) catch return false;
+    if (std.Io.Dir.cwd().access(app_io, acl_path, .{})) |_| return true else |_| {}
+    return objectAclsUsed(ctx);
+}
+
+var object_acls_used_cache: enum { unknown, no, yes } = .unknown;
+
+/// Whether any object has ever been given a public ACL (persisted as a
+/// marker file so the fast path stays correct across restarts).
+fn objectAclsUsed(ctx: *const S3Context) bool {
+    switch (object_acls_used_cache) {
+        .yes => return true,
+        .no => return false,
+        .unknown => {},
+    }
+    var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+    const marker = std.fmt.bufPrint(&path_buf, "{s}/.zs3/object-acls", .{ctx.data_dir}) catch return false;
+    if (std.Io.Dir.cwd().access(app_io, marker, .{})) |_| {
+        object_acls_used_cache = .yes;
+        return true;
+    } else |_| {
+        object_acls_used_cache = .no;
+        return false;
+    }
+}
+
+fn noteObjectAclUsed(ctx: *const S3Context) void {
+    if (object_acls_used_cache == .yes) return;
+    var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+    const marker = std.fmt.bufPrint(&path_buf, "{s}/.zs3/object-acls", .{ctx.data_dir}) catch return;
+    if (std.fs.path.dirname(marker)) |d| std.Io.Dir.cwd().createDirPath(app_io, d) catch {};
+    var f = std.Io.Dir.cwd().createFile(app_io, marker, .{}) catch return;
+    f.close(app_io);
+    object_acls_used_cache = .yes;
+}
+
 fn hasQueryAuth(data: []const u8) bool {
     // Scan only the request line (up to the first CRLF) for the presigned marker.
     const line_end = std.mem.indexOf(u8, data, "\r\n") orelse data.len;
@@ -2394,7 +2461,7 @@ fn handleConnectionWithStream(allocator: Allocator, ctx: *const S3Context, strea
 
     // Requests that never need auth: peer protocol, CORS preflight, and the
     // public observability/console endpoints.
-    if (!isPublicRequest(data) and !hasAuth(data)) {
+    if (!isPublicRequest(data) and !hasAuth(data) and !mayBeAnonymousAllowed(ctx, data)) {
         streamWriteAll(stream, ERROR_403) catch return false;
         return true;
     }
@@ -2525,16 +2592,6 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         acl_ctx = SigV4.verifyPresigned(ctx, req, allocator);
     }
 
-    // S3 API requires authentication
-    if (!acl_ctx.authenticated) {
-        sendError(res, 403, "AccessDenied", "Invalid credentials");
-        return;
-    }
-    if (!acl_ctx.granted(req.method)) {
-        sendError(res, 403, "AccessDenied", "Insufficient permissions");
-        return;
-    }
-
     // Split the raw path, then decode each segment: the filesystem stores
     // decoded names, while SigV4 above verified the raw (encoded) form.
     // Segments split before decoding so a literal %2F inside a key survives
@@ -2565,9 +2622,32 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         return;
     }
 
+    // Unsigned requests are allowed only what the bucket/object ACL grants.
+    if (!acl_ctx.authenticated) {
+        if (anonymousRole(ctx, allocator, req, bucket, key)) |role| {
+            acl_ctx = .{ .authenticated = true, .role = role, .anonymous = true };
+        } else {
+            sendError(res, 403, "AccessDenied", "Invalid credentials");
+            return;
+        }
+    }
+    if (!acl_ctx.granted(req.method)) {
+        sendError(res, 403, "AccessDenied", "Insufficient permissions");
+        return;
+    }
+
     // Legacy fallback: objects written before path decoding are stored
     // encoded; prefer whichever file exists.
     key = try resolveLegacyKey(ctx, allocator, bucket, key, raw_key);
+
+    // ?acl, ?tagging, ?versioning, ?versions, ?lifecycle, ?encryption
+    if (try routeSubresource(ctx, allocator, req, res, bucket, key, acl_ctx.anonymous)) return;
+
+    // Public-read-write grants object writes, never bucket create/delete.
+    if (acl_ctx.anonymous and key.len == 0 and !std.mem.eql(u8, req.method, "GET") and !std.mem.eql(u8, req.method, "HEAD") and !hasQuery(req.query, "delete")) {
+        sendError(res, 403, "AccessDenied", "Anonymous requests cannot create or delete buckets");
+        return;
+    }
 
     // In distributed mode, use CAS for object storage
     if (ctx.distributed != null) {
@@ -2609,7 +2689,7 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         }
     } else if (std.mem.eql(u8, req.method, "PUT")) {
         if (key.len == 0) {
-            try handleCreateBucket(ctx, allocator, res, bucket);
+            try handleCreateBucket(ctx, allocator, req, res, bucket);
         } else if (hasQuery(req.query, "uploadId")) {
             if (req.header("x-amz-copy-source")) |_| {
                 try handleUploadPartCopy(ctx, allocator, req, res, bucket, key);
@@ -2627,7 +2707,7 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         } else if (hasQuery(req.query, "uploadId")) {
             try handleAbortMultipart(ctx, allocator, req, res);
         } else {
-            try handleDeleteObject(ctx, allocator, res, bucket, key);
+            try handleDeleteObject(ctx, allocator, req, res, bucket, key);
         }
     } else if (std.mem.eql(u8, req.method, "HEAD")) {
         if (key.len == 0) {
@@ -2639,7 +2719,7 @@ fn route(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Respo
         if (hasQuery(req.query, "delete")) {
             try handleDeleteObjects(ctx, allocator, req, res, bucket);
         } else if (hasQuery(req.query, "uploads")) {
-            try handleInitiateMultipart(ctx, allocator, res, bucket, key);
+            try handleInitiateMultipart(ctx, allocator, req, res, bucket, key);
         } else if (hasQuery(req.query, "uploadId")) {
             try handleCompleteMultipart(ctx, allocator, req, res, bucket, key);
         } else {
@@ -2666,6 +2746,8 @@ pub const SigV4 = struct {
     const ACLCtx = struct {
         authenticated: bool,
         role: ?acl.Role,
+        /// Granted by a public ACL rather than a signature.
+        anonymous: bool = false,
 
         fn granted(self: *const ACLCtx, method: []const u8) bool {
             const role = self.role orelse return false;
@@ -3283,6 +3365,19 @@ const AttrEntry = struct { name: []const u8, value: []const u8 };
 const ObjectAttrs = struct {
     content_type: []const u8,
     entries: []AttrEntry = &.{},
+    // System fields, kept out of `entries` so they never echo as headers.
+    /// Object tags in x-amz-tagging query form ("k=v&k2=v2", URL-encoded).
+    tagging: ?[]const u8 = null,
+    /// Canned object ACL (private / public-read / public-read-write).
+    acl: ?[]const u8 = null,
+    /// Version ID of this object (absent = the "null" version).
+    version_id: ?[]const u8 = null,
+    /// "AES256" when the file on disk is SSE-S3 encrypted; "SSE-C" for
+    /// customer-key encryption (key MD5 in `sse_key_md5`).
+    sse: ?[]const u8 = null,
+    sse_key_md5: ?[]const u8 = null,
+    /// Stored plaintext ETag for encrypted objects (MD5 of the content).
+    etag: ?[]const u8 = null,
 
     fn deinit(self: *const ObjectAttrs, allocator: Allocator) void {
         allocator.free(self.content_type);
@@ -3291,8 +3386,84 @@ const ObjectAttrs = struct {
             allocator.free(e.value);
         }
         allocator.free(self.entries);
+        if (self.tagging) |v| allocator.free(v);
+        if (self.acl) |v| allocator.free(v);
+        if (self.version_id) |v| allocator.free(v);
+        if (self.sse) |v| allocator.free(v);
+        if (self.sse_key_md5) |v| allocator.free(v);
+        if (self.etag) |v| allocator.free(v);
+    }
+
+    /// True when a sidecar is needed to represent this object.
+    fn hasNonDefault(self: *const ObjectAttrs) bool {
+        return !std.mem.eql(u8, self.content_type, DEFAULT_CONTENT_TYPE) or
+            self.entries.len > 0 or self.tagging != null or self.acl != null or
+            self.version_id != null or self.sse != null or self.sse_key_md5 != null or
+            self.etag != null;
+    }
+
+    /// Deep copy (for carrying attrs across arena boundaries or editing).
+    fn clone(self: *const ObjectAttrs, allocator: Allocator) !ObjectAttrs {
+        var out = ObjectAttrs{ .content_type = try allocator.dupe(u8, self.content_type) };
+        errdefer out.deinit(allocator);
+        var entries: std.ArrayListUnmanaged(AttrEntry) = .empty;
+        errdefer {
+            for (entries.items) |e| {
+                allocator.free(e.name);
+                allocator.free(e.value);
+            }
+            entries.deinit(allocator);
+        }
+        for (self.entries) |e| {
+            try entries.append(allocator, .{ .name = try allocator.dupe(u8, e.name), .value = try allocator.dupe(u8, e.value) });
+        }
+        out.entries = try entries.toOwnedSlice(allocator);
+        if (self.tagging) |v| out.tagging = try allocator.dupe(u8, v);
+        if (self.acl) |v| out.acl = try allocator.dupe(u8, v);
+        if (self.version_id) |v| out.version_id = try allocator.dupe(u8, v);
+        if (self.sse) |v| out.sse = try allocator.dupe(u8, v);
+        if (self.sse_key_md5) |v| out.sse_key_md5 = try allocator.dupe(u8, v);
+        if (self.etag) |v| out.etag = try allocator.dupe(u8, v);
+        return out;
     }
 };
+
+/// Sidecar line names reserved for system fields (never echoed as headers).
+fn isSystemAttrName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "tagging") or std.mem.eql(u8, name, "acl") or
+        std.mem.eql(u8, name, "version-id") or std.mem.eql(u8, name, "sse") or
+        std.mem.eql(u8, name, "sse-key-md5") or std.mem.eql(u8, name, "etag");
+}
+
+/// Serialize attrs to the `name: value` sidecar text (shared by the
+/// standalone sidecar and the distributed .attrs entry).
+fn attrsToTextInto(allocator: Allocator, buf: *std.ArrayListUnmanaged(u8), attrs: *const ObjectAttrs) !void {
+    try buf.appendSlice(allocator, "content-type: ");
+    try buf.appendSlice(allocator, attrs.content_type);
+    try buf.append(allocator, '\n');
+    for (attrs.entries) |e| {
+        try buf.appendSlice(allocator, e.name);
+        try buf.appendSlice(allocator, ": ");
+        try buf.appendSlice(allocator, e.value);
+        try buf.append(allocator, '\n');
+    }
+    const sys = [_]struct { name: []const u8, value: ?[]const u8 }{
+        .{ .name = "tagging", .value = attrs.tagging },
+        .{ .name = "acl", .value = attrs.acl },
+        .{ .name = "version-id", .value = attrs.version_id },
+        .{ .name = "sse", .value = attrs.sse },
+        .{ .name = "sse-key-md5", .value = attrs.sse_key_md5 },
+        .{ .name = "etag", .value = attrs.etag },
+    };
+    for (sys) |f| {
+        if (f.value) |v| {
+            try buf.appendSlice(allocator, f.name);
+            try buf.appendSlice(allocator, ": ");
+            try buf.appendSlice(allocator, v);
+            try buf.append(allocator, '\n');
+        }
+    }
+}
 
 fn isAttrHeader(name: []const u8) bool {
     // Headers persisted on the object and echoed back on GET/HEAD.
@@ -3323,10 +3494,21 @@ fn collectRequestAttrs(allocator: Allocator, req: *const Request) !ObjectAttrs {
             });
         }
     }
-    return .{
+    var out = ObjectAttrs{
         .content_type = try allocator.dupe(u8, ct),
         .entries = try entries.toOwnedSlice(allocator),
     };
+    errdefer out.deinit(allocator);
+    if (req.header("x-amz-tagging")) |t| {
+        const tags = try parseTagQuery(allocator, t);
+        defer freeTags(allocator, tags);
+        out.tagging = try tagsToQuery(allocator, tags);
+    }
+    if (req.header("x-amz-acl")) |a| {
+        if (!isCannedAcl(a)) return error.InvalidAcl;
+        out.acl = try allocator.dupe(u8, normalizeCannedAcl(a));
+    }
+    return out;
 }
 
 fn attrsSidecarPath(allocator: Allocator, obj_path: []const u8) ![]const u8 {
@@ -3336,8 +3518,7 @@ fn attrsSidecarPath(allocator: Allocator, obj_path: []const u8) ![]const u8 {
 /// Persist attributes next to a standalone object. Skips the write when there
 /// is nothing non-default to store, keeping plain PUTs to a single file.
 fn saveStandaloneAttrs(allocator: Allocator, obj_path: []const u8, attrs: *const ObjectAttrs) void {
-    const non_default_ct = !std.mem.eql(u8, attrs.content_type, DEFAULT_CONTENT_TYPE);
-    if (!non_default_ct and attrs.entries.len == 0) {
+    if (!attrs.hasNonDefault()) {
         // Remove any stale sidecar (e.g. overwrite with bare PUT after a
         // metadata PUT, or a CopyObject with REPLACE and no metadata).
         const old = attrsSidecarPath(allocator, obj_path) catch return;
@@ -3349,15 +3530,7 @@ fn saveStandaloneAttrs(allocator: Allocator, obj_path: []const u8, attrs: *const
     defer allocator.free(sidecar);
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
-    buf.appendSlice(allocator, "content-type: ") catch return;
-    buf.appendSlice(allocator, attrs.content_type) catch return;
-    buf.append(allocator, '\n') catch return;
-    for (attrs.entries) |e| {
-        buf.appendSlice(allocator, e.name) catch return;
-        buf.appendSlice(allocator, ": ") catch return;
-        buf.appendSlice(allocator, e.value) catch return;
-        buf.append(allocator, '\n') catch return;
-    }
+    attrsToTextInto(allocator, &buf, attrs) catch return;
     var af = std.Io.Dir.cwd().createFileAtomic(app_io, sidecar, .{ .make_path = true, .replace = true }) catch return;
     defer af.deinit(app_io);
     af.file.writeStreamingAll(app_io, buf.items) catch return;
@@ -3384,6 +3557,15 @@ fn loadStandaloneAttrs(allocator: Allocator, obj_path: []const u8, key: []const 
 fn parseAttrsContent(allocator: Allocator, content: []const u8) !ObjectAttrs {
     var ct: []const u8 = try allocator.dupe(u8, DEFAULT_CONTENT_TYPE);
     errdefer allocator.free(ct);
+    var sys = ObjectAttrs{ .content_type = "" };
+    errdefer {
+        if (sys.tagging) |v| allocator.free(v);
+        if (sys.acl) |v| allocator.free(v);
+        if (sys.version_id) |v| allocator.free(v);
+        if (sys.sse) |v| allocator.free(v);
+        if (sys.sse_key_md5) |v| allocator.free(v);
+        if (sys.etag) |v| allocator.free(v);
+    }
     var entries: std.ArrayListUnmanaged(AttrEntry) = .empty;
     errdefer {
         for (entries.items) |e| {
@@ -3403,6 +3585,12 @@ fn parseAttrsContent(allocator: Allocator, content: []const u8) !ObjectAttrs {
         if (std.mem.eql(u8, name, "content-type")) {
             allocator.free(ct);
             ct = try allocator.dupe(u8, value);
+        } else if (isSystemAttrName(name)) {
+            const dup = try allocator.dupe(u8, value);
+            errdefer allocator.free(dup);
+            const slot: *?[]const u8 = if (std.mem.eql(u8, name, "tagging")) &sys.tagging else if (std.mem.eql(u8, name, "acl")) &sys.acl else if (std.mem.eql(u8, name, "version-id")) &sys.version_id else if (std.mem.eql(u8, name, "sse")) &sys.sse else if (std.mem.eql(u8, name, "sse-key-md5")) &sys.sse_key_md5 else &sys.etag;
+            if (slot.*) |old_v| allocator.free(old_v);
+            slot.* = dup;
         } else {
             try entries.append(allocator, .{
                 .name = try allocator.dupe(u8, name),
@@ -3410,7 +3598,9 @@ fn parseAttrsContent(allocator: Allocator, content: []const u8) !ObjectAttrs {
             });
         }
     }
-    return .{ .content_type = ct, .entries = try entries.toOwnedSlice(allocator) };
+    sys.content_type = ct;
+    sys.entries = try entries.toOwnedSlice(allocator);
+    return sys;
 }
 
 fn deleteStandaloneAttrs(allocator: Allocator, obj_path: []const u8) void {
@@ -3425,6 +3615,32 @@ fn applyAttrsToResponse(res: *Response, attrs: *const ObjectAttrs) void {
     for (attrs.entries) |e| {
         res.setHeader(e.name, e.value);
     }
+    applySystemAttrHeaders(res, attrs);
+}
+
+/// Headers derived from system fields: tag count, version id, SSE echo.
+fn applySystemAttrHeaders(res: *Response, attrs: *const ObjectAttrs) void {
+    if (attrs.tagging) |t| {
+        if (t.len > 0) {
+            var n: usize = 1;
+            for (t) |c| {
+                if (c == '&') n += 1;
+            }
+            var buf: [16]u8 = undefined;
+            const count = std.fmt.bufPrint(&buf, "{d}", .{n}) catch "0";
+            // Header values must outlive the response: copy onto the arena.
+            res.setHeader("x-amz-tagging-count", res.allocator.dupe(u8, count) catch return);
+        }
+    }
+    if (attrs.version_id) |v| res.setHeader("x-amz-version-id", v);
+    if (attrs.sse) |mode| {
+        if (std.mem.eql(u8, mode, "SSE-C")) {
+            res.setHeader("x-amz-server-side-encryption-customer-algorithm", "AES256");
+            if (attrs.sse_key_md5) |m| res.setHeader("x-amz-server-side-encryption-customer-key-MD5", m);
+        } else {
+            res.setHeader("x-amz-server-side-encryption", mode);
+        }
+    }
 }
 
 /// Variant for 206 Partial Content: checksums describe the whole object, not
@@ -3438,6 +3654,7 @@ fn applyAttrsToRangeResponse(res: *Response, attrs: *const ObjectAttrs) void {
         if (std.mem.eql(u8, e.name, "x-amz-sdk-checksum-algorithm")) continue;
         res.setHeader(e.name, e.value);
     }
+    applySystemAttrHeaders(res, attrs);
 }
 
 /// Echo request checksums back on a PUT/CopyObject response, mirroring S3.
@@ -3467,6 +3684,41 @@ fn handlePutObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     // Honor If-Match / If-None-Match before touching the object.
     if (!checkPutPreconditions(allocator, req, res, path)) return;
 
+    // Validate headers that become stored attributes before writing anything.
+    var attrs = collectRequestAttrs(allocator, req) catch |err| {
+        if (err == error.InvalidTag) {
+            sendError(res, 400, "InvalidTag", "The TagValue you have provided is invalid");
+            return;
+        }
+        if (err == error.InvalidAcl) {
+            sendError(res, 400, "InvalidArgument", "Unknown canned ACL");
+            return;
+        }
+        return err;
+    };
+    defer attrs.deinit(allocator);
+
+    // Server-side encryption: SSE-C headers, then x-amz-server-side-encryption,
+    // then the bucket default. Encrypt into a separate buffer; the ETag is
+    // always the MD5 of the plaintext.
+    const sse = resolveSseForWrite(ctx, allocator, req, res, bucket) catch return;
+    const stored_body: []const u8 = if (sse) |mode| blk: {
+        const enc = sseEncrypt(allocator, req.body, mode) catch {
+            sendError(res, 500, "InternalError", "Encryption failed");
+            return;
+        };
+        try applySseToAttrs(allocator, &attrs, mode, req.body);
+        noteBucketSseUsed(ctx, allocator, bucket);
+        break :blk enc;
+    } else req.body;
+
+    const vstatus = bucketVersioning(ctx, allocator, bucket);
+    archiveCurrentVersion(ctx, allocator, bucket, effective_key, path, vstatus) catch {
+        sendError(res, 500, "InternalError", "Cannot archive previous version");
+        return;
+    };
+    if (vstatus == .enabled) attrs.version_id = try newVersionId(allocator);
+
     // Write atomically: temp file + rename, so a concurrent GET never sees a
     // half-written object. make_path creates parent directories.
     var af = std.Io.Dir.cwd().createFileAtomic(app_io, path, .{
@@ -3478,7 +3730,7 @@ fn handlePutObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     };
     defer af.deinit(app_io);
 
-    af.file.writeStreamingAll(app_io, req.body) catch {
+    af.file.writeStreamingAll(app_io, stored_body) catch {
         sendError(res, 500, "InternalError", "Cannot write file");
         return;
     };
@@ -3490,13 +3742,11 @@ fn handlePutObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     };
     if (enable_fsync) fsyncParentDir(path);
 
-    // Persist Content-Type / x-amz-meta-* / checksums alongside the object.
-    const attrs = collectRequestAttrs(allocator, req) catch null;
-    if (attrs) |a| {
-        saveStandaloneAttrs(allocator, path, &a);
-        echoRequestChecksums(req, res);
-        a.deinit(allocator);
-    }
+    // Persist Content-Type / x-amz-meta-* / checksums / tags / ACL / version
+    // / SSE state alongside the object.
+    saveStandaloneAttrs(allocator, path, &attrs);
+    echoRequestChecksums(req, res);
+    if (attrs.acl != null) noteObjectAclUsed(ctx);
 
     // ETag is the MD5 of the content, so `aws s3 sync` and `rclone check`
     // agree with local md5sum.
@@ -3508,6 +3758,12 @@ fn handlePutObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     metrics.put_bytes += req.body.len;
     res.ok();
     res.setHeader("ETag", etag);
+    if (attrs.version_id) |v| {
+        res.setHeader("x-amz-version-id", try allocator.dupe(u8, v));
+    } else if (vstatus != .disabled) {
+        res.setHeader("x-amz-version-id", NULL_VERSION);
+    }
+    applySseResponseHeaders(res, &attrs, allocator);
 }
 
 fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
@@ -3516,11 +3772,17 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     else
         try allocator.dupe(u8, key);
     defer allocator.free(effective_key);
-    const path = try ctx.objectPath(allocator, bucket, effective_key);
-    defer allocator.free(path);
+    const current_path = try ctx.objectPath(allocator, bucket, effective_key);
+    defer allocator.free(current_path);
+
+    // ?versionId= selects the current object or an archived version.
+    const path = (try resolveRequestedVersion(ctx, allocator, req, res, bucket, effective_key, current_path)) orelse return;
+
+    // Encrypted objects are decrypted in memory and served from there.
+    if (try serveEncryptedIfNeeded(ctx, allocator, req, res, bucket, effective_key, path, false)) return;
 
     var file = std.Io.Dir.cwd().openFile(app_io, path, .{}) catch {
-        sendError(res, 404, "NoSuchKey", "Object not found");
+        sendMissingObject(ctx, allocator, res, bucket, effective_key);
         return;
     };
 
@@ -3583,6 +3845,7 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
             } else {
                 applyAttrsToResponse(res, &attrs);
             }
+            addNullVersionHeader(ctx, allocator, res, bucket, &attrs);
         } else |_| {}
         if (cond_range) |range| {
             const content_range = std.fmt.allocPrint(allocator, "bytes {d}-{d}/{d}", .{ range.start, range.end, content.len }) catch {
@@ -3604,6 +3867,7 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     // NB: no deinit — response headers borrow attrs memory, freed by the
     // request arena after the response is written.
     const obj_attrs = loadStandaloneAttrs(allocator, path, key) catch null;
+    if (obj_attrs) |*a| addNullVersionHeader(ctx, allocator, res, bucket, a);
 
     // For range requests, use sendFile without ETag (efficient for large files)
     if (req.header("range")) |range_header| {
@@ -3650,17 +3914,25 @@ fn handleGetObject(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     res.body = content;
 }
 
-fn handleDeleteObject(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, key: []const u8) !void {
+fn handleDeleteObject(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
     const effective_key = if (key.len > 0 and key[key.len - 1] == '/')
         try std.fmt.allocPrint(allocator, "{s}.folder_marker", .{key})
     else
         try allocator.dupe(u8, key);
     defer allocator.free(effective_key);
-    const path = try ctx.objectPath(allocator, bucket, effective_key);
-    defer allocator.free(path);
 
-    deleteObjectInternal(ctx, allocator, bucket, path);
+    const version_id = if (getQueryParam(req.query, "versionId")) |v| try uriDecode(allocator, v) else null;
+    const outcome = deleteObjectVersioned(ctx, allocator, bucket, effective_key, version_id) catch {
+        sendError(res, 500, "InternalError", "Delete failed");
+        return;
+    };
+    if (outcome.not_found) {
+        sendError(res, 404, "NoSuchVersion", "The specified version does not exist");
+        return;
+    }
     res.noContent();
+    if (outcome.delete_marker) res.setHeader("x-amz-delete-marker", "true");
+    if (outcome.version_id) |v| res.setHeader("x-amz-version-id", v);
 }
 
 fn deleteObjectInternal(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, path: []const u8) void {
@@ -3691,34 +3963,68 @@ fn handleDeleteObjects(ctx: *const S3Context, allocator: Allocator, req: *Reques
     try xml.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
     try xml.appendSlice(allocator, "<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
 
-    // Simple XML parsing - find all <Key>...</Key> pairs
+    // Each <Object> carries a <Key> and optionally a <VersionId>.
+    const quiet = if (xmlTagText(req.body, "Quiet")) |q| std.mem.eql(u8, q, "true") else false;
     var body = req.body;
+    while (std.mem.indexOf(u8, body, "<Object>")) |start| {
+        const after = body[start + 8 ..];
+        const end = std.mem.indexOf(u8, after, "</Object>") orelse break;
+        const block = after[0..end];
+        body = after[end + 9 ..];
+        const raw_key = xmlTagText(block, "Key") orelse continue;
+        const key = try xmlUnescape(allocator, raw_key);
+        const version_id: ?[]const u8 = if (xmlTagText(block, "VersionId")) |v| (if (v.len > 0) v else null) else null;
 
-    while (std.mem.indexOf(u8, body, "<Key>")) |start| {
-        const key_start = start + 5;
-        const end = std.mem.indexOf(u8, body[key_start..], "</Key>") orelse break;
-        const key = body[key_start .. key_start + end];
-
-        if (key.len > 0 and isValidKey(key)) {
-            // Legacy fallback: a decoded name may refer to a still-encoded file.
-            const rkey = resolveLegacyKey(ctx, allocator, bucket, key, key) catch continue;
-            // In distributed mode, also delete from metadata index
-            if (ctx.distributed) |dist| {
-                dist.meta_index.delete(allocator, bucket, rkey);
-                deleteDistAttrs(allocator, dist, bucket, rkey);
-            }
-
-            const path = ctx.objectPath(allocator, bucket, rkey) catch continue;
-            defer allocator.free(path);
-
-            deleteObjectInternal(ctx, allocator, bucket, path);
-
-            try xml.appendSlice(allocator, "<Deleted><Key>");
+        if (key.len == 0 or !isValidKey(key)) {
+            try xml.appendSlice(allocator, "<Error><Key>");
             try xmlEscape(allocator, &xml, key);
-            try xml.appendSlice(allocator, "</Key></Deleted>");
+            try xml.appendSlice(allocator, "</Key><Code>InvalidKey</Code><Message>Object key is invalid</Message></Error>");
+            continue;
+        }
+        // Legacy fallback: a decoded name may refer to a still-encoded file.
+        const rkey = resolveLegacyKey(ctx, allocator, bucket, key, key) catch continue;
+        const effective_key = if (rkey.len > 0 and rkey[rkey.len - 1] == '/')
+            try std.fmt.allocPrint(allocator, "{s}.folder_marker", .{rkey})
+        else
+            rkey;
+        // In distributed mode, also delete from metadata index
+        if (ctx.distributed) |dist| {
+            dist.meta_index.delete(allocator, bucket, rkey);
+            deleteDistAttrs(allocator, dist, bucket, rkey);
         }
 
-        body = body[key_start + end + 6 ..];
+        const outcome = deleteObjectVersioned(ctx, allocator, bucket, effective_key, version_id) catch {
+            try xml.appendSlice(allocator, "<Error><Key>");
+            try xmlEscape(allocator, &xml, key);
+            try xml.appendSlice(allocator, "</Key><Code>InternalError</Code><Message>Delete failed</Message></Error>");
+            continue;
+        };
+        if (outcome.not_found) {
+            try xml.appendSlice(allocator, "<Error><Key>");
+            try xmlEscape(allocator, &xml, key);
+            try xml.appendSlice(allocator, "</Key><VersionId>");
+            try xmlEscape(allocator, &xml, version_id orelse "");
+            try xml.appendSlice(allocator, "</VersionId><Code>NoSuchVersion</Code><Message>The specified version does not exist</Message></Error>");
+            continue;
+        }
+        if (quiet) continue;
+        try xml.appendSlice(allocator, "<Deleted><Key>");
+        try xmlEscape(allocator, &xml, key);
+        try xml.appendSlice(allocator, "</Key>");
+        if (version_id) |v| {
+            try xml.appendSlice(allocator, "<VersionId>");
+            try xmlEscape(allocator, &xml, v);
+            try xml.appendSlice(allocator, "</VersionId>");
+        }
+        if (outcome.delete_marker) {
+            try xml.appendSlice(allocator, "<DeleteMarker>true</DeleteMarker>");
+            if (outcome.version_id) |v| {
+                try xml.appendSlice(allocator, "<DeleteMarkerVersionId>");
+                try xml.appendSlice(allocator, v);
+                try xml.appendSlice(allocator, "</DeleteMarkerVersionId>");
+            }
+        }
+        try xml.appendSlice(allocator, "</Deleted>");
     }
 
     try xml.appendSlice(allocator, "</DeleteResult>");
@@ -3739,13 +4045,20 @@ const CopySource = struct {
     bucket: []const u8,
     key: []const u8, // decoded (canonical) form
     raw: []const u8, // verbatim header form, for the legacy fallback
+    version_id: ?[]const u8 = null,
 };
 
 fn parseCopySource(allocator: Allocator, header: []const u8) !CopySource {
     var src = std.mem.trim(u8, header, " \t");
     if (src.len > 0 and src[0] == '/') src = src[1..];
-    // Strip ?versionId=... (accepted, ignored: no versions stored).
-    if (std.mem.indexOfScalar(u8, src, '?')) |q| src = src[0..q];
+    // ?versionId=... selects an archived version of the source.
+    var version_id: ?[]const u8 = null;
+    if (std.mem.indexOfScalar(u8, src, '?')) |q| {
+        if (getQueryParam(src[q + 1 ..], "versionId")) |v| {
+            if (v.len > 0) version_id = try uriDecode(allocator, v);
+        }
+        src = src[0..q];
+    }
     const slash = std.mem.indexOfScalar(u8, src, '/') orelse return error.InvalidCopySource;
     // x-amz-copy-source is URL-encoded per spec: split raw, then decode each
     // segment (a literal %2F inside a key survives as data).
@@ -3771,7 +4084,7 @@ fn parseCopySource(allocator: Allocator, header: []const u8) !CopySource {
         allocator.free(raw);
         return error.InvalidCopySource;
     }
-    return .{ .bucket = bucket, .key = key, .raw = raw };
+    return .{ .bucket = bucket, .key = key, .raw = raw, .version_id = version_id };
 }
 
 /// Parse x-amz-copy-source-range ("bytes=first-last" or "first-last").
@@ -3886,10 +4199,41 @@ fn handleCopyObject(ctx: *const S3Context, allocator: Allocator, req: *Request, 
     // Legacy fallback for the source, same rule as request paths.
     const src_key = try resolveLegacyKey(ctx, allocator, src.bucket, src.key, src.raw);
 
-    const data = readSourceBytes(ctx, allocator, src.bucket, src_key) catch {
-        sendError(res, 404, "NoSuchKey", "Copy source not found");
-        return;
-    };
+    // Source: current object, or a specific version; decrypted if stored
+    // with SSE (SSE-C needs the x-amz-copy-source-…-customer-* headers).
+    const src_effective = if (src_key.len > 0 and src_key[src_key.len - 1] == '/')
+        try std.fmt.allocPrint(allocator, "{s}.folder_marker", .{src_key})
+    else
+        src_key;
+    var src_path_opt: ?[]const u8 = null;
+    if (ctx.distributed == null) {
+        const cur = try ctx.objectPath(allocator, src.bucket, src_effective);
+        if (src.version_id) |vid| {
+            switch (try resolveVersion(ctx, allocator, src.bucket, src_effective, cur, vid)) {
+                .path => |p| src_path_opt = p,
+                .delete_marker => {
+                    sendError(res, 404, "NoSuchKey", "Copy source is a delete marker");
+                    return;
+                },
+                .not_found => {
+                    sendError(res, 404, "NoSuchVersion", "The specified version does not exist");
+                    return;
+                },
+            }
+        } else {
+            src_path_opt = cur;
+        }
+    }
+    const data = if (src_path_opt) |sp|
+        readObjectPlaintext(allocator, req, sp, src_effective, true) catch |err| {
+            sendCopySourceReadError(res, err);
+            return;
+        }
+    else
+        readSourceBytes(ctx, allocator, src.bucket, src_key) catch {
+            sendError(res, 404, "NoSuchKey", "Copy source not found");
+            return;
+        };
     defer allocator.free(data);
 
     // Folder-marker destinations are stored as ".folder_marker" files, like PUT.
@@ -3941,12 +4285,87 @@ fn handleCopyObject(ctx: *const S3Context, allocator: Allocator, req: *Request, 
     defer allocator.free(dst_path);
     if (!checkPutPreconditions(allocator, req, res, dst_path)) return;
 
+    // Destination attributes: request headers (REPLACE) or the source's
+    // (COPY), with tags following x-amz-tagging-directive separately.
+    const tagging_replace = if (req.header("x-amz-tagging-directive")) |d| std.ascii.eqlIgnoreCase(d, "REPLACE") else false;
+    const src_attrs: ?ObjectAttrs = if (src_path_opt) |sp| (loadStandaloneAttrs(allocator, sp, src_key) catch null) else null;
+    var dst_attrs: ObjectAttrs = blk: {
+        if (replace) {
+            var a = collectRequestAttrs(allocator, req) catch |err| {
+                if (err == error.InvalidTag) {
+                    sendError(res, 400, "InvalidTag", "The TagValue you have provided is invalid");
+                    return;
+                }
+                if (err == error.InvalidAcl) {
+                    sendError(res, 400, "InvalidArgument", "Unknown canned ACL");
+                    return;
+                }
+                return err;
+            };
+            if (!tagging_replace) {
+                if (a.tagging) |t| allocator.free(t);
+                a.tagging = if (src_attrs) |sa| (if (sa.tagging) |t| try allocator.dupe(u8, t) else null) else null;
+            }
+            break :blk a;
+        }
+        var a: ObjectAttrs = if (src_attrs) |sa| try sa.clone(allocator) else .{ .content_type = try allocator.dupe(u8, sniffContentType(key)) };
+        // Version id, ACL and encryption state belong to the source object.
+        if (a.version_id) |v| allocator.free(v);
+        a.version_id = null;
+        if (a.acl) |v| allocator.free(v);
+        a.acl = null;
+        if (a.sse) |v| allocator.free(v);
+        a.sse = null;
+        if (a.sse_key_md5) |v| allocator.free(v);
+        a.sse_key_md5 = null;
+        if (a.etag) |v| allocator.free(v);
+        a.etag = null;
+        if (tagging_replace) {
+            if (a.tagging) |t| allocator.free(t);
+            a.tagging = null;
+            if (req.header("x-amz-tagging")) |t| {
+                const tags = parseTagQuery(allocator, t) catch {
+                    sendError(res, 400, "InvalidTag", "The TagValue you have provided is invalid");
+                    return;
+                };
+                defer freeTags(allocator, tags);
+                a.tagging = try tagsToQuery(allocator, tags);
+            }
+        }
+        if (req.header("x-amz-acl")) |h| {
+            if (isCannedAcl(h) and !std.mem.eql(u8, normalizeCannedAcl(h), "private")) {
+                a.acl = try allocator.dupe(u8, normalizeCannedAcl(h));
+            }
+        }
+        break :blk a;
+    };
+    defer dst_attrs.deinit(allocator);
+    if (dst_attrs.acl != null) noteObjectAclUsed(ctx);
+
+    const sse = resolveSseForWrite(ctx, allocator, req, res, bucket) catch return;
+    const stored: []const u8 = if (sse) |mode| blk: {
+        const enc = sseEncrypt(allocator, data, mode) catch {
+            sendError(res, 500, "InternalError", "Encryption failed");
+            return;
+        };
+        try applySseToAttrs(allocator, &dst_attrs, mode, data);
+        noteBucketSseUsed(ctx, allocator, bucket);
+        break :blk enc;
+    } else data;
+
+    const vstatus = bucketVersioning(ctx, allocator, bucket);
+    archiveCurrentVersion(ctx, allocator, bucket, effective_key, dst_path, vstatus) catch {
+        sendError(res, 500, "InternalError", "Cannot archive previous version");
+        return;
+    };
+    if (vstatus == .enabled) dst_attrs.version_id = try newVersionId(allocator);
+
     var af = std.Io.Dir.cwd().createFileAtomic(app_io, dst_path, .{ .make_path = true, .replace = true }) catch {
         sendError(res, 500, "InternalError", "Cannot create file");
         return;
     };
     defer af.deinit(app_io);
-    af.file.writeStreamingAll(app_io, data) catch {
+    af.file.writeStreamingAll(app_io, stored) catch {
         sendError(res, 500, "InternalError", "Cannot write file");
         return;
     };
@@ -3957,34 +4376,12 @@ fn handleCopyObject(ctx: *const S3Context, allocator: Allocator, req: *Request, 
     };
     if (enable_fsync) fsyncParentDir(dst_path);
 
-    if (replace) {
-        if (collectRequestAttrs(allocator, req)) |a| {
-            defer a.deinit(allocator);
-            saveStandaloneAttrs(allocator, dst_path, &a);
-        } else |_| {}
-    } else {
-        const src_path = try ctx.objectPath(allocator, src.bucket, src_key);
-        defer allocator.free(src_path);
-        if (loadStandaloneAttrs(allocator, src_path, src_key)) |sa| {
-            defer sa.deinit(allocator);
-            saveStandaloneAttrs(allocator, dst_path, &sa);
-        } else |_| {
-            // Folder-marker sources keep their sidecar next to the marker file.
-            if (src_key.len > 0 and src_key[src_key.len - 1] == '/') {
-                const smarker = std.fmt.allocPrint(allocator, "{s}.folder_marker", .{src_key}) catch null;
-                if (smarker) |sm| {
-                    defer allocator.free(sm);
-                    if (ctx.objectPath(allocator, src.bucket, sm)) |smp| {
-                        defer allocator.free(smp);
-                        if (loadStandaloneAttrs(allocator, smp, src_key)) |sa| {
-                            defer sa.deinit(allocator);
-                            saveStandaloneAttrs(allocator, dst_path, &sa);
-                        } else |_| {}
-                    } else |_| {}
-                }
-            }
-        }
+    saveStandaloneAttrs(allocator, dst_path, &dst_attrs);
+    if (dst_attrs.version_id) |v| res.setHeader("x-amz-version-id", try allocator.dupe(u8, v));
+    if (src_attrs) |sa| {
+        if (sa.version_id) |v| res.setHeader("x-amz-copy-source-version-id", try allocator.dupe(u8, v));
     }
+    applySseResponseHeaders(res, &dst_attrs, allocator);
 
     const etag = try md5Etag(allocator, data);
     defer allocator.free(etag);
@@ -4034,9 +4431,9 @@ fn handleUploadPartCopy(ctx: *const S3Context, allocator: Allocator, req: *Reque
     // Legacy fallback for the source, same rule as request paths.
     const src_key = try resolveLegacyKey(ctx, allocator, src.bucket, src.key, src.raw);
 
-    const data = readSourceBytes(ctx, allocator, src.bucket, src_key) catch {
-        sendError(res, 404, "NoSuchKey", "Copy source not found");
-        return;
+    const data = readCopySourcePlaintext(ctx, allocator, req, res, src, src_key) catch |err| {
+        if (err == error.Handled) return;
+        return err;
     };
     defer allocator.free(data);
 
@@ -4067,25 +4464,48 @@ fn handleUploadPartCopy(ctx: *const S3Context, allocator: Allocator, req: *Reque
     };
     defer allocator.free(part_path);
 
-    var file = std.Io.Dir.cwd().createFile(app_io, part_path, .{}) catch {
-        sendError(res, 500, "InternalError", "Cannot create part file");
-        return;
+    const etag = writeUploadPart(ctx, allocator, req, res, upload_id, part_path, part_data) catch |err| {
+        if (err == error.Handled) return;
+        return err;
     };
-    defer file.close(app_io);
-    file.writeStreamingAll(app_io, part_data) catch {
-        sendError(res, 500, "InternalError", "Cannot write part");
-        return;
-    };
-    if (enable_fsync) {
-        fsyncFile(file);
-        fsyncParentDir(part_path);
-    }
-
-    const etag = try md5Etag(allocator, part_data);
     defer allocator.free(etag);
 
     res.ok();
     res.setXmlBody(try copyObjectXml(allocator, etag, "<CopyPartResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"));
+}
+
+/// Source bytes for CopyObject / UploadPartCopy: a specific version if
+/// requested, decrypted when stored with SSE.
+fn readCopySourcePlaintext(ctx: *const S3Context, allocator: Allocator, req: *const Request, res: *Response, src: CopySource, src_key: []const u8) ![]const u8 {
+    if (ctx.distributed != null) {
+        return readSourceBytes(ctx, allocator, src.bucket, src_key) catch {
+            sendError(res, 404, "NoSuchKey", "Copy source not found");
+            return error.Handled;
+        };
+    }
+    const src_effective = if (src_key.len > 0 and src_key[src_key.len - 1] == '/')
+        try std.fmt.allocPrint(allocator, "{s}.folder_marker", .{src_key})
+    else
+        src_key;
+    const cur = try ctx.objectPath(allocator, src.bucket, src_effective);
+    var src_path = cur;
+    if (src.version_id) |vid| {
+        switch (try resolveVersion(ctx, allocator, src.bucket, src_effective, cur, vid)) {
+            .path => |p| src_path = p,
+            .delete_marker => {
+                sendError(res, 404, "NoSuchKey", "Copy source is a delete marker");
+                return error.Handled;
+            },
+            .not_found => {
+                sendError(res, 404, "NoSuchVersion", "The specified version does not exist");
+                return error.Handled;
+            },
+        }
+    }
+    return readObjectPlaintext(allocator, req, src_path, src_effective, true) catch |err| {
+        sendCopySourceReadError(res, err);
+        return error.Handled;
+    };
 }
 
 fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
@@ -4094,11 +4514,14 @@ fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, req: *Request, 
     else
         try allocator.dupe(u8, key);
     defer allocator.free(effective_key);
-    const path = try ctx.objectPath(allocator, bucket, effective_key);
-    defer allocator.free(path);
+    const current_path = try ctx.objectPath(allocator, bucket, effective_key);
+    defer allocator.free(current_path);
+
+    const path = (try resolveRequestedVersion(ctx, allocator, req, res, bucket, effective_key, current_path)) orelse return;
+    if (try serveEncryptedIfNeeded(ctx, allocator, req, res, bucket, effective_key, path, true)) return;
 
     var file = std.Io.Dir.cwd().openFile(app_io, path, .{}) catch {
-        sendError(res, 404, "NoSuchKey", "Object not found");
+        sendMissingObject(ctx, allocator, res, bucket, effective_key);
         return;
     };
     defer file.close(app_io);
@@ -4161,6 +4584,7 @@ fn handleHeadObject(ctx: *const S3Context, allocator: Allocator, req: *Request, 
     // NB: no deinit — headers borrow attrs memory (arena-freed after write).
     if (loadStandaloneAttrs(allocator, path, key)) |attrs| {
         applyAttrsToResponse(res, &attrs);
+        addNullVersionHeader(ctx, allocator, res, bucket, &attrs);
     } else |_| {}
 }
 
@@ -4209,7 +4633,7 @@ fn handleListObjects(ctx: *const S3Context, allocator: Allocator, req: *Request,
     var keys: std.ArrayListUnmanaged(KeyInfo) = .empty;
     defer keys.deinit(allocator);
 
-    try collectKeys(allocator, bucket_path, "", prefix, &keys);
+    try collectKeys(allocator, bucket_path, "", prefix, &keys, bucketSseUsed(ctx, allocator, bucket));
 
     std.mem.sort(KeyInfo, keys.items, {}, struct {
         fn lessThan(_: void, a: KeyInfo, b: KeyInfo) bool {
@@ -4303,7 +4727,10 @@ const KeyInfo = struct {
     mtime: i64, // Unix timestamp in seconds
 };
 
-fn collectKeys(allocator: Allocator, base_path: []const u8, current_prefix: []const u8, filter_prefix: []const u8, keys: *std.ArrayListUnmanaged(KeyInfo)) !void {
+/// `check_sse`: consult sidecars to report plaintext sizes for encrypted
+/// objects. Only worth its cost when the bucket has ever used SSE (see
+/// bucketSseUsed), so plain buckets keep the one-stat-per-object LIST.
+fn collectKeys(allocator: Allocator, base_path: []const u8, current_prefix: []const u8, filter_prefix: []const u8, keys: *std.ArrayListUnmanaged(KeyInfo), check_sse: bool) !void {
     const full_path = if (current_prefix.len > 0)
         try std.fs.path.join(allocator, &[_][]const u8{ base_path, current_prefix })
     else
@@ -4313,8 +4740,31 @@ fn collectKeys(allocator: Allocator, base_path: []const u8, current_prefix: []co
     var dir = std.Io.Dir.cwd().openDir(app_io, full_path, .{ .iterate = true }) catch return;
     defer dir.close(app_io);
 
+    // Two passes: first learn which files have a sidecar (needed to report
+    // plaintext sizes for encrypted objects without a stat per object).
+    const Ent = struct { name: []const u8, kind: std.Io.File.Kind };
+    var ents: std.ArrayListUnmanaged(Ent) = .empty;
+    defer {
+        for (ents.items) |e| allocator.free(e.name);
+        ents.deinit(allocator);
+    }
+    var sidecars = std.StringHashMap(void).init(allocator);
+    defer sidecars.deinit();
     var iter = dir.iterate();
     while (try iter.next(app_io)) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zs3attrs")) {
+            const owner = try allocator.dupe(u8, entry.name[0 .. entry.name.len - ".zs3attrs".len]);
+            try sidecars.put(owner, {});
+            continue;
+        }
+        try ents.append(allocator, .{ .name = try allocator.dupe(u8, entry.name), .kind = entry.kind });
+    }
+    defer {
+        var kit = sidecars.keyIterator();
+        while (kit.next()) |k| allocator.free(k.*);
+    }
+
+    for (ents.items) |entry| {
         // The snapshot tree stays hidden unless this listing deliberately
         // targets it via prefix=".zs3snapshots/". Everything else lists —
         // including dot-prefixed user keys and .folder_marker files (which
@@ -4322,7 +4772,8 @@ fn collectKeys(allocator: Allocator, base_path: []const u8, current_prefix: []co
         // sidecars, which are implementation detail, not S3 objects.
         if (entry.kind == .directory and std.mem.eql(u8, entry.name, ".zs3snapshots") and
             !std.mem.startsWith(u8, filter_prefix, SNAP_PREFIX)) continue;
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".zs3attrs")) continue;
+        if (entry.kind == .directory and current_prefix.len == 0 and
+            (std.mem.eql(u8, entry.name, BUCKET_CFG_DIR) or std.mem.eql(u8, entry.name, VERSIONS_DIR))) continue;
 
         const full_key = if (current_prefix.len > 0)
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ current_prefix, entry.name })
@@ -4330,7 +4781,7 @@ fn collectKeys(allocator: Allocator, base_path: []const u8, current_prefix: []co
             try allocator.dupe(u8, entry.name);
 
         if (entry.kind == .directory) {
-            try collectKeys(allocator, base_path, full_key, filter_prefix, keys);
+            try collectKeys(allocator, base_path, full_key, filter_prefix, keys, check_sse);
             allocator.free(full_key);
         } else if (entry.kind == .file) {
             // Translate .folder_marker files back to keys ending with /
@@ -4342,10 +4793,19 @@ fn collectKeys(allocator: Allocator, base_path: []const u8, current_prefix: []co
 
             if (filter_prefix.len == 0 or std.mem.startsWith(u8, report_key, filter_prefix)) {
                 // Use statFile instead of open+stat+close - much faster
-                const size, const mtime = blk: {
+                var size, const mtime = blk: {
                     const stat = dir.statFile(app_io, entry.name, .{}) catch break :blk .{ 0, @as(i64, 0) };
                     break :blk .{ stat.size, @as(i64, @intCast(stat.mtime.toSeconds())) };
                 };
+                if (check_sse and sidecars.contains(entry.name)) {
+                    // Only objects with a sidecar can be encrypted.
+                    const obj_path = try std.fs.path.join(allocator, &.{ full_path, entry.name });
+                    defer allocator.free(obj_path);
+                    if (loadStandaloneAttrs(allocator, obj_path, report_key)) |attrs| {
+                        defer attrs.deinit(allocator);
+                        if (attrs.sse != null) size = sseLogicalSize(size);
+                    } else |_| {}
+                }
                 try keys.append(allocator, .{ .key = report_key, .size = size, .mtime = mtime });
             } else {
                 allocator.free(report_key);
@@ -4354,9 +4814,17 @@ fn collectKeys(allocator: Allocator, base_path: []const u8, current_prefix: []co
     }
 }
 
-fn handleCreateBucket(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8) !void {
+fn handleCreateBucket(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8) !void {
     const path = try ctx.bucketPath(allocator, bucket);
     defer allocator.free(path);
+
+    const canned: ?[]const u8 = if (req.header("x-amz-acl")) |h| blk: {
+        if (!isCannedAcl(h)) {
+            sendError(res, 400, "InvalidArgument", "Unknown canned ACL");
+            return;
+        }
+        break :blk normalizeCannedAcl(h);
+    } else null;
 
     std.Io.Dir.cwd().createDir(app_io, path, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -4365,6 +4833,9 @@ fn handleCreateBucket(ctx: *const S3Context, allocator: Allocator, res: *Respons
             return;
         },
     };
+    if (canned) |c| {
+        if (!std.mem.eql(u8, c, "private")) writeBucketConfig(ctx, allocator, bucket, "acl", c) catch {};
+    }
 
     if (ctx.distributed) |dist| {
         const ts = std.Io.Clock.real.now(app_io).toSeconds();
@@ -4393,6 +4864,21 @@ fn handleHeadBucket(ctx: *const S3Context, allocator: Allocator, res: *Response,
 fn handleDeleteBucket(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8) !void {
     const path = try ctx.bucketPath(allocator, bucket);
     defer allocator.free(path);
+
+    // A bucket with only its own configuration is empty. Stored object
+    // versions (including delete markers) are not: S3 refuses too.
+    if (bucketHasVersions(ctx, allocator, bucket)) {
+        sendError(res, 409, "BucketNotEmpty", "The bucket you tried to delete is not empty. You must delete all versions in the bucket.");
+        return;
+    }
+    if (std.fs.path.join(allocator, &.{ path, VERSIONS_DIR })) |vp| {
+        defer allocator.free(vp);
+        std.Io.Dir.cwd().deleteTree(app_io, vp) catch {};
+    } else |_| {}
+    if (std.fs.path.join(allocator, &.{ path, BUCKET_CFG_DIR })) |cp| {
+        defer allocator.free(cp);
+        std.Io.Dir.cwd().deleteTree(app_io, cp) catch {};
+    } else |_| {}
 
     std.Io.Dir.cwd().deleteDir(app_io, path) catch |err| switch (err) {
         error.DirNotEmpty => {
@@ -4468,7 +4954,27 @@ fn handleListBuckets(ctx: *const S3Context, allocator: Allocator, res: *Response
     res.setXmlBody(try xml.toOwnedSlice(allocator));
 }
 
-fn handleInitiateMultipart(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, key: []const u8) !void {
+fn handleInitiateMultipart(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
+    // Encryption for the whole upload is fixed here; parts follow it.
+    const sse = resolveSseForWrite(ctx, allocator, req, res, bucket) catch return;
+    if (sse != null and ctx.distributed != null) {
+        sendError(res, 501, "NotImplemented", "Encryption is not available in distributed mode");
+        return;
+    }
+    // Content-Type / metadata / tags / ACL come from this request in S3.
+    const init_attrs = collectRequestAttrs(allocator, req) catch |err| {
+        if (err == error.InvalidTag) {
+            sendError(res, 400, "InvalidTag", "The TagValue you have provided is invalid");
+            return;
+        }
+        if (err == error.InvalidAcl) {
+            sendError(res, 400, "InvalidArgument", "Unknown canned ACL");
+            return;
+        }
+        return err;
+    };
+    defer init_attrs.deinit(allocator);
+
     // Generate unique upload ID using timestamp + random bytes to prevent collision
     const timestamp: u64 = @intCast(std.Io.Clock.real.now(app_io).toSeconds());
     var random_bytes: [8]u8 = undefined;
@@ -4486,9 +4992,30 @@ fn handleInitiateMultipart(ctx: *const S3Context, allocator: Allocator, res: *Re
 
     var meta_file = std.Io.Dir.cwd().createFile(app_io, meta_path, .{}) catch return;
     defer meta_file.close(app_io);
-    const meta_content = std.fmt.allocPrint(allocator, "{s}\n{s}", .{ bucket, key }) catch return;
+    const sse_line: []const u8 = if (sse) |m| switch (m) {
+        .s3 => "\nsse=AES256",
+        .customer => |c| std.fmt.allocPrint(allocator, "\nsse=SSE-C:{s}", .{c.key_md5_b64}) catch return,
+    } else "";
+    const meta_content = std.fmt.allocPrint(allocator, "{s}\n{s}{s}", .{ bucket, key, sse_line }) catch return;
     defer allocator.free(meta_content);
     meta_file.writeStreamingAll(app_io, meta_content) catch {};
+    if (init_attrs.hasNonDefault()) {
+        const attrs_path = std.fmt.allocPrint(allocator, "{s}/.uploads/{s}/.attrs", .{ ctx.data_dir, upload_id }) catch return;
+        defer allocator.free(attrs_path);
+        if (attrsToText(allocator, &init_attrs)) |text| {
+            defer allocator.free(text);
+            var af = std.Io.Dir.cwd().createFile(app_io, attrs_path, .{}) catch return;
+            defer af.close(app_io);
+            af.writeStreamingAll(app_io, text) catch {};
+        } else |_| {}
+    }
+    if (sse) |m| switch (m) {
+        .s3 => res.setHeader("x-amz-server-side-encryption", "AES256"),
+        .customer => |c| {
+            res.setHeader("x-amz-server-side-encryption-customer-algorithm", "AES256");
+            res.setHeader("x-amz-server-side-encryption-customer-key-MD5", c.key_md5_b64);
+        },
+    };
 
     var xml: std.ArrayListUnmanaged(u8) = .empty;
     defer xml.deinit(allocator);
@@ -4531,21 +5058,28 @@ fn handleUploadPart(ctx: *const S3Context, allocator: Allocator, req: *Request, 
     const part_path = std.fmt.allocPrint(allocator, "{s}/.uploads/{s}/{s}", .{ ctx.data_dir, upload_id, part_number }) catch return;
     defer allocator.free(part_path);
 
-    var file = std.Io.Dir.cwd().createFile(app_io, part_path, .{}) catch {
-        sendError(res, 500, "InternalError", "Cannot create part file");
+    const parts_dir = std.fs.path.dirname(part_path) orelse return;
+    var up_dir = std.Io.Dir.cwd().openDir(app_io, parts_dir, .{}) catch {
+        sendError(res, 404, "NoSuchUpload", "Upload not found");
         return;
     };
-    defer file.close(app_io);
+    up_dir.close(app_io);
 
-    file.writeStreamingAll(app_io, req.body) catch {
-        sendError(res, 500, "InternalError", "Cannot write part");
-        return;
+    const etag = writeUploadPart(ctx, allocator, req, res, upload_id, part_path, req.body) catch |err| {
+        if (err == error.Handled) return;
+        return err;
     };
-
-    const etag = try md5Etag(allocator, req.body);
 
     res.ok();
     res.setHeader("ETag", etag);
+    if (readUploadMeta(ctx, allocator, upload_id)) |meta| switch (uploadSseFromMeta(meta)) {
+        .none => {},
+        .s3 => res.setHeader("x-amz-server-side-encryption", "AES256"),
+        .customer_md5 => |m| {
+            res.setHeader("x-amz-server-side-encryption-customer-algorithm", "AES256");
+            res.setHeader("x-amz-server-side-encryption-customer-key-MD5", m);
+        },
+    };
 }
 
 /// GET /{bucket}/{key}?uploadId=.. : list uploaded parts.
@@ -4581,6 +5115,11 @@ fn handleListParts(ctx: *const S3Context, allocator: Allocator, req: *Request, r
     }
     std.mem.sort(u32, nums.items, {}, std.sort.asc(u32));
 
+    const list_sse: ?UploadSse = if (readUploadMeta(ctx, allocator, upload_id)) |meta| blk: {
+        const u = uploadSseFromMeta(meta);
+        break :blk if (u == .none) null else u;
+    } else null;
+
     var xml: std.ArrayListUnmanaged(u8) = .empty;
     defer xml.deinit(allocator);
     try xml.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
@@ -4599,9 +5138,23 @@ fn handleListParts(ctx: *const S3Context, allocator: Allocator, req: *Request, r
         defer allocator.free(part_path);
         var pf = std.Io.Dir.cwd().openFile(app_io, part_path, .{}) catch continue;
         defer pf.close(app_io);
-        const stat = pf.stat(app_io) catch continue;
-        const data = readToEndAlloc(pf, allocator, MAX_BODY_SIZE) catch continue;
-        defer allocator.free(data);
+        var stat = pf.stat(app_io) catch continue;
+        const raw = readToEndAlloc(pf, allocator, MAX_BODY_SIZE) catch continue;
+        defer allocator.free(raw);
+        // Encrypted parts: report plaintext size and ETag when the key is
+        // available (SSE-S3 always; SSE-C needs the request's key headers).
+        var data: []const u8 = raw;
+        if (list_sse) |usse| {
+            const mode = uploadSseMode(allocator, req, res, usse) catch null;
+            if (mode) |m| {
+                if (sseIkm(ctx, m)) |ikm| {
+                    if (sseDecrypt(allocator, raw, &ikm)) |plain| {
+                        data = plain;
+                    } else |_| {}
+                } else |_| {}
+            }
+            stat.size = sseLogicalSize(stat.size);
+        }
         const petag = md5Etag(allocator, data) catch continue;
         defer allocator.free(petag);
         try xml.appendSlice(allocator, "<Part><PartNumber>");
@@ -4639,6 +5192,40 @@ fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Re
     const final_path = try ctx.objectPath(allocator, bucket, key);
     defer allocator.free(final_path);
 
+    // Upload-level state written at initiate: SSE mode and attributes.
+    const upload_meta = readUploadMeta(ctx, allocator, upload_id) orelse {
+        sendError(res, 404, "NoSuchUpload", "Upload not found");
+        return;
+    };
+    const upload_sse = uploadSseFromMeta(upload_meta);
+    // Attributes sent at initiate (Content-Type, metadata, tags, ACL); the
+    // upload directory goes away after assembly, so read them now.
+    const init_attrs: ?ObjectAttrs = blk: {
+        const attrs_path = try std.fmt.allocPrint(allocator, "{s}/.attrs", .{parts_dir});
+        defer allocator.free(attrs_path);
+        var f = std.Io.Dir.cwd().openFile(app_io, attrs_path, .{}) catch break :blk null;
+        defer f.close(app_io);
+        const text = readToEndAlloc(f, allocator, 64 * 1024) catch break :blk null;
+        defer allocator.free(text);
+        break :blk parseAttrsContent(allocator, text) catch null;
+    };
+    const sse_mode: ?SseMode = uploadSseMode(allocator, req, res, upload_sse) catch return;
+    const sse_ikm: ?[32]u8 = if (sse_mode) |m| (sseIkm(ctx, m) catch {
+        sseErrorResponse(res, error.BadSseKey);
+        return;
+    }) else null;
+    var encryptor: ?SseEncryptor = if (sse_mode) |m| (SseEncryptor.init(allocator, &sse_ikm.?, m) catch {
+        sendError(res, 500, "InternalError", "Encryption failed");
+        return;
+    }) else null;
+    defer if (encryptor) |*e| e.deinit(allocator);
+
+    const vstatus = bucketVersioning(ctx, allocator, bucket);
+    archiveCurrentVersion(ctx, allocator, bucket, key, final_path, vstatus) catch {
+        sendError(res, 500, "InternalError", "Cannot archive previous version");
+        return;
+    };
+
     if (std.fs.path.dirname(final_path)) |dir| {
         std.Io.Dir.cwd().createDirPath(app_io, dir) catch |err| {
             std.log.warn("makePath failed: {}", .{err});
@@ -4650,6 +5237,10 @@ fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Re
         return;
     };
     defer final_file.close(app_io);
+    if (encryptor) |*e| {
+        final_file.writeStreamingAll(app_io, e.out.items) catch {};
+        e.out.clearRetainingCapacity();
+    }
 
     var dir = std.Io.Dir.cwd().openDir(app_io, parts_dir, .{ .iterate = true }) catch {
         sendError(res, 404, "NoSuchUpload", "Upload not found");
@@ -4693,15 +5284,39 @@ fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Re
         defer allocator.free(data);
 
         const bytes_read = part_file.readPositionalAll(app_io, data, 0) catch continue;
-        final_file.writeStreamingAll(app_io, data[0..bytes_read]) catch |err| {
-            std.log.warn("failed to write part {d}: {}", .{ part_num, err });
-            continue;
-        };
+        var plain: []const u8 = data[0..bytes_read];
+        if (encryptor) |*e| {
+            // Parts were encrypted with the same key material at upload.
+            const dec = sseDecrypt(allocator, plain, &sse_ikm.?) catch {
+                sendError(res, 500, "InternalError", "Stored part failed authentication");
+                return;
+            };
+            plain = dec;
+            e.update(allocator, plain) catch {
+                sendError(res, 500, "InternalError", "Encryption failed");
+                return;
+            };
+            final_file.writeStreamingAll(app_io, e.out.items) catch |err| {
+                std.log.warn("failed to write part {d}: {}", .{ part_num, err });
+                continue;
+            };
+            e.out.clearRetainingCapacity();
+        } else {
+            final_file.writeStreamingAll(app_io, plain) catch |err| {
+                std.log.warn("failed to write part {d}: {}", .{ part_num, err });
+                continue;
+            };
+        }
 
         var part_hash: [16]u8 = undefined;
-        std.crypto.hash.Md5.hash(data[0..bytes_read], &part_hash, .{});
+        std.crypto.hash.Md5.hash(plain, &part_hash, .{});
         hasher.update(&part_hash);
         parts_assembled += 1;
+    }
+    if (encryptor) |*e| {
+        e.finish(allocator) catch {};
+        final_file.writeStreamingAll(app_io, e.out.items) catch {};
+        e.out.clearRetainingCapacity();
     }
 
     std.Io.Dir.cwd().deleteTree(app_io, parts_dir) catch |err| {
@@ -4712,11 +5327,30 @@ fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Re
         fsyncParentDir(final_path);
     }
 
-    // Persist any Content-Type / metadata sent on CompleteMultipartUpload.
-    if (collectRequestAttrs(allocator, req)) |a| {
-        defer a.deinit(allocator);
-        saveStandaloneAttrs(allocator, final_path, &a);
-    } else |_| {}
+    var final_hash: [16]u8 = undefined;
+    hasher.final(&final_hash);
+    const composite_etag = try std.fmt.allocPrint(allocator, "\"{x}-{d}\"", .{ final_hash, parts_assembled });
+
+    // Attributes: those sent at initiate (Content-Type, metadata, tags, ACL),
+    // else anything on this request; plus version id and SSE state.
+    var final_attrs: ObjectAttrs = init_attrs orelse
+        (collectRequestAttrs(allocator, req) catch ObjectAttrs{ .content_type = try allocator.dupe(u8, DEFAULT_CONTENT_TYPE) });
+    defer final_attrs.deinit(allocator);
+    if (vstatus == .enabled) final_attrs.version_id = try newVersionId(allocator);
+    if (sse_mode) |m| {
+        try applySseToAttrs(allocator, &final_attrs, m, "");
+        noteBucketSseUsed(ctx, allocator, bucket);
+        allocator.free(final_attrs.etag.?);
+        final_attrs.etag = try allocator.dupe(u8, composite_etag);
+    }
+    saveStandaloneAttrs(allocator, final_path, &final_attrs);
+    if (final_attrs.acl != null) noteObjectAclUsed(ctx);
+    if (final_attrs.version_id) |v| {
+        res.setHeader("x-amz-version-id", try allocator.dupe(u8, v));
+    } else if (vstatus != .disabled) {
+        res.setHeader("x-amz-version-id", NULL_VERSION);
+    }
+    applySseResponseHeaders(res, &final_attrs, allocator);
 
     // In distributed mode, index the assembled file so distributed GET can find it
     if (ctx.distributed) |dist| {
@@ -4745,9 +5379,6 @@ fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Re
         }
     }
 
-    var final_hash: [16]u8 = undefined;
-    hasher.final(&final_hash);
-
     var xml: std.ArrayListUnmanaged(u8) = .empty;
     defer xml.deinit(allocator);
 
@@ -4757,11 +5388,9 @@ fn handleCompleteMultipart(ctx: *const S3Context, allocator: Allocator, req: *Re
     try xml.appendSlice(allocator, bucket);
     try xml.appendSlice(allocator, "</Bucket><Key>");
     try xmlEscape(allocator, &xml, key);
-
-    var etag_buf: [72]u8 = undefined;
-    const etag = std.fmt.bufPrint(&etag_buf, "</Key><ETag>\"{x}-{d}\"</ETag>", .{ final_hash, parts_assembled }) catch "</Key><ETag>\"\"</ETag>";
-    try xml.appendSlice(allocator, etag);
-    try xml.appendSlice(allocator, "</CompleteMultipartUploadResult>");
+    try xml.appendSlice(allocator, "</Key><ETag>");
+    try xml.appendSlice(allocator, composite_etag);
+    try xml.appendSlice(allocator, "</ETag></CompleteMultipartUploadResult>");
 
     res.ok();
     res.setXmlBody(try xml.toOwnedSlice(allocator));
@@ -4840,6 +5469,44 @@ pub fn getQueryParam(query: []const u8, key: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Decode an HTTP/1.1 chunked body (RFC 9112 §7.1). Chunk extensions and
+/// trailers are ignored. Returns what was decoded before any malformed chunk.
+pub fn decodeHttpChunked(allocator: Allocator, body: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var rest = body;
+    while (true) {
+        const eol = std.mem.indexOf(u8, rest, "\r\n") orelse break;
+        var size_text = rest[0..eol];
+        if (std.mem.indexOfScalar(u8, size_text, ';')) |semi| size_text = size_text[0..semi];
+        const size = std.fmt.parseInt(usize, std.mem.trim(u8, size_text, " \t"), 16) catch break;
+        rest = rest[eol + 2 ..];
+        if (size == 0) break;
+        if (rest.len < size) {
+            try out.appendSlice(allocator, rest);
+            break;
+        }
+        try out.appendSlice(allocator, rest[0..size]);
+        rest = rest[size..];
+        if (std.mem.startsWith(u8, rest, "\r\n")) rest = rest[2..];
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Text of the first <tag>...</tag> in `xml` (no attribute or nesting
+/// support; enough for the flat S3 request/response bodies zs3 handles).
+pub fn xmlTagText(xml: []const u8, tag: []const u8) ?[]const u8 {
+    var open_buf: [64]u8 = undefined;
+    var close_buf: [64]u8 = undefined;
+    if (tag.len + 3 > open_buf.len) return null;
+    const open = std.fmt.bufPrint(&open_buf, "<{s}>", .{tag}) catch return null;
+    const close = std.fmt.bufPrint(&close_buf, "</{s}>", .{tag}) catch return null;
+    const start = std.mem.indexOf(u8, xml, open) orelse return null;
+    const body = xml[start + open.len ..];
+    const end = std.mem.indexOf(u8, body, close) orelse return null;
+    return std.mem.trim(u8, body[0..end], " \t\r\n");
 }
 
 pub fn xmlEscape(allocator: Allocator, list: *std.ArrayListUnmanaged(u8), input: []const u8) !void {
@@ -6104,6 +6771,9 @@ const SnapArgs = struct {
     secret: []const u8 = "",
     region: []const u8 = "us-east-1",
     chunk_bytes: usize = DEFAULT_CHUNK_BYTES,
+    insecure: bool = false,
+    /// Extra PEM CA file trusted in addition to the system store.
+    ca_file: []const u8 = "",
 };
 
 // Process environment for snapshot/clone credential lookup (no libc getenv,
@@ -6142,10 +6812,17 @@ fn parseSnapArgs(allocator: Allocator, args: []const []const u8) !SnapArgs {
             out.region = arg[9..];
         } else if (std.mem.startsWith(u8, arg, "--chunk-bytes=")) {
             out.chunk_bytes = std.fmt.parseInt(usize, arg[14..], 10) catch DEFAULT_CHUNK_BYTES;
+        } else if (std.mem.eql(u8, arg, "--insecure")) {
+            out.insecure = true;
+        } else if (std.mem.startsWith(u8, arg, "--ca-file=")) {
+            out.ca_file = arg[10..];
         } else {
             std.debug.print("Unknown snapshot option: {s}\n", .{arg});
             return error.BadArgs;
         }
+    }
+    if (getenvStr("ZS3_CA_FILE")) |v| {
+        if (out.ca_file.len == 0) out.ca_file = v;
     }
     if (out.access.len == 0) out.access = "minioadmin";
     if (out.secret.len == 0) out.secret = "minioadmin";
@@ -6218,6 +6895,117 @@ fn xmlUnescape(allocator: Allocator, s: []const u8) ![]const u8 {
 
 /// Minimal S3 client (header SigV4) for snapshot/clone. HTTP only; put a
 /// proxy in front for TLS, same as the server side.
+/// One HTTP connection for the snapshot/clone client: a raw socket, or a
+/// socket wrapped in std.crypto.tls.Client for https:// endpoints. TLS uses
+/// the system CA bundle (loaded lazily on first verification) and verifies
+/// the hostname; --insecure disables both for self-signed test servers.
+const ClientConn = struct {
+    stream: net.Stream,
+    tls: ?*TlsState = null,
+
+    const TlsState = struct {
+        sock_reader: net.Stream.Reader,
+        sock_writer: net.Stream.Writer,
+        client: std.crypto.tls.Client,
+        bufs: []u8,
+
+        const tls_len = std.crypto.tls.Client.min_buffer_len;
+        // socket read | socket write | tls plaintext read | tls ciphertext write
+        const sock_read_len = tls_len;
+        const sock_write_len = tls_len;
+        const tls_read_len = tls_len + 32 * 1024;
+        const tls_write_len = tls_len;
+
+        fn create(allocator: Allocator, stream: net.Stream, host: []const u8, insecure: bool, ca_file: []const u8) !*TlsState {
+            if (!build_options.tls) return error.TlsNotSupported;
+            const st = try allocator.create(TlsState);
+            errdefer allocator.destroy(st);
+            st.bufs = try allocator.alloc(u8, sock_read_len + sock_write_len + tls_read_len + tls_write_len);
+            errdefer allocator.free(st.bufs);
+            const sock_read = st.bufs[0..sock_read_len];
+            const sock_write = st.bufs[sock_read_len..][0..sock_write_len];
+            const tls_read = st.bufs[sock_read_len + sock_write_len ..][0..tls_read_len];
+            const tls_write = st.bufs[sock_read_len + sock_write_len + tls_read_len ..][0..tls_write_len];
+            st.sock_reader = stream.reader(app_io, sock_read);
+            st.sock_writer = stream.writer(app_io, sock_write);
+            if (!insecure) {
+                // Load the system CA store once; the TLS client only consults
+                // it, it does not populate it.
+                try client_ca_lock.lock(app_io);
+                defer client_ca_lock.unlock(app_io);
+                if (client_ca_bundle.map.count() == 0) {
+                    const now = std.Io.Clock.real.now(app_io);
+                    client_ca_bundle.rescan(allocator, app_io, now) catch |err| {
+                        std.debug.print("could not load system CA certificates: {t} (use --insecure to skip verification)\n", .{err});
+                        return error.TlsHandshakeFailed;
+                    };
+                    if (ca_file.len > 0) {
+                        client_ca_bundle.addCertsFromFilePath(allocator, app_io, now, std.Io.Dir.cwd(), ca_file) catch |err| {
+                            std.debug.print("could not load --ca-file {s}: {t}\n", .{ ca_file, err });
+                            return error.TlsHandshakeFailed;
+                        };
+                    }
+                }
+            }
+            var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+            app_io.random(&entropy);
+            st.client = std.crypto.tls.Client.init(
+                &st.sock_reader.interface,
+                &st.sock_writer.interface,
+                .{
+                    .host = if (insecure) .no_verification else .{ .explicit = host },
+                    .ca = if (insecure) .no_verification else .{ .bundle = .{
+                        .gpa = allocator,
+                        .io = app_io,
+                        .lock = &client_ca_lock,
+                        .bundle = &client_ca_bundle,
+                    } },
+                    .read_buffer = tls_read,
+                    .write_buffer = tls_write,
+                    .entropy = &entropy,
+                    .realtime_now = std.Io.Clock.real.now(app_io),
+                    // HTTP Content-Length detects truncation; matches std.http.
+                    .allow_truncation_attacks = true,
+                },
+            ) catch |err| {
+                std.debug.print("TLS handshake with {s} failed: {t}\n", .{ host, err });
+                return error.TlsHandshakeFailed;
+            };
+            return st;
+        }
+    };
+
+    fn writeAll(self: *ClientConn, bytes: []const u8) !void {
+        if (self.tls) |st| {
+            st.client.writer.writeAll(bytes) catch return error.WriteFailed;
+            st.client.writer.flush() catch return error.WriteFailed;
+            st.sock_writer.interface.flush() catch return error.WriteFailed;
+            return;
+        }
+        try streamWriteAll(self.stream, bytes);
+    }
+
+    fn read(self: *ClientConn, buffer: []u8) !usize {
+        if (self.tls) |st| {
+            return st.client.reader.readSliceShort(buffer) catch return error.ReadFailed;
+        }
+        return streamRead(self.stream, buffer);
+    }
+
+    fn close(self: *ClientConn, allocator: Allocator) void {
+        if (self.tls) |st| {
+            st.client.end() catch {};
+            st.sock_writer.interface.flush() catch {};
+            allocator.free(st.bufs);
+            allocator.destroy(st);
+        }
+        self.stream.close(app_io);
+    }
+};
+
+var client_ca_bundle: std.crypto.Certificate.Bundle = .empty;
+var client_ca_lock: std.Io.RwLock = .init;
+
 const S3Client = struct {
     allocator: Allocator,
     host: []const u8,
@@ -6226,13 +7014,22 @@ const S3Client = struct {
     region: []const u8,
     access: []const u8,
     secret: []const u8,
+    tls: bool = false,
+    /// Skip certificate and hostname verification (self-signed test servers).
+    insecure: bool = false,
+    /// Extra PEM CA file to trust (e.g. a private CA for a TLS proxy).
+    ca_file: []const u8 = "",
+
+    fn defaultPort(self: *const S3Client) u16 {
+        return if (self.tls) 443 else 80;
+    }
 
     const Resp = struct {
         status: u16,
         body: []u8,
     };
 
-    fn connect(self: *const S3Client) !net.Stream {
+    fn connectTcp(self: *const S3Client) !net.Stream {
         if (net.IpAddress.parseLiteral(self.host)) |addr| {
             var a = addr;
             a.setPort(self.port);
@@ -6249,6 +7046,18 @@ const S3Client = struct {
             .canonical_name => continue,
         } else |_| {}
         return error.ConnectionFailed;
+    }
+
+    fn connect(self: *const S3Client) !ClientConn {
+        if (self.tls and !build_options.tls) {
+            std.debug.print("this zs3 was built with -Dtls=false; https:// endpoints need a TLS-terminating proxy or a default build\n", .{});
+            return error.TlsNotSupported;
+        }
+        const stream = try self.connectTcp();
+        errdefer stream.close(app_io);
+        if (!self.tls) return .{ .stream = stream };
+        const st = try ClientConn.TlsState.create(self.allocator, stream, self.host, self.insecure, self.ca_file);
+        return .{ .stream = stream, .tls = st };
     }
 
     const QueryPair = struct { name: []const u8, value: []const u8 };
@@ -6315,7 +7124,7 @@ const S3Client = struct {
         try canon.append(self.allocator, '\n');
         try canon.appendSlice(self.allocator, "host:");
         try canon.appendSlice(self.allocator, self.host);
-        if (self.port != 80) {
+        if (self.port != self.defaultPort()) {
             const ps = try std.fmt.allocPrint(self.allocator, ":{d}", .{self.port});
             defer self.allocator.free(ps);
             try canon.appendSlice(self.allocator, ps);
@@ -6344,7 +7153,7 @@ const S3Client = struct {
         });
         defer self.allocator.free(req_line);
         try req_buf.appendSlice(self.allocator, req_line);
-        const host_hdr = if (self.port != 80)
+        const host_hdr = if (self.port != self.defaultPort())
             try std.fmt.allocPrint(self.allocator, "Host: {s}:{d}\r\n", .{ self.host, self.port })
         else
             try std.fmt.allocPrint(self.allocator, "Host: {s}\r\n", .{self.host});
@@ -6368,9 +7177,9 @@ const S3Client = struct {
         try req_buf.appendSlice(self.allocator, cl_hdr);
         try req_buf.appendSlice(self.allocator, body);
 
-        var stream = try self.connect();
-        defer stream.close(app_io);
-        try streamWriteAll(stream, req_buf.items);
+        var conn = try self.connect();
+        defer conn.close(self.allocator);
+        try conn.writeAll(req_buf.items);
 
         // Read headers, then exactly Content-Length (server always sends it).
         var resp: std.ArrayListUnmanaged(u8) = .empty;
@@ -6378,9 +7187,10 @@ const S3Client = struct {
         var chunk: [32 * 1024]u8 = undefined;
         var header_len: ?usize = null;
         var content_len: usize = 0;
+        var chunked = false;
         var status: u16 = 0;
         while (header_len == null) {
-            const n = streamRead(stream, &chunk) catch break;
+            const n = conn.read(&chunk) catch break;
             if (n == 0) break;
             try resp.appendSlice(self.allocator, chunk[0..n]);
             if (std.mem.indexOf(u8, resp.items, "\r\n\r\n")) |he| {
@@ -6397,6 +7207,8 @@ const S3Client = struct {
                 while (h_iter.next()) |hline| {
                     if (hline.len > 15 and std.ascii.eqlIgnoreCase(hline[0..15], "content-length:")) {
                         content_len = std.fmt.parseInt(usize, std.mem.trim(u8, hline[15..], " \t"), 10) catch 0;
+                    } else if (hline.len > 18 and std.ascii.eqlIgnoreCase(hline[0..18], "transfer-encoding:")) {
+                        chunked = std.ascii.indexOfIgnoreCase(hline[18..], "chunked") != null;
                     }
                 }
             } else if (resp.items.len > MAX_HEADER_SIZE + 1024) {
@@ -6404,8 +7216,21 @@ const S3Client = struct {
             }
         }
         const hl = header_len orelse return error.InvalidResponse;
+        if (chunked) {
+            // AWS and most proxies answer error (and some LIST) responses
+            // with Transfer-Encoding: chunked. Read to EOF (we sent
+            // Connection: close), then de-chunk.
+            while (true) {
+                const n = conn.read(&chunk) catch break;
+                if (n == 0) break;
+                try resp.appendSlice(self.allocator, chunk[0..n]);
+                if (resp.items.len > MAX_BODY_SIZE) return error.ResponseTooLarge;
+            }
+            const out_body = try decodeHttpChunked(self.allocator, resp.items[hl..]);
+            return .{ .status = status, .body = out_body };
+        }
         while (resp.items.len - hl < content_len) {
-            const n = streamRead(stream, &chunk) catch break;
+            const n = conn.read(&chunk) catch break;
             if (n == 0) break;
             try resp.appendSlice(self.allocator, chunk[0..n]);
             if (resp.items.len > MAX_BODY_SIZE) return error.ResponseTooLarge;
@@ -6417,14 +7242,22 @@ const S3Client = struct {
     fn get(self: *const S3Client, key: []const u8) ![]u8 {
         const r = try self.request("GET", key, &.{}, "", null);
         defer self.allocator.free(r.body);
-        if (r.status != 200) return error.RequestFailed;
+        if (r.status != 200) return failRequest("GET", key, r);
         return self.allocator.dupe(u8, r.body);
     }
 
     fn put(self: *const S3Client, key: []const u8, body: []const u8, content_type: ?[]const u8) !void {
         const r = try self.request("PUT", key, &.{}, body, content_type);
         defer self.allocator.free(r.body);
-        if (r.status != 200) return error.RequestFailed;
+        if (r.status != 200) return failRequest("PUT", key, r);
+    }
+
+    /// Print the S3 error code for a failed request so `zs3 clone` against a
+    /// foreign server says "403 InvalidAccessKeyId" instead of just failing.
+    fn failRequest(method: []const u8, key: []const u8, r: Resp) error{RequestFailed} {
+        const code = xmlTagText(r.body, "Code") orelse "";
+        std.debug.print("{s} {s}: server returned {d} {s}\n", .{ method, key, r.status, code });
+        return error.RequestFailed;
     }
 
     fn head(self: *const S3Client, key: []const u8) bool {
@@ -6452,12 +7285,16 @@ fn formatAmzDate(buf: *[16]u8, timestamp: i64) void {
     }) catch unreachable;
 }
 
-fn splitEndpoint(endpoint: []const u8) !struct { host: []const u8, port: u16 } {
+pub const Endpoint = struct { host: []const u8, port: u16, tls: bool };
+
+pub fn splitEndpoint(endpoint: []const u8) !Endpoint {
     var rest = endpoint;
+    var tls = false;
     if (std.mem.startsWith(u8, rest, "http://")) {
         rest = rest[7..];
     } else if (std.mem.startsWith(u8, rest, "https://")) {
-        return error.TlsNotSupported;
+        rest = rest[8..];
+        tls = true;
     } else {
         return error.BadEndpoint;
     }
@@ -6465,9 +7302,9 @@ fn splitEndpoint(endpoint: []const u8) !struct { host: []const u8, port: u16 } {
     if (std.mem.indexOfScalar(u8, rest, '/')) |s| rest = rest[0..s];
     if (std.mem.lastIndexOfScalar(u8, rest, ':')) |c| {
         const port = std.fmt.parseInt(u16, rest[c + 1 ..], 10) catch return error.BadEndpoint;
-        return .{ .host = rest[0..c], .port = port };
+        return .{ .host = rest[0..c], .port = port, .tls = tls };
     }
-    return .{ .host = rest, .port = 80 };
+    return .{ .host = rest, .port = if (tls) 443 else 80, .tls = tls };
 }
 
 /// List all keys under a prefix (handles ListObjectsV2 pagination).
@@ -6492,7 +7329,7 @@ fn s3ListAll(client: *const S3Client, allocator: Allocator, prefix: []const u8) 
         }
         const r = try client.request("GET", "", qbuf[0..qn], "", null);
         defer allocator.free(r.body);
-        if (r.status != 200) return error.RequestFailed;
+        if (r.status != 200) return S3Client.failRequest("LIST", prefix, r);
 
         var search: []const u8 = r.body;
         while (std.mem.indexOf(u8, search, "<Key>")) |s| {
@@ -6533,6 +7370,9 @@ fn runSnapshot(allocator: Allocator, args: []const []const u8) !void {
         .region = sa.region,
         .access = sa.access,
         .secret = sa.secret,
+        .tls = ep.tls,
+        .insecure = sa.insecure,
+        .ca_file = sa.ca_file,
     };
 
     var keys = try s3ListAll(&client, allocator, "");
@@ -6636,6 +7476,9 @@ fn runSnapshotsList(allocator: Allocator, args: []const []const u8) !void {
         .region = sa.region,
         .access = sa.access,
         .secret = sa.secret,
+        .tls = ep.tls,
+        .insecure = sa.insecure,
+        .ca_file = sa.ca_file,
     };
     var keys = try s3ListAll(&client, allocator, SNAP_PREFIX);
     defer {
@@ -6826,6 +7669,9 @@ fn runClone(allocator: Allocator, args: []const []const u8) !void {
         .region = sa.region,
         .access = sa.access,
         .secret = sa.secret,
+        .tls = ep.tls,
+        .insecure = sa.insecure,
+        .ca_file = sa.ca_file,
     };
     const manifest_key = try std.fmt.allocPrint(allocator, "{s}{s}.json", .{ SNAP_PREFIX, sa.name });
     defer allocator.free(manifest_key);
@@ -6910,4 +7756,2124 @@ fn runClone(allocator: Allocator, args: []const []const u8) !void {
         file.writeStreamingAll(app_io, manifest_body) catch {};
     } else |_| {}
     std.debug.print("clone {s}: {d} files, {d} bytes transferred, {d} reused from cache\n", .{ sa.name, files, transferred, reused });
+}
+
+// ============================================================================
+// BUCKET CONFIGURATION (ACL, versioning, lifecycle, encryption, tagging)
+// ============================================================================
+// Per-bucket settings live as small files under `<bucket>/.zs3bucket/`, and
+// object versions under `<bucket>/.zs3versions/`. Both directories are hidden
+// from LIST, ignored by snapshots, and removed with the bucket.
+
+const BUCKET_CFG_DIR = ".zs3bucket";
+const VERSIONS_DIR = ".zs3versions";
+const OWNER_ID = "minioadmin";
+
+fn bucketConfigPath(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, name: []const u8) ![]const u8 {
+    return std.fs.path.join(allocator, &.{ ctx.data_dir, bucket, BUCKET_CFG_DIR, name });
+}
+
+fn readBucketConfig(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, name: []const u8) ?[]u8 {
+    const path = bucketConfigPath(ctx, allocator, bucket, name) catch return null;
+    defer allocator.free(path);
+    var file = std.Io.Dir.cwd().openFile(app_io, path, .{}) catch return null;
+    defer file.close(app_io);
+    return readToEndAlloc(file, allocator, 1024 * 1024) catch null;
+}
+
+fn writeBucketConfig(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, name: []const u8, content: []const u8) !void {
+    const path = try bucketConfigPath(ctx, allocator, bucket, name);
+    defer allocator.free(path);
+    var af = try std.Io.Dir.cwd().createFileAtomic(app_io, path, .{ .make_path = true, .replace = true });
+    defer af.deinit(app_io);
+    try af.file.writeStreamingAll(app_io, content);
+    fsyncFile(af.file);
+    try af.replace(app_io);
+    fsyncParentDir(path);
+}
+
+fn deleteBucketConfig(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, name: []const u8) void {
+    const path = bucketConfigPath(ctx, allocator, bucket, name) catch return;
+    defer allocator.free(path);
+    std.Io.Dir.cwd().deleteFile(app_io, path) catch {};
+}
+
+fn bucketExists(ctx: *const S3Context, allocator: Allocator, bucket: []const u8) bool {
+    const path = ctx.bucketPath(allocator, bucket) catch return false;
+    defer allocator.free(path);
+    var dir = std.Io.Dir.cwd().openDir(app_io, path, .{}) catch return false;
+    dir.close(app_io);
+    return true;
+}
+
+/// Read attrs for an object through whichever backend is active.
+fn loadObjectAttrsAny(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, key: []const u8) ?ObjectAttrs {
+    if (ctx.distributed) |dist| {
+        return readDistAttrs(allocator, dist, bucket, key);
+    }
+    const path = ctx.objectPath(allocator, bucket, key) catch return null;
+    defer allocator.free(path);
+    // Missing object: no attrs.
+    std.Io.Dir.cwd().access(app_io, path, .{}) catch return null;
+    return loadStandaloneAttrs(allocator, path, key) catch null;
+}
+
+fn saveObjectAttrsAny(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, key: []const u8, attrs: *const ObjectAttrs) !void {
+    if (ctx.distributed) |dist| {
+        writeDistAttrs(allocator, dist, bucket, key, attrs);
+        propagateObjectAttrs(ctx, allocator, bucket, key);
+        return;
+    }
+    const path = try ctx.objectPath(allocator, bucket, key);
+    defer allocator.free(path);
+    saveStandaloneAttrs(allocator, path, attrs);
+}
+
+fn objectExistsAny(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, key: []const u8) bool {
+    if (ctx.distributed) |dist| {
+        const meta = dist.meta_index.getFull(allocator, bucket, key) catch return false;
+        if (meta) |m| {
+            if (m.inline_data) |d| allocator.free(d);
+            return true;
+        }
+        return false;
+    }
+    const path = ctx.objectPath(allocator, bucket, key) catch return false;
+    defer allocator.free(path);
+    const stat = std.Io.Dir.cwd().statFile(app_io, path, .{}) catch return false;
+    return stat.kind == .file;
+}
+
+// ---------------------------------------------------------------------------
+// Tagging
+// ---------------------------------------------------------------------------
+
+const Tag = struct { key: []const u8, value: []const u8 };
+
+const MAX_TAGS = 10;
+
+fn freeTags(allocator: Allocator, tags: []Tag) void {
+    for (tags) |t| {
+        allocator.free(t.key);
+        allocator.free(t.value);
+    }
+    allocator.free(tags);
+}
+
+fn validateTags(tags: []const Tag) !void {
+    if (tags.len > MAX_TAGS) return error.InvalidTag;
+    for (tags, 0..) |t, i| {
+        if (t.key.len == 0 or t.key.len > 128 or t.value.len > 256) return error.InvalidTag;
+        for (tags[0..i]) |prev| {
+            if (std.mem.eql(u8, prev.key, t.key)) return error.InvalidTag;
+        }
+    }
+}
+
+/// Parse the x-amz-tagging header / query form: "k=v&k2=v2" (URL-encoded).
+pub fn parseTagQuery(allocator: Allocator, text: []const u8) ![]Tag {
+    var list: std.ArrayListUnmanaged(Tag) = .empty;
+    errdefer {
+        for (list.items) |t| {
+            allocator.free(t.key);
+            allocator.free(t.value);
+        }
+        list.deinit(allocator);
+    }
+    const trimmed = std.mem.trim(u8, text, " \t");
+    if (trimmed.len == 0) return list.toOwnedSlice(allocator);
+    var it = std.mem.splitScalar(u8, trimmed, '&');
+    while (it.next()) |pair| {
+        if (pair.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, pair, '=');
+        const raw_k = if (eq) |e| pair[0..e] else pair;
+        const raw_v = if (eq) |e| pair[e + 1 ..] else "";
+        const k = try uriDecode(allocator, raw_k);
+        errdefer allocator.free(k);
+        const v = try uriDecode(allocator, raw_v);
+        errdefer allocator.free(v);
+        try list.append(allocator, .{ .key = k, .value = v });
+    }
+    try validateTags(list.items);
+    return list.toOwnedSlice(allocator);
+}
+
+/// Parse a <Tagging><TagSet><Tag><Key/><Value/></Tag>…</TagSet></Tagging> body.
+pub fn parseTaggingXml(allocator: Allocator, body: []const u8) ![]Tag {
+    var list: std.ArrayListUnmanaged(Tag) = .empty;
+    errdefer {
+        for (list.items) |t| {
+            allocator.free(t.key);
+            allocator.free(t.value);
+        }
+        list.deinit(allocator);
+    }
+    if (std.mem.indexOf(u8, body, "<Tagging") == null) return error.MalformedXML;
+    var rest = body;
+    while (std.mem.indexOf(u8, rest, "<Tag>")) |start| {
+        const after = rest[start + 5 ..];
+        const end = std.mem.indexOf(u8, after, "</Tag>") orelse return error.MalformedXML;
+        const block = after[0..end];
+        const k = xmlTagText(block, "Key") orelse return error.MalformedXML;
+        const v = xmlTagText(block, "Value") orelse "";
+        const dk = try xmlUnescape(allocator, k);
+        errdefer allocator.free(dk);
+        const dv = try xmlUnescape(allocator, v);
+        errdefer allocator.free(dv);
+        try list.append(allocator, .{ .key = dk, .value = dv });
+        rest = after[end + 6 ..];
+    }
+    try validateTags(list.items);
+    return list.toOwnedSlice(allocator);
+}
+
+pub fn tagsToQuery(allocator: Allocator, tags: []const Tag) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    for (tags, 0..) |t, i| {
+        if (i > 0) try buf.append(allocator, '&');
+        const ek = try uriEncode(allocator, t.key, true);
+        defer allocator.free(ek);
+        const ev = try uriEncode(allocator, t.value, true);
+        defer allocator.free(ev);
+        try buf.appendSlice(allocator, ek);
+        try buf.append(allocator, '=');
+        try buf.appendSlice(allocator, ev);
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+fn tagsToXml(allocator: Allocator, tags: []const Tag) ![]const u8 {
+    var xml: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer xml.deinit(allocator);
+    try xml.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    try xml.appendSlice(allocator, "<Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet>");
+    for (tags) |t| {
+        try xml.appendSlice(allocator, "<Tag><Key>");
+        try xmlEscape(allocator, &xml, t.key);
+        try xml.appendSlice(allocator, "</Key><Value>");
+        try xmlEscape(allocator, &xml, t.value);
+        try xml.appendSlice(allocator, "</Value></Tag>");
+    }
+    try xml.appendSlice(allocator, "</TagSet></Tagging>");
+    return xml.toOwnedSlice(allocator);
+}
+
+/// GET/PUT/DELETE /{bucket}/{key}?tagging
+fn handleObjectTagging(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
+    const effective_key = if (key.len > 0 and key[key.len - 1] == '/')
+        try std.fmt.allocPrint(allocator, "{s}.folder_marker", .{key})
+    else
+        try allocator.dupe(u8, key);
+    defer allocator.free(effective_key);
+
+    if (!objectExistsAny(ctx, allocator, bucket, effective_key)) {
+        sendError(res, 404, "NoSuchKey", "Object not found");
+        return;
+    }
+    var attrs = loadObjectAttrsAny(ctx, allocator, bucket, effective_key) orelse
+        ObjectAttrs{ .content_type = try allocator.dupe(u8, DEFAULT_CONTENT_TYPE) };
+    // NB: attrs memory feeds response headers; arena-freed after write.
+
+    if (std.mem.eql(u8, req.method, "GET")) {
+        const tags = if (attrs.tagging) |t| try parseTagQuery(allocator, t) else &[_]Tag{};
+        res.ok();
+        if (attrs.version_id) |v| res.setHeader("x-amz-version-id", v);
+        res.setXmlBody(try tagsToXml(allocator, tags));
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "PUT")) {
+        const tags = parseTaggingXml(allocator, req.body) catch |err| switch (err) {
+            error.MalformedXML => {
+                sendError(res, 400, "MalformedXML", "The XML you provided was not well-formed");
+                return;
+            },
+            error.InvalidTag => {
+                sendError(res, 400, "InvalidTag", "The TagValue you have provided is invalid");
+                return;
+            },
+            else => return err,
+        };
+        if (attrs.tagging) |old| allocator.free(old);
+        attrs.tagging = try tagsToQuery(allocator, tags);
+        try saveObjectAttrsAny(ctx, allocator, bucket, effective_key, &attrs);
+        res.ok();
+        if (attrs.version_id) |v| res.setHeader("x-amz-version-id", v);
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "DELETE")) {
+        if (attrs.tagging) |old| allocator.free(old);
+        attrs.tagging = null;
+        try saveObjectAttrsAny(ctx, allocator, bucket, effective_key, &attrs);
+        res.noContent();
+        if (attrs.version_id) |v| res.setHeader("x-amz-version-id", v);
+        return;
+    }
+    sendError(res, 405, "MethodNotAllowed", "Method not allowed");
+}
+
+/// GET/PUT/DELETE /{bucket}?tagging
+fn handleBucketTagging(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8) !void {
+    if (!bucketExists(ctx, allocator, bucket)) {
+        sendError(res, 404, "NoSuchBucket", "Bucket not found");
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "GET")) {
+        const stored = readBucketConfig(ctx, allocator, bucket, "tagging") orelse {
+            sendError(res, 404, "NoSuchTagSet", "The TagSet does not exist");
+            return;
+        };
+        const tags = try parseTagQuery(allocator, stored);
+        res.ok();
+        res.setXmlBody(try tagsToXml(allocator, tags));
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "PUT")) {
+        const tags = parseTaggingXml(allocator, req.body) catch |err| switch (err) {
+            error.MalformedXML => {
+                sendError(res, 400, "MalformedXML", "The XML you provided was not well-formed");
+                return;
+            },
+            error.InvalidTag => {
+                sendError(res, 400, "InvalidTag", "The TagValue you have provided is invalid");
+                return;
+            },
+            else => return err,
+        };
+        const q = try tagsToQuery(allocator, tags);
+        try writeBucketConfig(ctx, allocator, bucket, "tagging", q);
+        res.ok();
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "DELETE")) {
+        deleteBucketConfig(ctx, allocator, bucket, "tagging");
+        res.noContent();
+        return;
+    }
+    sendError(res, 405, "MethodNotAllowed", "Method not allowed");
+}
+
+// ---------------------------------------------------------------------------
+// ACLs (canned)
+// ---------------------------------------------------------------------------
+// zs3 has one owner (the configured credentials). Canned ACLs decide what
+// anonymous (unsigned) requests may do: `public-read` grants GET/HEAD/LIST,
+// `public-read-write` adds PUT/POST/DELETE on objects. Everything else is
+// `private`. Grants to specific AWS accounts have no meaning here and are
+// rejected with a clear error rather than silently accepted.
+
+pub fn isCannedAcl(name: []const u8) bool {
+    const canned = [_][]const u8{ "private", "public-read", "public-read-write", "authenticated-read", "bucket-owner-read", "bucket-owner-full-control", "aws-exec-read", "log-delivery-write" };
+    for (canned) |c| {
+        if (std.mem.eql(u8, c, name)) return true;
+    }
+    return false;
+}
+
+/// Collapse canned ACLs to the three that change behavior here.
+pub fn normalizeCannedAcl(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "public-read")) return "public-read";
+    if (std.mem.eql(u8, name, "public-read-write")) return "public-read-write";
+    return "private";
+}
+
+fn aclAllowsAnonymousRead(acl_name: ?[]const u8) bool {
+    const a = acl_name orelse return false;
+    return std.mem.eql(u8, a, "public-read") or std.mem.eql(u8, a, "public-read-write");
+}
+
+fn aclAllowsAnonymousWrite(acl_name: ?[]const u8) bool {
+    const a = acl_name orelse return false;
+    return std.mem.eql(u8, a, "public-read-write");
+}
+
+fn readBucketAcl(ctx: *const S3Context, allocator: Allocator, bucket: []const u8) []const u8 {
+    const stored = readBucketConfig(ctx, allocator, bucket, "acl") orelse return "private";
+    return normalizeCannedAcl(std.mem.trim(u8, stored, " \t\r\n"));
+}
+
+/// Role an unsigned request gets from bucket/object ACLs, or null (403).
+fn anonymousRole(ctx: *const S3Context, allocator: Allocator, req: *const Request, bucket: []const u8, key: []const u8) ?acl.Role {
+    if (bucket.len == 0) return null;
+    const is_read = std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "HEAD");
+    const bucket_acl = readBucketAcl(ctx, allocator, bucket);
+    if (aclAllowsAnonymousWrite(bucket_acl)) return .Writer;
+    if (is_read and aclAllowsAnonymousRead(bucket_acl)) return .Reader;
+    if (is_read and key.len > 0) {
+        const effective_key = if (key[key.len - 1] == '/')
+            std.fmt.allocPrint(allocator, "{s}.folder_marker", .{key}) catch return null
+        else
+            key;
+        if (loadObjectAttrsAny(ctx, allocator, bucket, effective_key)) |attrs| {
+            if (aclAllowsAnonymousRead(attrs.acl)) return .Reader;
+        }
+    }
+    return null;
+}
+
+fn aclPolicyXml(allocator: Allocator, canned: []const u8) ![]const u8 {
+    var xml: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer xml.deinit(allocator);
+    try xml.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    try xml.appendSlice(allocator, "<AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><ID>" ++ OWNER_ID ++ "</ID><DisplayName>" ++ OWNER_ID ++ "</DisplayName></Owner><AccessControlList>");
+    try xml.appendSlice(allocator, "<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\"><ID>" ++ OWNER_ID ++ "</ID><DisplayName>" ++ OWNER_ID ++ "</DisplayName></Grantee><Permission>FULL_CONTROL</Permission></Grant>");
+    if (aclAllowsAnonymousRead(canned)) {
+        try xml.appendSlice(allocator, "<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"Group\"><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee><Permission>READ</Permission></Grant>");
+    }
+    if (aclAllowsAnonymousWrite(canned)) {
+        try xml.appendSlice(allocator, "<Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"Group\"><URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee><Permission>WRITE</Permission></Grant>");
+    }
+    try xml.appendSlice(allocator, "</AccessControlList></AccessControlPolicy>");
+    return xml.toOwnedSlice(allocator);
+}
+
+/// Resolve the ACL a PUT ?acl request asks for: x-amz-acl header, or an
+/// AccessControlPolicy body reduced to its AllUsers grants.
+fn aclFromRequest(req: *const Request) ![]const u8 {
+    if (req.header("x-amz-acl")) |h| {
+        if (!isCannedAcl(h)) return error.InvalidAcl;
+        return normalizeCannedAcl(h);
+    }
+    const body = req.body;
+    if (std.mem.indexOf(u8, body, "<AccessControlPolicy") == null) return error.MalformedACL;
+    var read = false;
+    var write = false;
+    var rest = body;
+    while (std.mem.indexOf(u8, rest, "<Grant>")) |start| {
+        const after = rest[start + 7 ..];
+        const end = std.mem.indexOf(u8, after, "</Grant>") orelse return error.MalformedACL;
+        const grant = after[0..end];
+        const perm = xmlTagText(grant, "Permission") orelse "";
+        const uri = xmlTagText(grant, "URI") orelse "";
+        const all_users = std.mem.endsWith(u8, uri, "/AllUsers");
+        const owner = if (xmlTagText(grant, "ID")) |id| std.mem.eql(u8, id, OWNER_ID) else false;
+        if (all_users) {
+            if (std.mem.eql(u8, perm, "READ")) read = true;
+            if (std.mem.eql(u8, perm, "WRITE")) write = true;
+            if (std.mem.eql(u8, perm, "FULL_CONTROL")) {
+                read = true;
+                write = true;
+            }
+        } else if (!owner and !std.mem.endsWith(u8, uri, "/AuthenticatedUsers")) {
+            // Grants to arbitrary accounts cannot be honored.
+            return error.UnsupportedGrantee;
+        }
+        rest = after[end + 8 ..];
+    }
+    if (write) return "public-read-write";
+    if (read) return "public-read";
+    return "private";
+}
+
+fn sendAclError(res: *Response, err: anyerror) void {
+    switch (err) {
+        error.InvalidAcl => sendError(res, 400, "InvalidArgument", "Unknown canned ACL"),
+        error.MalformedACL => sendError(res, 400, "MalformedACLError", "The XML you provided was not well-formed or did not validate against our published schema"),
+        error.UnsupportedGrantee => sendError(res, 400, "UnresolvableGrantByEmailAddress", "zs3 supports canned ACLs and AllUsers grants only"),
+        else => sendError(res, 500, "InternalError", "ACL update failed"),
+    }
+}
+
+/// GET/PUT /{bucket}?acl
+fn handleBucketAcl(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8) !void {
+    if (!bucketExists(ctx, allocator, bucket)) {
+        sendError(res, 404, "NoSuchBucket", "Bucket not found");
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "GET")) {
+        res.ok();
+        res.setXmlBody(try aclPolicyXml(allocator, readBucketAcl(ctx, allocator, bucket)));
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "PUT")) {
+        const canned = aclFromRequest(req) catch |err| {
+            sendAclError(res, err);
+            return;
+        };
+        try writeBucketConfig(ctx, allocator, bucket, "acl", canned);
+        res.ok();
+        return;
+    }
+    sendError(res, 405, "MethodNotAllowed", "Method not allowed");
+}
+
+/// GET/PUT /{bucket}/{key}?acl
+fn handleObjectAcl(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8) !void {
+    const effective_key = if (key.len > 0 and key[key.len - 1] == '/')
+        try std.fmt.allocPrint(allocator, "{s}.folder_marker", .{key})
+    else
+        try allocator.dupe(u8, key);
+    defer allocator.free(effective_key);
+    if (!objectExistsAny(ctx, allocator, bucket, effective_key)) {
+        sendError(res, 404, "NoSuchKey", "Object not found");
+        return;
+    }
+    var attrs = loadObjectAttrsAny(ctx, allocator, bucket, effective_key) orelse
+        ObjectAttrs{ .content_type = try allocator.dupe(u8, DEFAULT_CONTENT_TYPE) };
+    if (std.mem.eql(u8, req.method, "GET")) {
+        res.ok();
+        if (attrs.version_id) |v| res.setHeader("x-amz-version-id", v);
+        res.setXmlBody(try aclPolicyXml(allocator, attrs.acl orelse "private"));
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "PUT")) {
+        const canned = aclFromRequest(req) catch |err| {
+            sendAclError(res, err);
+            return;
+        };
+        if (attrs.acl) |old| allocator.free(old);
+        attrs.acl = if (std.mem.eql(u8, canned, "private")) null else try allocator.dupe(u8, canned);
+        if (attrs.acl != null) noteObjectAclUsed(ctx);
+        try saveObjectAttrsAny(ctx, allocator, bucket, effective_key, &attrs);
+        res.ok();
+        if (attrs.version_id) |v| res.setHeader("x-amz-version-id", v);
+        return;
+    }
+    sendError(res, 405, "MethodNotAllowed", "Method not allowed");
+}
+
+// ---------------------------------------------------------------------------
+// Subresource routing
+// ---------------------------------------------------------------------------
+
+/// Bucket/object subresources (?acl, ?tagging, ?versioning, ?versions,
+/// ?lifecycle, ?encryption). Returns true when the request was handled.
+/// Anonymous callers may read but never change configuration.
+fn routeSubresource(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, key: []const u8, anonymous: bool) !bool {
+    if (bucket.len == 0) return false;
+    const q = req.query;
+    const is_get = std.mem.eql(u8, req.method, "GET");
+    const mutating = !is_get and !std.mem.eql(u8, req.method, "HEAD");
+
+    const sub: enum { none, acl, tagging, versioning, versions, lifecycle, encryption } =
+        if (hasQuery(q, "acl")) .acl else if (hasQuery(q, "tagging")) .tagging else if (hasQuery(q, "versioning")) .versioning else if (hasQuery(q, "versions")) .versions else if (hasQuery(q, "lifecycle")) .lifecycle else if (hasQuery(q, "encryption")) .encryption else .none;
+    if (sub == .none) return false;
+
+    // Configuration changes need real credentials, even on public-read-write
+    // buckets (S3 keeps WRITE_ACP separate from WRITE).
+    const object_data_change = key.len > 0 and sub == .tagging;
+    if (anonymous and mutating and !object_data_change) {
+        sendError(res, 403, "AccessDenied", "Anonymous requests cannot change bucket configuration");
+        return true;
+    }
+
+    switch (sub) {
+        .acl => if (key.len == 0) try handleBucketAcl(ctx, allocator, req, res, bucket) else try handleObjectAcl(ctx, allocator, req, res, bucket, key),
+        .tagging => if (key.len == 0) try handleBucketTagging(ctx, allocator, req, res, bucket) else try handleObjectTagging(ctx, allocator, req, res, bucket, key),
+        .versioning => try handleBucketVersioning(ctx, allocator, req, res, bucket),
+        .versions => if (key.len == 0 and is_get) try handleListObjectVersions(ctx, allocator, req, res, bucket) else return false,
+        .lifecycle => try handleBucketLifecycle(ctx, allocator, req, res, bucket),
+        .encryption => try handleBucketEncryption(ctx, allocator, req, res, bucket),
+        .none => unreachable,
+    }
+    return true;
+}
+
+// (implemented in the versioning / lifecycle / encryption sections below)
+
+// ---------------------------------------------------------------------------
+// Versioning
+// ---------------------------------------------------------------------------
+// The current version of a key stays at its normal path, so the directory is
+// still a plain tree of files. Older versions and delete markers move to
+// `<bucket>/.zs3versions/<key>.v/<version-id>` (`.zs3attrs` sidecars travel
+// with them; delete markers are empty `<version-id>.deletemarker` files).
+// An object written before versioning was enabled is the "null" version,
+// exactly as in S3. Version IDs are 32 hex chars: 16 of write time in
+// nanoseconds, 16 random.
+
+const VersioningStatus = enum { disabled, enabled, suspended };
+
+const NULL_VERSION = "null";
+const DELETE_MARKER_SUFFIX = ".deletemarker";
+const VERSION_DIR_SUFFIX = ".v";
+
+fn bucketVersioning(ctx: *const S3Context, allocator: Allocator, bucket: []const u8) VersioningStatus {
+    const stored = readBucketConfig(ctx, allocator, bucket, "versioning") orelse return .disabled;
+    defer allocator.free(stored);
+    const t = std.mem.trim(u8, stored, " \t\r\n");
+    if (std.mem.eql(u8, t, "Enabled")) return .enabled;
+    if (std.mem.eql(u8, t, "Suspended")) return .suspended;
+    return .disabled;
+}
+
+/// GET/PUT /{bucket}?versioning
+fn handleBucketVersioning(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8) !void {
+    if (!bucketExists(ctx, allocator, bucket)) {
+        sendError(res, 404, "NoSuchBucket", "Bucket not found");
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "GET")) {
+        const status = bucketVersioning(ctx, allocator, bucket);
+        const body = switch (status) {
+            .disabled => "<?xml version=\"1.0\" encoding=\"UTF-8\"?><VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>",
+            .enabled => "<?xml version=\"1.0\" encoding=\"UTF-8\"?><VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status></VersioningConfiguration>",
+            .suspended => "<?xml version=\"1.0\" encoding=\"UTF-8\"?><VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Suspended</Status></VersioningConfiguration>",
+        };
+        res.ok();
+        res.setXmlBody(body);
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "PUT")) {
+        if (ctx.distributed != null) {
+            sendError(res, 501, "NotImplemented", "Versioning is not available in distributed mode");
+            return;
+        }
+        const status = xmlTagText(req.body, "Status") orelse {
+            sendError(res, 400, "IllegalVersioningConfigurationException", "The Versioning element must contain a Status of Enabled or Suspended");
+            return;
+        };
+        if (!std.mem.eql(u8, status, "Enabled") and !std.mem.eql(u8, status, "Suspended")) {
+            sendError(res, 400, "IllegalVersioningConfigurationException", "Status must be Enabled or Suspended");
+            return;
+        }
+        try writeBucketConfig(ctx, allocator, bucket, "versioning", status);
+        res.ok();
+        return;
+    }
+    sendError(res, 405, "MethodNotAllowed", "Method not allowed");
+}
+
+pub fn isValidVersionId(vid: []const u8) bool {
+    if (std.mem.eql(u8, vid, NULL_VERSION)) return true;
+    if (vid.len != 32) return false;
+    for (vid) |c| {
+        if (!std.ascii.isHex(c) or std.ascii.isUpper(c)) return false;
+    }
+    return true;
+}
+
+fn newVersionId(allocator: Allocator) ![]const u8 {
+    const now = std.Io.Clock.real.now(app_io);
+    const nanos: u64 = @intCast(@max(now.nanoseconds, 0));
+    var rnd: [8]u8 = undefined;
+    app_io.random(&rnd);
+    return std.fmt.allocPrint(allocator, "{x:0>16}{x:0>16}", .{ nanos, std.mem.readInt(u64, &rnd, .little) });
+}
+
+fn versionsDirPath(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, effective_key: []const u8) ![]const u8 {
+    const leaf = try std.fmt.allocPrint(allocator, "{s}" ++ VERSION_DIR_SUFFIX, .{effective_key});
+    defer allocator.free(leaf);
+    return std.fs.path.join(allocator, &.{ ctx.data_dir, bucket, VERSIONS_DIR, leaf });
+}
+
+fn versionFilePath(allocator: Allocator, vdir: []const u8, vid: []const u8, suffix: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ vdir, vid, suffix });
+}
+
+/// Version id of the object at `path` ("null" when it has none).
+fn currentVersionId(allocator: Allocator, path: []const u8, key: []const u8) []const u8 {
+    const attrs = loadStandaloneAttrs(allocator, path, key) catch return NULL_VERSION;
+    // Arena-allocated; deinit is cosmetic here but keeps non-arena callers clean.
+    const vid = if (attrs.version_id) |v| allocator.dupe(u8, v) catch NULL_VERSION else NULL_VERSION;
+    attrs.deinit(allocator);
+    return vid;
+}
+
+fn renameFile(old_path: []const u8, new_path: []const u8) !void {
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, app_io);
+}
+
+/// Move the current object (file + sidecar) into the versions directory
+/// under its version id. Called before any overwrite or delete on a bucket
+/// with versioning enabled or suspended. In the suspended state the null
+/// version is overwritten in place (S3 semantics), so nothing is archived.
+fn archiveCurrentVersion(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, effective_key: []const u8, path: []const u8, status: VersioningStatus) !void {
+    if (status == .disabled) return;
+    const stat = std.Io.Dir.cwd().statFile(app_io, path, .{}) catch return;
+    if (stat.kind != .file) return;
+    const vid = currentVersionId(allocator, path, effective_key);
+    if (status == .suspended and std.mem.eql(u8, vid, NULL_VERSION)) return;
+
+    const vdir = try versionsDirPath(ctx, allocator, bucket, effective_key);
+    defer allocator.free(vdir);
+    try std.Io.Dir.cwd().createDirPath(app_io, vdir);
+
+    const dst = try versionFilePath(allocator, vdir, vid, "");
+    defer allocator.free(dst);
+    try renameFile(path, dst);
+    const src_sidecar = try attrsSidecarPath(allocator, path);
+    defer allocator.free(src_sidecar);
+    const dst_sidecar = try attrsSidecarPath(allocator, dst);
+    defer allocator.free(dst_sidecar);
+    renameFile(src_sidecar, dst_sidecar) catch {
+        std.Io.Dir.cwd().deleteFile(app_io, dst_sidecar) catch {};
+    };
+    // A null version supersedes a null delete marker.
+    if (std.mem.eql(u8, vid, NULL_VERSION)) {
+        const marker = try versionFilePath(allocator, vdir, NULL_VERSION, DELETE_MARKER_SUFFIX);
+        defer allocator.free(marker);
+        std.Io.Dir.cwd().deleteFile(app_io, marker) catch {};
+    }
+    fsyncParentDir(dst);
+    fsyncParentDir(path);
+}
+
+const VersionEntry = struct {
+    vid: []const u8,
+    is_marker: bool,
+    mtime: i64,
+    size: u64,
+};
+
+/// Stored (non-current) versions of a key, newest first.
+fn listStoredVersions(allocator: Allocator, vdir: []const u8) !std.ArrayListUnmanaged(VersionEntry) {
+    var out: std.ArrayListUnmanaged(VersionEntry) = .empty;
+    errdefer out.deinit(allocator);
+    var dir = std.Io.Dir.cwd().openDir(app_io, vdir, .{ .iterate = true }) catch return out;
+    defer dir.close(app_io);
+    var it = dir.iterate();
+    while (try it.next(app_io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.endsWith(u8, entry.name, ".zs3attrs")) continue;
+        const is_marker = std.mem.endsWith(u8, entry.name, DELETE_MARKER_SUFFIX);
+        const vid = if (is_marker) entry.name[0 .. entry.name.len - DELETE_MARKER_SUFFIX.len] else entry.name;
+        if (!isValidVersionId(vid)) continue;
+        const stat = dir.statFile(app_io, entry.name, .{}) catch continue;
+        try out.append(allocator, .{
+            .vid = try allocator.dupe(u8, vid),
+            .is_marker = is_marker,
+            .mtime = @intCast(stat.mtime.toSeconds()),
+            .size = stat.size,
+        });
+    }
+    std.mem.sort(VersionEntry, out.items, {}, struct {
+        fn lessThan(_: void, a: VersionEntry, b: VersionEntry) bool {
+            if (a.mtime != b.mtime) return a.mtime > b.mtime;
+            // Same second: generated ids sort by time; "null" is oldest.
+            if (std.mem.eql(u8, a.vid, NULL_VERSION)) return false;
+            if (std.mem.eql(u8, b.vid, NULL_VERSION)) return true;
+            return std.mem.order(u8, a.vid, b.vid) == .gt;
+        }
+    }.lessThan);
+    return out;
+}
+
+/// After the current object is removed, make the newest stored data version
+/// current again (unless the newest entry is a delete marker).
+fn promoteLatestVersion(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, effective_key: []const u8, path: []const u8) !void {
+    const vdir = try versionsDirPath(ctx, allocator, bucket, effective_key);
+    defer allocator.free(vdir);
+    var versions = try listStoredVersions(allocator, vdir);
+    defer versions.deinit(allocator);
+    if (versions.items.len == 0) {
+        removeEmptyVersionDirs(ctx, allocator, bucket, vdir);
+        return;
+    }
+    const newest = versions.items[0];
+    if (newest.is_marker) return;
+    const src = try versionFilePath(allocator, vdir, newest.vid, "");
+    defer allocator.free(src);
+    if (std.fs.path.dirname(path)) |d| std.Io.Dir.cwd().createDirPath(app_io, d) catch {};
+    try renameFile(src, path);
+    const src_sidecar = try attrsSidecarPath(allocator, src);
+    defer allocator.free(src_sidecar);
+    const dst_sidecar = try attrsSidecarPath(allocator, path);
+    defer allocator.free(dst_sidecar);
+    renameFile(src_sidecar, dst_sidecar) catch {
+        std.Io.Dir.cwd().deleteFile(app_io, dst_sidecar) catch {};
+    };
+    fsyncParentDir(path);
+    if (versions.items.len == 1) removeEmptyVersionDirs(ctx, allocator, bucket, vdir);
+}
+
+/// Remove an empty `<key>.v` directory and empty parents up to .zs3versions.
+fn removeEmptyVersionDirs(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, vdir: []const u8) void {
+    const root = std.fs.path.join(allocator, &.{ ctx.data_dir, bucket, VERSIONS_DIR }) catch return;
+    defer allocator.free(root);
+    var cur: ?[]const u8 = vdir;
+    while (cur) |d| {
+        if (d.len < root.len) break;
+        std.Io.Dir.cwd().deleteDir(app_io, d) catch break;
+        cur = std.fs.path.dirname(d);
+    }
+}
+
+fn bucketHasVersions(ctx: *const S3Context, allocator: Allocator, bucket: []const u8) bool {
+    const root = std.fs.path.join(allocator, &.{ ctx.data_dir, bucket, VERSIONS_DIR }) catch return false;
+    defer allocator.free(root);
+    return dirHasAnyFile(allocator, root);
+}
+
+fn dirHasAnyFile(allocator: Allocator, path: []const u8) bool {
+    var dir = std.Io.Dir.cwd().openDir(app_io, path, .{ .iterate = true }) catch return false;
+    defer dir.close(app_io);
+    var it = dir.iterate();
+    while (it.next(app_io) catch null) |entry| {
+        if (entry.kind == .file) return true;
+        if (entry.kind == .directory) {
+            const sub = std.fs.path.join(allocator, &.{ path, entry.name }) catch continue;
+            defer allocator.free(sub);
+            if (dirHasAnyFile(allocator, sub)) return true;
+        }
+    }
+    return false;
+}
+
+const ResolvedVersion = union(enum) {
+    /// Path of the file holding this version (current object or archived).
+    path: []const u8,
+    delete_marker,
+    not_found,
+};
+
+/// Locate a specific version of a key.
+fn resolveVersion(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, effective_key: []const u8, path: []const u8, vid: []const u8) !ResolvedVersion {
+    if (!isValidVersionId(vid)) return .not_found;
+    if (std.Io.Dir.cwd().statFile(app_io, path, .{})) |st| {
+        if (st.kind == .file and std.mem.eql(u8, currentVersionId(allocator, path, effective_key), vid)) {
+            return .{ .path = try allocator.dupe(u8, path) };
+        }
+    } else |_| {}
+    const vdir = try versionsDirPath(ctx, allocator, bucket, effective_key);
+    defer allocator.free(vdir);
+    const vpath = try versionFilePath(allocator, vdir, vid, "");
+    if (std.Io.Dir.cwd().access(app_io, vpath, .{})) |_| return .{ .path = vpath } else |_| {}
+    allocator.free(vpath);
+    const marker = try versionFilePath(allocator, vdir, vid, DELETE_MARKER_SUFFIX);
+    defer allocator.free(marker);
+    if (std.Io.Dir.cwd().access(app_io, marker, .{})) |_| return .delete_marker else |_| {}
+    return .not_found;
+}
+
+/// The delete marker that currently hides a key, if any.
+fn latestDeleteMarker(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, effective_key: []const u8) ?[]const u8 {
+    const vdir = versionsDirPath(ctx, allocator, bucket, effective_key) catch return null;
+    defer allocator.free(vdir);
+    var versions = listStoredVersions(allocator, vdir) catch return null;
+    defer versions.deinit(allocator);
+    if (versions.items.len == 0) return null;
+    if (!versions.items[0].is_marker) return null;
+    return versions.items[0].vid;
+}
+
+const DeleteOutcome = struct {
+    delete_marker: bool = false,
+    version_id: ?[]const u8 = null,
+    not_found: bool = false,
+};
+
+/// DELETE semantics for one key: with no version id, remove the current
+/// object (unversioned) or add a delete marker (versioned); with a version
+/// id, permanently remove that version and promote the next one.
+fn deleteObjectVersioned(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, effective_key: []const u8, version_id: ?[]const u8) !DeleteOutcome {
+    const path = try ctx.objectPath(allocator, bucket, effective_key);
+    defer allocator.free(path);
+    const status = bucketVersioning(ctx, allocator, bucket);
+
+    if (version_id) |vid| {
+        if (!isValidVersionId(vid)) return .{ .not_found = true };
+        const vdir = try versionsDirPath(ctx, allocator, bucket, effective_key);
+        defer allocator.free(vdir);
+        // Current object?
+        if (std.Io.Dir.cwd().statFile(app_io, path, .{})) |st| {
+            if (st.kind == .file and std.mem.eql(u8, currentVersionId(allocator, path, effective_key), vid)) {
+                deleteObjectInternal(ctx, allocator, bucket, path);
+                try promoteLatestVersion(ctx, allocator, bucket, effective_key, path);
+                return .{ .version_id = try allocator.dupe(u8, vid) };
+            }
+        } else |_| {}
+        const vpath = try versionFilePath(allocator, vdir, vid, "");
+        defer allocator.free(vpath);
+        if (std.Io.Dir.cwd().deleteFile(app_io, vpath)) |_| {
+            deleteStandaloneAttrs(allocator, vpath);
+            removeEmptyVersionDirs(ctx, allocator, bucket, vdir);
+            return .{ .version_id = try allocator.dupe(u8, vid) };
+        } else |_| {}
+        const marker = try versionFilePath(allocator, vdir, vid, DELETE_MARKER_SUFFIX);
+        defer allocator.free(marker);
+        if (std.Io.Dir.cwd().deleteFile(app_io, marker)) |_| {
+            // Removing the marker that hid the key brings the newest
+            // remaining version back.
+            if (std.Io.Dir.cwd().access(app_io, path, .{})) |_| {} else |_| {
+                try promoteLatestVersion(ctx, allocator, bucket, effective_key, path);
+            }
+            removeEmptyVersionDirs(ctx, allocator, bucket, vdir);
+            return .{ .version_id = try allocator.dupe(u8, vid), .delete_marker = true };
+        } else |_| {}
+        return .{ .not_found = true };
+    }
+
+    switch (status) {
+        .disabled => {
+            deleteObjectInternal(ctx, allocator, bucket, path);
+            return .{};
+        },
+        .enabled => {
+            try archiveCurrentVersion(ctx, allocator, bucket, effective_key, path, status);
+            const vdir = try versionsDirPath(ctx, allocator, bucket, effective_key);
+            defer allocator.free(vdir);
+            try std.Io.Dir.cwd().createDirPath(app_io, vdir);
+            const vid = try newVersionId(allocator);
+            const marker = try versionFilePath(allocator, vdir, vid, DELETE_MARKER_SUFFIX);
+            defer allocator.free(marker);
+            var f = try std.Io.Dir.cwd().createFile(app_io, marker, .{});
+            f.close(app_io);
+            fsyncParentDir(marker);
+            cleanupEmptyObjectDirs(ctx, allocator, bucket, path);
+            return .{ .version_id = vid, .delete_marker = true };
+        },
+        .suspended => {
+            // Non-null current versions are kept; the null version (and any
+            // stored null version) is replaced by a null delete marker.
+            try archiveCurrentVersion(ctx, allocator, bucket, effective_key, path, status);
+            deleteObjectInternal(ctx, allocator, bucket, path);
+            const vdir = try versionsDirPath(ctx, allocator, bucket, effective_key);
+            defer allocator.free(vdir);
+            try std.Io.Dir.cwd().createDirPath(app_io, vdir);
+            const null_data = try versionFilePath(allocator, vdir, NULL_VERSION, "");
+            defer allocator.free(null_data);
+            std.Io.Dir.cwd().deleteFile(app_io, null_data) catch {};
+            deleteStandaloneAttrs(allocator, null_data);
+            const marker = try versionFilePath(allocator, vdir, NULL_VERSION, DELETE_MARKER_SUFFIX);
+            defer allocator.free(marker);
+            var f = try std.Io.Dir.cwd().createFile(app_io, marker, .{});
+            f.close(app_io);
+            fsyncParentDir(marker);
+            return .{ .version_id = try allocator.dupe(u8, NULL_VERSION), .delete_marker = true };
+        },
+    }
+}
+
+/// Remove empty parent directories of a (now absent) object path, up to the
+/// bucket root. Same walk deleteObjectInternal does after unlinking.
+fn cleanupEmptyObjectDirs(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, path: []const u8) void {
+    const bucket_path = ctx.bucketPath(allocator, bucket) catch return;
+    defer allocator.free(bucket_path);
+    var dir_path = std.fs.path.dirname(path);
+    while (dir_path) |dp| {
+        if (dp.len <= bucket_path.len) break;
+        std.Io.Dir.cwd().deleteDir(app_io, dp) catch break;
+        dir_path = std.fs.path.dirname(dp);
+    }
+}
+
+// --- ListObjectVersions -----------------------------------------------------
+
+const ListedVersion = struct {
+    key: []const u8, // S3 key (folder markers translated)
+    vid: []const u8,
+    is_marker: bool,
+    is_current: bool,
+    mtime: i64,
+    size: u64,
+    path: ?[]const u8, // data file, for ETag
+};
+
+fn listedVersionLess(_: void, a: ListedVersion, b: ListedVersion) bool {
+    const ko = std.mem.order(u8, a.key, b.key);
+    if (ko != .eq) return ko == .lt;
+    if (a.is_current != b.is_current) return a.is_current;
+    if (a.mtime != b.mtime) return a.mtime > b.mtime;
+    if (std.mem.eql(u8, a.vid, NULL_VERSION)) return false;
+    if (std.mem.eql(u8, b.vid, NULL_VERSION)) return true;
+    return std.mem.order(u8, a.vid, b.vid) == .gt;
+}
+
+/// Translate an effective (on-disk) key back to its S3 key.
+fn displayKey(allocator: Allocator, effective_key: []const u8) ![]const u8 {
+    if (std.mem.endsWith(u8, effective_key, ".folder_marker")) {
+        return allocator.dupe(u8, effective_key[0 .. effective_key.len - ".folder_marker".len]);
+    }
+    return allocator.dupe(u8, effective_key);
+}
+
+fn collectStoredVersions(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, rel: []const u8, filter_prefix: []const u8, out: *std.ArrayListUnmanaged(ListedVersion)) !void {
+    const root = try std.fs.path.join(allocator, &.{ ctx.data_dir, bucket, VERSIONS_DIR });
+    defer allocator.free(root);
+    const full = if (rel.len > 0) try std.fs.path.join(allocator, &.{ root, rel }) else try allocator.dupe(u8, root);
+    defer allocator.free(full);
+    var dir = std.Io.Dir.cwd().openDir(app_io, full, .{ .iterate = true }) catch return;
+    defer dir.close(app_io);
+    var it = dir.iterate();
+    while (try it.next(app_io)) |entry| {
+        if (entry.kind != .directory) continue;
+        const sub_rel = if (rel.len > 0) try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel, entry.name }) else try allocator.dupe(u8, entry.name);
+        if (std.mem.endsWith(u8, entry.name, VERSION_DIR_SUFFIX)) {
+            const effective_key = sub_rel[0 .. sub_rel.len - VERSION_DIR_SUFFIX.len];
+            const key = try displayKey(allocator, effective_key);
+            if (filter_prefix.len > 0 and !std.mem.startsWith(u8, key, filter_prefix)) continue;
+            const vdir = try std.fs.path.join(allocator, &.{ root, sub_rel });
+            var versions = try listStoredVersions(allocator, vdir);
+            defer versions.deinit(allocator);
+            for (versions.items) |v| {
+                try out.append(allocator, .{
+                    .key = key,
+                    .vid = v.vid,
+                    .is_marker = v.is_marker,
+                    .is_current = false,
+                    .mtime = v.mtime,
+                    .size = v.size,
+                    .path = if (v.is_marker) null else try versionFilePath(allocator, vdir, v.vid, ""),
+                });
+            }
+        } else {
+            try collectStoredVersions(ctx, allocator, bucket, sub_rel, filter_prefix, out);
+        }
+    }
+}
+
+/// ETag and logical size for a stored file (decrypting metadata for SSE).
+fn fileEtagAndSize(allocator: Allocator, path: []const u8, key: []const u8, raw_size: u64) struct { etag: []const u8, size: u64 } {
+    if (loadStandaloneAttrs(allocator, path, key)) |attrs| {
+        if (attrs.sse != null) {
+            // Size on disk, not the caller's (possibly already logical) size.
+            const st = std.Io.Dir.cwd().statFile(app_io, path, .{}) catch return .{ .etag = attrs.etag orelse "\"\"", .size = 0 };
+            return .{ .etag = attrs.etag orelse "\"\"", .size = ssePlaintextSize(st.size) };
+        }
+    } else |_| {}
+    var file = std.Io.Dir.cwd().openFile(app_io, path, .{}) catch return .{ .etag = "\"\"", .size = raw_size };
+    defer file.close(app_io);
+    const content = readToEndAlloc(file, allocator, MAX_BODY_SIZE) catch return .{ .etag = "\"\"", .size = raw_size };
+    defer allocator.free(content);
+    return .{ .etag = md5Etag(allocator, content) catch "\"\"", .size = raw_size };
+}
+
+/// GET /{bucket}?versions
+fn handleListObjectVersions(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8) !void {
+    const prefix = try uriDecode(allocator, getQueryParam(req.query, "prefix") orelse "");
+    const max_keys = std.fmt.parseInt(usize, getQueryParam(req.query, "max-keys") orelse "1000", 10) catch 1000;
+    const delimiter_decoded = if (getQueryParam(req.query, "delimiter")) |d| try uriDecode(allocator, d) else null;
+    const delimiter: ?[]const u8 = if (delimiter_decoded) |d| (if (d.len > 0) d else null) else null;
+    const key_marker = if (getQueryParam(req.query, "key-marker")) |k| try uriDecode(allocator, k) else "";
+    const vid_marker = if (getQueryParam(req.query, "version-id-marker")) |v| try uriDecode(allocator, v) else "";
+
+    const bucket_path = try ctx.bucketPath(allocator, bucket);
+    defer allocator.free(bucket_path);
+    if (!bucketExists(ctx, allocator, bucket)) {
+        sendError(res, 404, "NoSuchBucket", "Bucket not found");
+        return;
+    }
+
+    var entries: std.ArrayListUnmanaged(ListedVersion) = .empty;
+    defer entries.deinit(allocator);
+
+    // Current objects.
+    var keys: std.ArrayListUnmanaged(KeyInfo) = .empty;
+    defer keys.deinit(allocator);
+    try collectKeys(allocator, bucket_path, "", prefix, &keys, bucketSseUsed(ctx, allocator, bucket));
+    for (keys.items) |k| {
+        const effective_key = if (k.key.len > 0 and k.key[k.key.len - 1] == '/')
+            try std.fmt.allocPrint(allocator, "{s}.folder_marker", .{k.key})
+        else
+            k.key;
+        const path = try ctx.objectPath(allocator, bucket, effective_key);
+        try entries.append(allocator, .{
+            .key = k.key,
+            .vid = currentVersionId(allocator, path, effective_key),
+            .is_marker = false,
+            .is_current = true,
+            .mtime = k.mtime,
+            .size = k.size,
+            .path = path,
+        });
+    }
+    // Stored versions and delete markers.
+    try collectStoredVersions(ctx, allocator, bucket, "", prefix, &entries);
+
+    std.mem.sort(ListedVersion, entries.items, {}, listedVersionLess);
+
+    var xml: std.ArrayListUnmanaged(u8) = .empty;
+    defer xml.deinit(allocator);
+    try xml.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    try xml.appendSlice(allocator, "<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>");
+    try xmlEscape(allocator, &xml, bucket);
+    try xml.appendSlice(allocator, "</Name><Prefix>");
+    try xmlEscape(allocator, &xml, prefix);
+    try xml.appendSlice(allocator, "</Prefix><KeyMarker>");
+    try xmlEscape(allocator, &xml, key_marker);
+    try xml.appendSlice(allocator, "</KeyMarker><VersionIdMarker>");
+    try xmlEscape(allocator, &xml, vid_marker);
+    try xml.appendSlice(allocator, "</VersionIdMarker><MaxKeys>");
+    var mk_buf: [32]u8 = undefined;
+    try xml.appendSlice(allocator, std.fmt.bufPrint(&mk_buf, "{d}", .{max_keys}) catch "1000");
+    try xml.appendSlice(allocator, "</MaxKeys>");
+    if (delimiter) |d| {
+        try xml.appendSlice(allocator, "<Delimiter>");
+        try xmlEscape(allocator, &xml, d);
+        try xml.appendSlice(allocator, "</Delimiter>");
+    }
+
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(allocator);
+    var common_prefixes = std.StringHashMap(void).init(allocator);
+    defer common_prefixes.deinit();
+
+    var count: usize = 0;
+    var truncated = false;
+    var next_key: []const u8 = "";
+    var next_vid: []const u8 = "";
+    var prev_key: []const u8 = "";
+    var passed_vid_marker = false;
+    for (entries.items) |e| {
+        // Pagination: resume strictly after (key-marker, version-id-marker).
+        if (key_marker.len > 0) {
+            const ko = std.mem.order(u8, e.key, key_marker);
+            if (ko == .lt) continue;
+            if (ko == .eq) {
+                if (vid_marker.len == 0) continue;
+                if (!passed_vid_marker) {
+                    if (std.mem.eql(u8, e.vid, vid_marker)) passed_vid_marker = true;
+                    continue;
+                }
+            }
+        }
+        if (count >= max_keys) {
+            truncated = true;
+            break;
+        }
+        if (delimiter) |delim| {
+            const after_prefix = if (prefix.len > 0 and std.mem.startsWith(u8, e.key, prefix)) e.key[prefix.len..] else e.key;
+            if (std.mem.indexOf(u8, after_prefix, delim)) |idx| {
+                const cp = e.key[0 .. prefix.len + idx + delim.len];
+                if (!common_prefixes.contains(cp)) {
+                    try common_prefixes.put(cp, {});
+                    try body.appendSlice(allocator, "<CommonPrefixes><Prefix>");
+                    try xmlEscape(allocator, &body, cp);
+                    try body.appendSlice(allocator, "</Prefix></CommonPrefixes>");
+                    count += 1;
+                    next_key = e.key;
+                    next_vid = e.vid;
+                }
+                continue;
+            }
+        }
+        const is_latest = !std.mem.eql(u8, e.key, prev_key);
+        prev_key = e.key;
+        var iso: [20]u8 = undefined;
+        formatIso8601(&iso, e.mtime);
+        if (e.is_marker) {
+            try body.appendSlice(allocator, "<DeleteMarker><Key>");
+            try xmlEscape(allocator, &body, e.key);
+            try body.appendSlice(allocator, "</Key><VersionId>");
+            try body.appendSlice(allocator, e.vid);
+            try body.appendSlice(allocator, if (is_latest) "</VersionId><IsLatest>true</IsLatest><LastModified>" else "</VersionId><IsLatest>false</IsLatest><LastModified>");
+            try body.appendSlice(allocator, &iso);
+            try body.appendSlice(allocator, "</LastModified><Owner><ID>" ++ OWNER_ID ++ "</ID><DisplayName>" ++ OWNER_ID ++ "</DisplayName></Owner></DeleteMarker>");
+        } else {
+            const es = fileEtagAndSize(allocator, e.path.?, e.key, e.size);
+            try body.appendSlice(allocator, "<Version><Key>");
+            try xmlEscape(allocator, &body, e.key);
+            try body.appendSlice(allocator, "</Key><VersionId>");
+            try body.appendSlice(allocator, e.vid);
+            try body.appendSlice(allocator, if (is_latest) "</VersionId><IsLatest>true</IsLatest><LastModified>" else "</VersionId><IsLatest>false</IsLatest><LastModified>");
+            try body.appendSlice(allocator, &iso);
+            try body.appendSlice(allocator, "</LastModified><ETag>");
+            try xmlEscape(allocator, &body, es.etag);
+            try body.appendSlice(allocator, "</ETag><Size>");
+            var size_buf: [32]u8 = undefined;
+            try body.appendSlice(allocator, std.fmt.bufPrint(&size_buf, "{d}", .{es.size}) catch "0");
+            try body.appendSlice(allocator, "</Size><Owner><ID>" ++ OWNER_ID ++ "</ID><DisplayName>" ++ OWNER_ID ++ "</DisplayName></Owner><StorageClass>STANDARD</StorageClass></Version>");
+        }
+        count += 1;
+        next_key = e.key;
+        next_vid = e.vid;
+    }
+
+    if (truncated) {
+        try xml.appendSlice(allocator, "<IsTruncated>true</IsTruncated><NextKeyMarker>");
+        try xmlEscape(allocator, &xml, next_key);
+        try xml.appendSlice(allocator, "</NextKeyMarker><NextVersionIdMarker>");
+        try xmlEscape(allocator, &xml, next_vid);
+        try xml.appendSlice(allocator, "</NextVersionIdMarker>");
+    } else {
+        try xml.appendSlice(allocator, "<IsTruncated>false</IsTruncated>");
+    }
+    try xml.appendSlice(allocator, body.items);
+    try xml.appendSlice(allocator, "</ListVersionsResult>");
+    res.ok();
+    res.setXmlBody(try xml.toOwnedSlice(allocator));
+}
+
+/// Plaintext size of an SSE file given its on-disk size (defined with the
+/// encryption format below).
+fn ssePlaintextSize(raw_size: u64) u64 {
+    return sseLogicalSize(raw_size);
+}
+
+// ---------------------------------------------------------------------------
+// Version helpers used by GET / HEAD
+// ---------------------------------------------------------------------------
+
+/// Map ?versionId= to the file to serve. Sends the error response and returns
+/// null when the version is missing or is a delete marker.
+fn resolveRequestedVersion(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, effective_key: []const u8, current_path: []const u8) !?[]const u8 {
+    const vid_raw = getQueryParam(req.query, "versionId") orelse return current_path;
+    const vid = try uriDecode(allocator, vid_raw);
+    if (ctx.distributed != null) {
+        if (std.mem.eql(u8, vid, NULL_VERSION)) return current_path;
+        sendError(res, 404, "NoSuchVersion", "The specified version does not exist");
+        return null;
+    }
+    switch (try resolveVersion(ctx, allocator, bucket, effective_key, current_path, vid)) {
+        .path => |p| {
+            res.setHeader("x-amz-version-id", vid);
+            return p;
+        },
+        .delete_marker => {
+            res.setHeader("x-amz-delete-marker", "true");
+            res.setHeader("x-amz-version-id", vid);
+            sendError(res, 405, "MethodNotAllowed", "The specified version is a delete marker");
+            return null;
+        },
+        .not_found => {
+            sendError(res, 404, "NoSuchVersion", "The specified version does not exist");
+            return null;
+        },
+    }
+}
+
+/// 404 for a missing current object, flagging a delete marker when one hides
+/// the key.
+fn sendMissingObject(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, effective_key: []const u8) void {
+    if (ctx.distributed == null) {
+        if (latestDeleteMarker(ctx, allocator, bucket, effective_key)) |vid| {
+            res.setHeader("x-amz-delete-marker", "true");
+            res.setHeader("x-amz-version-id", vid);
+        }
+    }
+    sendError(res, 404, "NoSuchKey", "Object not found");
+}
+
+/// On a versioned bucket every object has a version id; those written before
+/// versioning report "null" (applySystemAttrHeaders covers the rest).
+fn addNullVersionHeader(ctx: *const S3Context, allocator: Allocator, res: *Response, bucket: []const u8, attrs: *const ObjectAttrs) void {
+    if (attrs.version_id != null) return;
+    for (res.headers.items) |h| {
+        if (std.mem.eql(u8, h.name, "x-amz-version-id")) return;
+    }
+    if (bucketVersioning(ctx, allocator, bucket) != .disabled) res.setHeader("x-amz-version-id", NULL_VERSION);
+}
+
+// ============================================================================
+// SERVER-SIDE ENCRYPTION (SSE-S3 and SSE-C)
+// ============================================================================
+// Encrypted objects are stored as a small header followed by 64KB AES-256-GCM
+// chunks (each with its own 16-byte tag), so ranges decrypt without reading
+// the whole file and a flipped byte anywhere fails authentication:
+//
+//   "ZS3E" | version=1 | mode (1=SSE-S3, 2=SSE-C) | 2 reserved |
+//   chunk size (u32 LE) | 32-byte salt | 8-byte nonce base
+//   chunk i: AES-256-GCM(plain[i]) || tag, nonce = base || i (u32 LE), AAD = header
+//
+// Per-object keys are HKDF-SHA256(master or customer key, salt). SSE-S3 uses
+// a server master key from --sse-key-file / ZS3_SSE_KEY, or one generated
+// into <data-dir>/.zs3/sse.key on first use. SSE-C keys are never stored;
+// only their MD5 is kept so the right key can be recognised.
+//
+// The ETag stays the MD5 of the plaintext and is stored in the sidecar.
+
+const SSE_MAGIC = "ZS3E";
+const SSE_VERSION: u8 = 1;
+pub const SSE_HEADER_LEN: usize = 52;
+pub const SSE_CHUNK: usize = 64 * 1024;
+const SSE_TAG: usize = 16;
+const SSE_HKDF_INFO = "zs3-sse-v1";
+
+const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
+const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
+
+pub const SseMode = union(enum) {
+    s3,
+    customer: struct { key: [32]u8, key_md5_b64: []const u8 },
+
+    fn modeByte(self: SseMode) u8 {
+        return switch (self) {
+            .s3 => 1,
+            .customer => 2,
+        };
+    }
+};
+
+var sse_master_key: ?[32]u8 = null;
+var sse_key_file_opt: []const u8 = "";
+
+/// Plaintext length encoded by an SSE file of `raw` bytes.
+pub fn sseLogicalSize(raw: u64) u64 {
+    if (raw < SSE_HEADER_LEN) return 0;
+    const c = raw - SSE_HEADER_LEN;
+    const per = @as(u64, SSE_CHUNK + SSE_TAG);
+    const n = (c + per - 1) / per;
+    if (c < n * SSE_TAG) return 0;
+    return c - n * SSE_TAG;
+}
+
+fn hexDecode32(text: []const u8) ?[32]u8 {
+    const t = std.mem.trim(u8, text, " \t\r\n");
+    if (t.len != 64) return null;
+    var out: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, t) catch return null;
+    return out;
+}
+
+/// Load (or create) the SSE-S3 master key.
+fn sseMasterKey(ctx: *const S3Context) ![32]u8 {
+    if (sse_master_key) |k| return k;
+    if (getenvStr("ZS3_SSE_KEY")) |hex| {
+        sse_master_key = hexDecode32(hex) orelse {
+            std.log.err("ZS3_SSE_KEY must be 64 hex characters (32 bytes)", .{});
+            return error.BadSseKey;
+        };
+        return sse_master_key.?;
+    }
+    var path_buf: [std.posix.PATH_MAX]u8 = undefined;
+    const path = if (sse_key_file_opt.len > 0)
+        sse_key_file_opt
+    else
+        try std.fmt.bufPrint(&path_buf, "{s}/.zs3/sse.key", .{ctx.data_dir});
+    if (std.Io.Dir.cwd().openFile(app_io, path, .{})) |file| {
+        defer file.close(app_io);
+        var buf: [256]u8 = undefined;
+        const n = file.readPositionalAll(app_io, &buf, 0) catch 0;
+        sse_master_key = hexDecode32(buf[0..n]) orelse {
+            std.log.err("SSE key file {s} must contain 64 hex characters", .{path});
+            return error.BadSseKey;
+        };
+        return sse_master_key.?;
+    } else |_| {}
+    if (sse_key_file_opt.len > 0) {
+        std.log.err("SSE key file {s} not found", .{path});
+        return error.BadSseKey;
+    }
+    // Generate one. Losing this file makes every SSE-S3 object unreadable.
+    var key: [32]u8 = undefined;
+    try app_io.randomSecure(&key);
+    var hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&hex, "{x}", .{key}) catch unreachable;
+    if (std.fs.path.dirname(path)) |d| std.Io.Dir.cwd().createDirPath(app_io, d) catch {};
+    var af = try std.Io.Dir.cwd().createFileAtomic(app_io, path, .{ .make_path = true, .replace = true, .permissions = .fromMode(0o600) });
+    defer af.deinit(app_io);
+    try af.file.writeStreamingAll(app_io, &hex);
+    fsyncFile(af.file);
+    try af.replace(app_io);
+    std.log.warn("generated SSE-S3 master key at {s}; back it up, encrypted objects cannot be read without it", .{path});
+    sse_master_key = key;
+    return key;
+}
+
+fn sseDeriveKey(ikm: *const [32]u8, salt: *const [32]u8) [32]u8 {
+    const prk = HkdfSha256.extract(salt, ikm);
+    var out: [32]u8 = undefined;
+    HkdfSha256.expand(&out, SSE_HKDF_INFO, prk);
+    return out;
+}
+
+fn sseNonce(base: *const [8]u8, index: u32) [12]u8 {
+    var n: [12]u8 = undefined;
+    @memcpy(n[0..8], base);
+    std.mem.writeInt(u32, n[8..12], index, .little);
+    return n;
+}
+
+/// Incremental encryptor: feed plaintext, drain ciphertext from `out`.
+const SseEncryptor = struct {
+    key: [32]u8,
+    header: [SSE_HEADER_LEN]u8,
+    base: [8]u8,
+    index: u32 = 0,
+    pending: std.ArrayListUnmanaged(u8) = .empty,
+    out: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn init(allocator: Allocator, ikm: *const [32]u8, mode: SseMode) !SseEncryptor {
+        var salt: [32]u8 = undefined;
+        try app_io.randomSecure(&salt);
+        var base: [8]u8 = undefined;
+        try app_io.randomSecure(&base);
+        var header: [SSE_HEADER_LEN]u8 = undefined;
+        @memcpy(header[0..4], SSE_MAGIC);
+        header[4] = SSE_VERSION;
+        header[5] = mode.modeByte();
+        header[6] = 0;
+        header[7] = 0;
+        std.mem.writeInt(u32, header[8..12], @intCast(SSE_CHUNK), .little);
+        @memcpy(header[12..44], &salt);
+        @memcpy(header[44..52], &base);
+        var e = SseEncryptor{ .key = sseDeriveKey(ikm, &salt), .header = header, .base = base };
+        try e.out.appendSlice(allocator, &header);
+        return e;
+    }
+
+    fn deinit(self: *SseEncryptor, allocator: Allocator) void {
+        self.pending.deinit(allocator);
+        self.out.deinit(allocator);
+        std.crypto.secureZero(u8, &self.key);
+    }
+
+    fn emitChunk(self: *SseEncryptor, allocator: Allocator, plain: []const u8) !void {
+        const start = self.out.items.len;
+        try self.out.resize(allocator, start + plain.len + SSE_TAG);
+        const c = self.out.items[start .. start + plain.len];
+        const tag = self.out.items[start + plain.len ..][0..SSE_TAG];
+        Aes256Gcm.encrypt(c, tag, plain, &self.header, sseNonce(&self.base, self.index), self.key);
+        self.index += 1;
+    }
+
+    fn update(self: *SseEncryptor, allocator: Allocator, data: []const u8) !void {
+        var rest = data;
+        if (self.pending.items.len > 0) {
+            const need = SSE_CHUNK - self.pending.items.len;
+            const take = @min(need, rest.len);
+            try self.pending.appendSlice(allocator, rest[0..take]);
+            rest = rest[take..];
+            if (self.pending.items.len == SSE_CHUNK) {
+                try self.emitChunk(allocator, self.pending.items);
+                self.pending.clearRetainingCapacity();
+            }
+        }
+        while (rest.len >= SSE_CHUNK) {
+            try self.emitChunk(allocator, rest[0..SSE_CHUNK]);
+            rest = rest[SSE_CHUNK..];
+        }
+        if (rest.len > 0) try self.pending.appendSlice(allocator, rest);
+    }
+
+    fn finish(self: *SseEncryptor, allocator: Allocator) !void {
+        if (self.pending.items.len > 0) {
+            try self.emitChunk(allocator, self.pending.items);
+            self.pending.clearRetainingCapacity();
+        }
+    }
+};
+
+fn sseIkm(ctx: *const S3Context, mode: SseMode) ![32]u8 {
+    return switch (mode) {
+        .s3 => try sseMasterKey(ctx),
+        .customer => |c| c.key,
+    };
+}
+
+pub fn sseEncryptWith(allocator: Allocator, ikm: *const [32]u8, plaintext: []const u8, mode: SseMode) ![]u8 {
+    var enc = try SseEncryptor.init(allocator, ikm, mode);
+    defer enc.deinit(allocator);
+    try enc.update(allocator, plaintext);
+    try enc.finish(allocator);
+    return allocator.dupe(u8, enc.out.items);
+}
+
+/// Encrypt a whole object for storage (PUT / CopyObject).
+fn sseEncrypt(allocator: Allocator, plaintext: []const u8, mode: SseMode) ![]u8 {
+    const ikm = try sseIkm(sse_ctx.?, mode);
+    return sseEncryptWith(allocator, &ikm, plaintext, mode);
+}
+
+/// Decrypt a stored SSE file with the given key material.
+pub fn sseDecrypt(allocator: Allocator, data: []const u8, ikm: *const [32]u8) ![]u8 {
+    if (data.len < SSE_HEADER_LEN or !std.mem.eql(u8, data[0..4], SSE_MAGIC) or data[4] != SSE_VERSION) return error.BadCiphertext;
+    const header = data[0..SSE_HEADER_LEN];
+    const chunk_size: usize = std.mem.readInt(u32, header[8..12], .little);
+    if (chunk_size == 0 or chunk_size > 16 * 1024 * 1024) return error.BadCiphertext;
+    const salt = header[12..44];
+    const base = header[44..52];
+    var key = sseDeriveKey(ikm, salt);
+    defer std.crypto.secureZero(u8, &key);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var rest = data[SSE_HEADER_LEN..];
+    var index: u32 = 0;
+    while (rest.len > 0) : (index += 1) {
+        if (rest.len < SSE_TAG) return error.BadCiphertext;
+        const clen = @min(rest.len - SSE_TAG, chunk_size);
+        const c = rest[0..clen];
+        const tag = rest[clen..][0..SSE_TAG].*;
+        const start = out.items.len;
+        try out.resize(allocator, start + clen);
+        Aes256Gcm.decrypt(out.items[start..], c, tag, header, sseNonce(base, index), key) catch return error.AuthenticationFailed;
+        rest = rest[clen + SSE_TAG ..];
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Handlers run with a single S3Context; keep a pointer for key lookup from
+/// helpers that do not receive it.
+var sse_ctx: ?*const S3Context = null;
+
+fn sseErrorResponse(res: *Response, err: anyerror) void {
+    switch (err) {
+        error.SseKeyRequired => sendError(res, 400, "InvalidRequest", "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object."),
+        error.SseKeyMismatch, error.AuthenticationFailed => sendError(res, 403, "AccessDenied", "The provided encryption key does not match the key used to encrypt the object"),
+        error.SseKeyNotExpected => sendError(res, 400, "InvalidRequest", "The encryption parameters are not applicable to this object"),
+        error.BadSseKey => sendError(res, 500, "InternalError", "Server-side encryption key unavailable"),
+        error.BadCiphertext => sendError(res, 500, "InternalError", "Stored object is not valid ciphertext"),
+        else => sendError(res, 500, "InternalError", "Decryption failed"),
+    }
+}
+
+fn md5Base64(allocator: Allocator, data: []const u8) ![]const u8 {
+    var digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(data, &digest, .{});
+    const out = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(16));
+    _ = std.base64.standard.Encoder.encode(out, &digest);
+    return out;
+}
+
+/// Parse SSE-C headers (`x-amz-[copy-source-]server-side-encryption-customer-*`).
+/// Returns null when none are present; validates algorithm and key MD5.
+fn sseCustomerKeyFromHeaders(allocator: Allocator, req: *const Request, copy_source: bool) !?SseMode {
+    const pfx = if (copy_source) "x-amz-copy-source-server-side-encryption-customer-" else "x-amz-server-side-encryption-customer-";
+    var name_buf: [96]u8 = undefined;
+    const alg_name = try std.fmt.bufPrint(&name_buf, "{s}algorithm", .{pfx});
+    const alg = req.header(alg_name) orelse return null;
+    if (!std.ascii.eqlIgnoreCase(alg, "AES256")) return error.SseBadAlgorithm;
+    var key_name_buf: [96]u8 = undefined;
+    const key_name = try std.fmt.bufPrint(&key_name_buf, "{s}key", .{pfx});
+    const key_b64 = req.header(key_name) orelse return error.SseBadKey;
+    var key: [32]u8 = undefined;
+    const dec_len = std.base64.standard.Decoder.calcSizeForSlice(key_b64) catch return error.SseBadKey;
+    if (dec_len != 32) return error.SseBadKey;
+    std.base64.standard.Decoder.decode(&key, key_b64) catch return error.SseBadKey;
+    const computed = try md5Base64(allocator, &key);
+    var md5_name_buf: [96]u8 = undefined;
+    const md5_name = try std.fmt.bufPrint(&md5_name_buf, "{s}key-md5", .{pfx});
+    if (req.header(md5_name)) |given| {
+        if (!std.mem.eql(u8, std.mem.trim(u8, given, " "), computed)) return error.SseBadKeyMd5;
+    }
+    return .{ .customer = .{ .key = key, .key_md5_b64 = computed } };
+}
+
+fn sendSseHeaderError(res: *Response, err: anyerror) void {
+    switch (err) {
+        error.SseBadAlgorithm => sendError(res, 400, "InvalidArgument", "The encryption algorithm specified is not valid; only AES256 is supported"),
+        error.SseBadKey => sendError(res, 400, "InvalidArgument", "The secret key was invalid for the specified algorithm (expected 256 bits, base64)"),
+        error.SseBadKeyMd5 => sendError(res, 400, "InvalidDigest", "The calculated MD5 hash of the key did not match the hash that was provided"),
+        error.SseKmsUnsupported => sendError(res, 501, "NotImplemented", "aws:kms encryption is not supported; use AES256"),
+        else => sendError(res, 400, "InvalidArgument", "Invalid server-side encryption request"),
+    }
+}
+
+/// Decide how a new object is stored: SSE-C headers, then
+/// x-amz-server-side-encryption, then the bucket's default encryption.
+/// Sends the error response and returns error.Handled on bad input.
+fn resolveSseForWrite(ctx: *const S3Context, allocator: Allocator, req: *const Request, res: *Response, bucket: []const u8) !?SseMode {
+    if (sseCustomerKeyFromHeaders(allocator, req, false)) |maybe| {
+        if (maybe) |m| return m;
+    } else |err| {
+        sendSseHeaderError(res, err);
+        return error.Handled;
+    }
+    if (req.header("x-amz-server-side-encryption")) |alg| {
+        if (std.ascii.eqlIgnoreCase(alg, "AES256")) return .s3;
+        if (std.ascii.eqlIgnoreCase(alg, "aws:kms") or std.ascii.eqlIgnoreCase(alg, "aws:kms:dsse")) {
+            sendSseHeaderError(res, error.SseKmsUnsupported);
+            return error.Handled;
+        }
+        sendSseHeaderError(res, error.SseBadAlgorithm);
+        return error.Handled;
+    }
+    if (ctx.distributed != null) return null;
+    if (bucketDefaultEncryption(ctx, allocator, bucket)) return .s3;
+    return null;
+}
+
+/// Whether any object in the bucket was ever stored encrypted. LIST only
+/// pays for sidecar reads in such buckets.
+fn bucketSseUsed(ctx: *const S3Context, allocator: Allocator, bucket: []const u8) bool {
+    const path = bucketConfigPath(ctx, allocator, bucket, "sse-used") catch return false;
+    defer allocator.free(path);
+    std.Io.Dir.cwd().access(app_io, path, .{}) catch return false;
+    return true;
+}
+
+fn noteBucketSseUsed(ctx: *const S3Context, allocator: Allocator, bucket: []const u8) void {
+    if (bucketSseUsed(ctx, allocator, bucket)) return;
+    writeBucketConfig(ctx, allocator, bucket, "sse-used", "1") catch {};
+}
+
+/// Whether the bucket's default encryption configuration asks for SSE-S3.
+fn bucketDefaultEncryption(ctx: *const S3Context, allocator: Allocator, bucket: []const u8) bool {
+    const stored = readBucketConfig(ctx, allocator, bucket, "encryption.xml") orelse return false;
+    defer allocator.free(stored);
+    const alg = xmlTagText(stored, "SSEAlgorithm") orelse return false;
+    return std.mem.eql(u8, alg, "AES256");
+}
+
+fn applySseToAttrs(allocator: Allocator, attrs: *ObjectAttrs, mode: SseMode, plaintext: []const u8) !void {
+    if (attrs.sse) |v| allocator.free(v);
+    if (attrs.sse_key_md5) |v| allocator.free(v);
+    if (attrs.etag) |v| allocator.free(v);
+    attrs.sse_key_md5 = null;
+    switch (mode) {
+        .s3 => attrs.sse = try allocator.dupe(u8, "AES256"),
+        .customer => |c| {
+            attrs.sse = try allocator.dupe(u8, "SSE-C");
+            attrs.sse_key_md5 = try allocator.dupe(u8, c.key_md5_b64);
+        },
+    }
+    attrs.etag = try md5Etag(allocator, plaintext);
+}
+
+/// Echo SSE state on write responses (PUT / CopyObject / CompleteMultipart).
+fn applySseResponseHeaders(res: *Response, attrs: *const ObjectAttrs, allocator: Allocator) void {
+    const mode = attrs.sse orelse return;
+    if (std.mem.eql(u8, mode, "SSE-C")) {
+        res.setHeader("x-amz-server-side-encryption-customer-algorithm", "AES256");
+        if (attrs.sse_key_md5) |m| res.setHeader("x-amz-server-side-encryption-customer-key-MD5", allocator.dupe(u8, m) catch return);
+    } else {
+        res.setHeader("x-amz-server-side-encryption", "AES256");
+    }
+}
+
+/// Read an object's plaintext from `path`, decrypting SSE objects. For SSE-C
+/// the key must come from the request (copy-source headers when
+/// `copy_source`).
+fn readObjectPlaintext(allocator: Allocator, req: *const Request, path: []const u8, key: []const u8, copy_source: bool) ![]u8 {
+    var file = try std.Io.Dir.cwd().openFile(app_io, path, .{});
+    defer file.close(app_io);
+    const raw = try readToEndAlloc(file, allocator, MAX_BODY_SIZE);
+    const attrs = loadStandaloneAttrs(allocator, path, key) catch return raw;
+    defer attrs.deinit(allocator);
+    const mode = attrs.sse orelse return raw;
+    defer allocator.free(raw);
+    if (std.mem.eql(u8, mode, "SSE-C")) {
+        const provided = sseCustomerKeyFromHeaders(allocator, req, copy_source) catch return error.SseKeyMismatch;
+        const m = provided orelse return error.SseKeyRequired;
+        if (attrs.sse_key_md5) |expected| {
+            if (!std.mem.eql(u8, expected, m.customer.key_md5_b64)) return error.SseKeyMismatch;
+        }
+        return sseDecrypt(allocator, raw, &m.customer.key);
+    }
+    const master = try sseMasterKey(sse_ctx.?);
+    return sseDecrypt(allocator, raw, &master);
+}
+
+fn sendCopySourceReadError(res: *Response, err: anyerror) void {
+    switch (err) {
+        error.FileNotFound => sendError(res, 404, "NoSuchKey", "Copy source not found"),
+        else => sseErrorResponse(res, err),
+    }
+}
+
+/// GET/HEAD path for encrypted objects: decrypt in memory and serve (ranges
+/// and conditional headers included). Returns false for plain objects.
+fn serveEncryptedIfNeeded(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8, effective_key: []const u8, path: []const u8, head_only: bool) !bool {
+    if (ctx.distributed != null) return false;
+    const attrs = loadStandaloneAttrs(allocator, path, effective_key) catch return false;
+    if (attrs.sse == null) {
+        // A key was offered for a plain object: S3 rejects that.
+        if (req.header("x-amz-server-side-encryption-customer-algorithm") != null) {
+            sseErrorResponse(res, error.SseKeyNotExpected);
+            return true;
+        }
+        return false;
+    }
+    const stat = std.Io.Dir.cwd().statFile(app_io, path, .{}) catch {
+        sendMissingObject(ctx, allocator, res, bucket, effective_key);
+        return true;
+    };
+    const content = readObjectPlaintext(allocator, req, path, effective_key, false) catch |err| {
+        sseErrorResponse(res, err);
+        return true;
+    };
+    const etag = attrs.etag orelse try md5Etag(allocator, content);
+    if (req.header("if-match")) |im| {
+        if (!etagListMatches(im, etag)) {
+            sendError(res, 412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
+            return true;
+        }
+    }
+    if (req.header("if-none-match")) |inm| {
+        if (etagListMatches(inm, etag)) {
+            res.status = 304;
+            res.status_text = "Not Modified";
+            return true;
+        }
+    }
+    const mtime: i64 = @intCast(stat.mtime.toSeconds());
+    if (head_only) {
+        const last_modified = try allocHttpDate(allocator, mtime);
+        res.ok();
+        res.setHeader("Content-Length", try std.fmt.allocPrint(allocator, "{d}", .{content.len}));
+        res.setHeader("Accept-Ranges", "bytes");
+        res.setHeader("ETag", etag);
+        res.setHeader("Last-Modified", last_modified);
+        applyAttrsToResponse(res, &attrs);
+        addNullVersionHeader(ctx, allocator, res, bucket, &attrs);
+        return true;
+    }
+    serveContent(allocator, req, res, content, etag, mtime, &attrs);
+    addNullVersionHeader(ctx, allocator, res, bucket, &attrs);
+    return true;
+}
+
+/// GET/PUT/DELETE /{bucket}?encryption (bucket default encryption).
+fn handleBucketEncryption(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8) !void {
+    if (!bucketExists(ctx, allocator, bucket)) {
+        sendError(res, 404, "NoSuchBucket", "Bucket not found");
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "GET")) {
+        const stored = readBucketConfig(ctx, allocator, bucket, "encryption.xml") orelse {
+            sendError(res, 404, "ServerSideEncryptionConfigurationNotFoundError", "The server side encryption configuration was not found");
+            return;
+        };
+        res.ok();
+        res.setXmlBody(stored);
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "PUT")) {
+        if (ctx.distributed != null) {
+            sendError(res, 501, "NotImplemented", "Encryption is not available in distributed mode");
+            return;
+        }
+        const alg = xmlTagText(req.body, "SSEAlgorithm") orelse {
+            sendError(res, 400, "MalformedXML", "ServerSideEncryptionConfiguration requires a Rule with SSEAlgorithm");
+            return;
+        };
+        if (std.mem.eql(u8, alg, "aws:kms") or std.mem.eql(u8, alg, "aws:kms:dsse")) {
+            sendSseHeaderError(res, error.SseKmsUnsupported);
+            return;
+        }
+        if (!std.mem.eql(u8, alg, "AES256")) {
+            sendSseHeaderError(res, error.SseBadAlgorithm);
+            return;
+        }
+        // Make sure the master key exists now, not on the first PUT.
+        _ = sseMasterKey(ctx) catch {
+            sseErrorResponse(res, error.BadSseKey);
+            return;
+        };
+        try writeBucketConfig(ctx, allocator, bucket, "encryption.xml", req.body);
+        res.ok();
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "DELETE")) {
+        deleteBucketConfig(ctx, allocator, bucket, "encryption.xml");
+        res.noContent();
+        return;
+    }
+    sendError(res, 405, "MethodNotAllowed", "Method not allowed");
+}
+
+// --- Multipart uploads with SSE ---------------------------------------------
+// Parts are encrypted on upload (with the customer key for SSE-C, the master
+// key for SSE-S3) and re-encrypted as one object on completion, so no part
+// ever sits on disk in the clear. SSE-C uploads need the customer key on
+// UploadPart and on CompleteMultipartUpload.
+
+const UploadSse = union(enum) {
+    none,
+    s3,
+    customer_md5: []const u8,
+};
+
+fn uploadSseFromMeta(meta_content: []const u8) UploadSse {
+    var lines = std.mem.splitScalar(u8, meta_content, '\n');
+    _ = lines.next();
+    _ = lines.next();
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "sse=AES256")) return .s3;
+        if (std.mem.startsWith(u8, line, "sse=SSE-C:")) return .{ .customer_md5 = line["sse=SSE-C:".len..] };
+    }
+    return .none;
+}
+
+fn readUploadMeta(ctx: *const S3Context, allocator: Allocator, upload_id: []const u8) ?[]u8 {
+    const meta_path = std.fmt.allocPrint(allocator, "{s}/.uploads/{s}/.meta", .{ ctx.data_dir, upload_id }) catch return null;
+    defer allocator.free(meta_path);
+    var f = std.Io.Dir.cwd().openFile(app_io, meta_path, .{}) catch return null;
+    defer f.close(app_io);
+    return readToEndAlloc(f, allocator, 64 * 1024) catch null;
+}
+
+/// Key material for an encrypted upload's parts, from the upload's SSE mode
+/// and (for SSE-C) the request headers.
+fn uploadSseMode(allocator: Allocator, req: *const Request, res: *Response, usse: UploadSse) !?SseMode {
+    switch (usse) {
+        .none => return null,
+        .s3 => return .s3,
+        .customer_md5 => |expected| {
+            const provided = sseCustomerKeyFromHeaders(allocator, req, false) catch |err| {
+                sendSseHeaderError(res, err);
+                return error.Handled;
+            };
+            const m = provided orelse {
+                sseErrorResponse(res, error.SseKeyRequired);
+                return error.Handled;
+            };
+            if (!std.mem.eql(u8, expected, m.customer.key_md5_b64)) {
+                sseErrorResponse(res, error.SseKeyMismatch);
+                return error.Handled;
+            }
+            return m;
+        },
+    }
+}
+
+/// Write one part, encrypting it when the upload is encrypted. Returns the
+/// plaintext ETag.
+fn writeUploadPart(ctx: *const S3Context, allocator: Allocator, req: *const Request, res: *Response, upload_id: []const u8, part_path: []const u8, data: []const u8) ![]const u8 {
+    var stored: []const u8 = data;
+    if (readUploadMeta(ctx, allocator, upload_id)) |meta| {
+        const usse = uploadSseFromMeta(meta);
+        if (try uploadSseMode(allocator, req, res, usse)) |mode| {
+            const ikm = sseIkm(ctx, mode) catch {
+                sseErrorResponse(res, error.BadSseKey);
+                return error.Handled;
+            };
+            stored = sseEncryptWith(allocator, &ikm, data, mode) catch {
+                sendError(res, 500, "InternalError", "Encryption failed");
+                return error.Handled;
+            };
+        }
+    }
+    var file = std.Io.Dir.cwd().createFile(app_io, part_path, .{}) catch {
+        sendError(res, 500, "InternalError", "Cannot create part file");
+        return error.Handled;
+    };
+    defer file.close(app_io);
+    file.writeStreamingAll(app_io, stored) catch {
+        sendError(res, 500, "InternalError", "Cannot write part");
+        return error.Handled;
+    };
+    if (enable_fsync) {
+        fsyncFile(file);
+        fsyncParentDir(part_path);
+    }
+    return md5Etag(allocator, data);
+}
+
+// ============================================================================
+// LIFECYCLE
+// ============================================================================
+// Rules are stored verbatim as `<bucket>/.zs3bucket/lifecycle.xml` and
+// evaluated by a background thread every --lifecycle-interval-s seconds.
+// Supported: Expiration (Days / Date / ExpiredObjectDeleteMarker),
+// NoncurrentVersionExpiration (NoncurrentDays),
+// AbortIncompleteMultipartUpload (DaysAfterInitiation), with Filter by
+// Prefix, Tag, or And{Prefix, Tag...} (and the legacy top-level Prefix).
+// Transitions to other storage classes have no meaning here and are rejected.
+
+const LIFECYCLE_INTERVAL_S: u64 = 3600;
+var lifecycle_interval_s: u64 = LIFECYCLE_INTERVAL_S;
+
+const LifecycleRule = struct {
+    id: []const u8,
+    enabled: bool,
+    prefix: []const u8,
+    tags: []const Tag,
+    expiration_days: ?u32 = null,
+    expiration_date: ?i64 = null,
+    expired_delete_marker: bool = false,
+    noncurrent_days: ?u32 = null,
+    abort_mpu_days: ?u32 = null,
+};
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+fn civilToEpochDays(y_in: i64, m: u32, d: u32) i64 {
+    const y: i64 = if (m <= 2) y_in - 1 else y_in;
+    const era: i64 = @divFloor(y, 400);
+    const yoe: i64 = y - era * 400;
+    const mp: i64 = @intCast((m + 9) % 12);
+    const doy: i64 = @divFloor(153 * mp + 2, 5) + @as(i64, d) - 1;
+    const doe: i64 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// "YYYY-MM-DD" or "YYYY-MM-DDThh:mm:ss[.fff]Z" to Unix seconds.
+pub fn parseIso8601(text: []const u8) ?i64 {
+    const t = std.mem.trim(u8, text, " \t\r\n");
+    if (t.len < 10 or t[4] != '-' or t[7] != '-') return null;
+    const y = std.fmt.parseInt(i64, t[0..4], 10) catch return null;
+    const m = std.fmt.parseInt(u32, t[5..7], 10) catch return null;
+    const d = std.fmt.parseInt(u32, t[8..10], 10) catch return null;
+    if (m < 1 or m > 12 or d < 1 or d > 31) return null;
+    var secs: i64 = civilToEpochDays(y, m, d) * 86400;
+    if (t.len >= 19 and (t[10] == 'T' or t[10] == ' ')) {
+        const hh = std.fmt.parseInt(i64, t[11..13], 10) catch return null;
+        const mm = std.fmt.parseInt(i64, t[14..16], 10) catch return null;
+        const ss = std.fmt.parseInt(i64, t[17..19], 10) catch return null;
+        secs += hh * 3600 + mm * 60 + ss;
+    }
+    return secs;
+}
+
+fn parseLifecycleTags(allocator: Allocator, block: []const u8, list: *std.ArrayListUnmanaged(Tag)) !void {
+    var rest = block;
+    while (std.mem.indexOf(u8, rest, "<Tag>")) |start| {
+        const after = rest[start + 5 ..];
+        const end = std.mem.indexOf(u8, after, "</Tag>") orelse return error.MalformedXML;
+        const tb = after[0..end];
+        const k = xmlTagText(tb, "Key") orelse return error.MalformedXML;
+        const v = xmlTagText(tb, "Value") orelse "";
+        try list.append(allocator, .{ .key = try xmlUnescape(allocator, k), .value = try xmlUnescape(allocator, v) });
+        rest = after[end + 6 ..];
+    }
+}
+
+/// Text of the first <tag> that is a direct child (not nested inside <sub>).
+fn xmlTagTextOutside(block: []const u8, tag: []const u8, sub: []const u8) ?[]const u8 {
+    var open_buf: [64]u8 = undefined;
+    var sub_open_buf: [64]u8 = undefined;
+    var sub_close_buf: [64]u8 = undefined;
+    const open = std.fmt.bufPrint(&open_buf, "<{s}>", .{tag}) catch return null;
+    const sub_open = std.fmt.bufPrint(&sub_open_buf, "<{s}>", .{sub}) catch return null;
+    const sub_close = std.fmt.bufPrint(&sub_close_buf, "</{s}>", .{sub}) catch return null;
+    const pos = std.mem.indexOf(u8, block, open) orelse return null;
+    if (std.mem.indexOf(u8, block, sub_open)) |so| {
+        const sc = std.mem.indexOf(u8, block, sub_close) orelse block.len;
+        if (pos > so and pos < sc) {
+            // inside the sub-block: look after it
+            return xmlTagText(block[sc..], tag);
+        }
+    }
+    return xmlTagText(block, tag);
+}
+
+pub fn parseLifecycleXml(allocator: Allocator, body: []const u8) ![]LifecycleRule {
+    if (std.mem.indexOf(u8, body, "<LifecycleConfiguration") == null) return error.MalformedXML;
+    var rules: std.ArrayListUnmanaged(LifecycleRule) = .empty;
+    errdefer rules.deinit(allocator);
+    var rest = body;
+    while (std.mem.indexOf(u8, rest, "<Rule>")) |start| {
+        const after = rest[start + 6 ..];
+        const end = std.mem.indexOf(u8, after, "</Rule>") orelse return error.MalformedXML;
+        const rb = after[0..end];
+        rest = after[end + 7 ..];
+
+        const status = xmlTagText(rb, "Status") orelse return error.MalformedXML;
+        const enabled = if (std.mem.eql(u8, status, "Enabled")) true else if (std.mem.eql(u8, status, "Disabled")) false else return error.MalformedXML;
+        const id = try xmlUnescape(allocator, xmlTagText(rb, "ID") orelse "");
+        if (id.len > 255) return error.InvalidArgument;
+
+        var prefix: []const u8 = "";
+        var tags: std.ArrayListUnmanaged(Tag) = .empty;
+        if (std.mem.indexOf(u8, rb, "<Filter>")) |fs| {
+            const fe = std.mem.indexOf(u8, rb[fs..], "</Filter>") orelse return error.MalformedXML;
+            const fb = rb[fs + 8 .. fs + fe];
+            if (xmlTagText(fb, "Prefix")) |pf| prefix = try xmlUnescape(allocator, pf);
+            try parseLifecycleTags(allocator, fb, &tags);
+        } else if (std.mem.indexOf(u8, rb, "<Filter/>") != null) {
+            // empty filter: whole bucket
+        } else if (xmlTagText(rb, "Prefix")) |pf| {
+            prefix = try xmlUnescape(allocator, pf);
+        }
+
+        var rule = LifecycleRule{ .id = id, .enabled = enabled, .prefix = prefix, .tags = try tags.toOwnedSlice(allocator) };
+        var actions: usize = 0;
+        if (std.mem.indexOf(u8, rb, "<Expiration>")) |es| {
+            const ee = std.mem.indexOf(u8, rb[es..], "</Expiration>") orelse return error.MalformedXML;
+            const eb = rb[es + 12 .. es + ee];
+            if (xmlTagText(eb, "Days")) |d| {
+                rule.expiration_days = std.fmt.parseInt(u32, d, 10) catch return error.InvalidArgument;
+            }
+            if (xmlTagText(eb, "Date")) |d| {
+                rule.expiration_date = parseIso8601(d) orelse return error.InvalidArgument;
+            }
+            if (xmlTagText(eb, "ExpiredObjectDeleteMarker")) |v| rule.expired_delete_marker = std.mem.eql(u8, v, "true");
+            if (rule.expiration_days != null and rule.expiration_date != null) return error.InvalidArgument;
+            if (rule.expired_delete_marker and (rule.expiration_days != null or rule.expiration_date != null)) return error.InvalidArgument;
+            if (rule.expired_delete_marker and rule.tags.len > 0) return error.InvalidArgument;
+            actions += 1;
+        }
+        if (std.mem.indexOf(u8, rb, "<NoncurrentVersionExpiration>")) |ns| {
+            const ne = std.mem.indexOf(u8, rb[ns..], "</NoncurrentVersionExpiration>") orelse return error.MalformedXML;
+            const nb = rb[ns + 29 .. ns + ne];
+            const d = xmlTagText(nb, "NoncurrentDays") orelse return error.MalformedXML;
+            rule.noncurrent_days = std.fmt.parseInt(u32, d, 10) catch return error.InvalidArgument;
+            actions += 1;
+        }
+        if (std.mem.indexOf(u8, rb, "<AbortIncompleteMultipartUpload>")) |as_| {
+            const ae = std.mem.indexOf(u8, rb[as_..], "</AbortIncompleteMultipartUpload>") orelse return error.MalformedXML;
+            const ab = rb[as_ + 32 .. as_ + ae];
+            const d = xmlTagText(ab, "DaysAfterInitiation") orelse return error.MalformedXML;
+            rule.abort_mpu_days = std.fmt.parseInt(u32, d, 10) catch return error.InvalidArgument;
+            if (rule.tags.len > 0) return error.InvalidArgument;
+            actions += 1;
+        }
+        if (std.mem.indexOf(u8, rb, "<Transition>") != null or std.mem.indexOf(u8, rb, "<NoncurrentVersionTransition>") != null) {
+            return error.TransitionUnsupported;
+        }
+        if (actions == 0) return error.InvalidArgument;
+        try rules.append(allocator, rule);
+    }
+    if (rules.items.len == 0) return error.MalformedXML;
+    if (rules.items.len > 1000) return error.InvalidArgument;
+    return rules.toOwnedSlice(allocator);
+}
+
+/// GET/PUT/DELETE /{bucket}?lifecycle
+fn handleBucketLifecycle(ctx: *const S3Context, allocator: Allocator, req: *Request, res: *Response, bucket: []const u8) !void {
+    if (!bucketExists(ctx, allocator, bucket)) {
+        sendError(res, 404, "NoSuchBucket", "Bucket not found");
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "GET")) {
+        const stored = readBucketConfig(ctx, allocator, bucket, "lifecycle.xml") orelse {
+            sendError(res, 404, "NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist");
+            return;
+        };
+        res.ok();
+        res.setXmlBody(stored);
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "PUT")) {
+        _ = parseLifecycleXml(allocator, req.body) catch |err| {
+            switch (err) {
+                error.MalformedXML => sendError(res, 400, "MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema"),
+                error.InvalidArgument => sendError(res, 400, "InvalidArgument", "Invalid lifecycle rule (check Days, Date, filters and actions)"),
+                error.TransitionUnsupported => sendError(res, 501, "NotImplemented", "Storage class transitions are not supported; zs3 has one storage class"),
+                else => return err,
+            }
+            return;
+        };
+        try writeBucketConfig(ctx, allocator, bucket, "lifecycle.xml", req.body);
+        res.ok();
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "DELETE")) {
+        deleteBucketConfig(ctx, allocator, bucket, "lifecycle.xml");
+        res.noContent();
+        return;
+    }
+    sendError(res, 405, "MethodNotAllowed", "Method not allowed");
+}
+
+// --- Background evaluation ---------------------------------------------------
+
+fn lifecycleThreadMain(ctx: *const S3Context) void {
+    while (true) {
+        app_io.sleep(.fromMilliseconds(@intCast(lifecycle_interval_s * 1000)), .awake) catch {};
+        runLifecycleOnce(ctx) catch |err| std.log.warn("lifecycle pass failed: {t}", .{err});
+    }
+}
+
+fn ruleTagsMatch(ctx: *const S3Context, allocator: Allocator, rule: *const LifecycleRule, bucket: []const u8, effective_key: []const u8) bool {
+    if (rule.tags.len == 0) return true;
+    const attrs = loadObjectAttrsAny(ctx, allocator, bucket, effective_key) orelse return false;
+    const stored = attrs.tagging orelse return false;
+    const tags = parseTagQuery(allocator, stored) catch return false;
+    for (rule.tags) |want| {
+        var found = false;
+        for (tags) |have| {
+            if (std.mem.eql(u8, have.key, want.key) and std.mem.eql(u8, have.value, want.value)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+/// One pass over every bucket with a lifecycle configuration.
+fn runLifecycleOnce(ctx: *const S3Context) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const now = std.Io.Clock.real.now(app_io).toSeconds();
+
+    var root = try std.Io.Dir.cwd().openDir(app_io, ctx.data_dir, .{ .iterate = true });
+    defer root.close(app_io);
+    var it = root.iterate();
+    while (try it.next(app_io)) |entry| {
+        if (entry.kind != .directory or !isValidBucketName(entry.name)) continue;
+        const bucket = try allocator.dupe(u8, entry.name);
+        const stored = readBucketConfig(ctx, allocator, bucket, "lifecycle.xml") orelse continue;
+        const rules = parseLifecycleXml(allocator, stored) catch continue;
+        for (rules) |*rule| {
+            if (!rule.enabled) continue;
+            applyLifecycleRule(ctx, allocator, bucket, rule, now) catch |err| {
+                std.log.warn("lifecycle rule {s} on {s}: {t}", .{ rule.id, bucket, err });
+            };
+        }
+    }
+}
+
+fn applyLifecycleRule(ctx: *const S3Context, allocator: Allocator, bucket: []const u8, rule: *const LifecycleRule, now: i64) !void {
+    const bucket_path = try ctx.bucketPath(allocator, bucket);
+
+    // Expiration of current objects.
+    if (rule.expiration_days != null or rule.expiration_date != null) {
+        var keys: std.ArrayListUnmanaged(KeyInfo) = .empty;
+        try collectKeys(allocator, bucket_path, "", rule.prefix, &keys, false);
+        for (keys.items) |k| {
+            const expired = if (rule.expiration_days) |days|
+                now - k.mtime >= @as(i64, days) * 86400
+            else
+                now >= rule.expiration_date.?;
+            if (!expired) continue;
+            const effective_key = if (k.key.len > 0 and k.key[k.key.len - 1] == '/')
+                try std.fmt.allocPrint(allocator, "{s}.folder_marker", .{k.key})
+            else
+                k.key;
+            if (!ruleTagsMatch(ctx, allocator, rule, bucket, effective_key)) continue;
+            if (ctx.distributed) |dist| {
+                dist.meta_index.delete(allocator, bucket, k.key);
+                deleteDistAttrs(allocator, dist, bucket, k.key);
+            }
+            _ = deleteObjectVersioned(ctx, allocator, bucket, effective_key, null) catch continue;
+            std.log.info("lifecycle: expired {s}/{s} (rule {s})", .{ bucket, k.key, rule.id });
+        }
+    }
+
+    // Noncurrent versions and orphaned delete markers.
+    if (rule.noncurrent_days != null or rule.expired_delete_marker) {
+        var versions: std.ArrayListUnmanaged(ListedVersion) = .empty;
+        try collectStoredVersions(ctx, allocator, bucket, "", rule.prefix, &versions);
+        // Group per key: entries come out grouped by directory already, but
+        // sort to be safe.
+        std.mem.sort(ListedVersion, versions.items, {}, listedVersionLess);
+        var i: usize = 0;
+        while (i < versions.items.len) {
+            var j = i;
+            while (j < versions.items.len and std.mem.eql(u8, versions.items[j].key, versions.items[i].key)) : (j += 1) {}
+            const group = versions.items[i..j];
+            i = j;
+            const effective_key = if (group[0].key.len > 0 and group[0].key[group[0].key.len - 1] == '/')
+                try std.fmt.allocPrint(allocator, "{s}.folder_marker", .{group[0].key})
+            else
+                group[0].key;
+            const current_path = try ctx.objectPath(allocator, bucket, effective_key);
+            const has_current = if (std.Io.Dir.cwd().statFile(app_io, current_path, .{})) |st| st.kind == .file else |_| false;
+            const vdir = try versionsDirPath(ctx, allocator, bucket, effective_key);
+
+            if (rule.expired_delete_marker and !has_current and group.len == 1 and group[0].is_marker) {
+                const marker = try versionFilePath(allocator, vdir, group[0].vid, DELETE_MARKER_SUFFIX);
+                std.Io.Dir.cwd().deleteFile(app_io, marker) catch {};
+                removeEmptyVersionDirs(ctx, allocator, bucket, vdir);
+                std.log.info("lifecycle: removed expired delete marker {s}/{s}", .{ bucket, group[0].key });
+                continue;
+            }
+            if (rule.noncurrent_days) |days| {
+                if (rule.tags.len > 0 and !ruleTagsMatch(ctx, allocator, rule, bucket, effective_key)) continue;
+                for (group, 0..) |v, idx| {
+                    // Without a current object the newest stored entry is the
+                    // latest version and stays.
+                    if (!has_current and idx == 0) continue;
+                    const fpath = try versionFilePath(allocator, vdir, v.vid, if (v.is_marker) DELETE_MARKER_SUFFIX else "");
+                    // Age counts from when the version became noncurrent,
+                    // which the rename into .zs3versions records as ctime.
+                    const st = std.Io.Dir.cwd().statFile(app_io, fpath, .{}) catch continue;
+                    const became_noncurrent: i64 = @intCast(st.ctime.toSeconds());
+                    if (now - became_noncurrent < @as(i64, days) * 86400) continue;
+                    std.Io.Dir.cwd().deleteFile(app_io, fpath) catch continue;
+                    if (!v.is_marker) deleteStandaloneAttrs(allocator, fpath);
+                    std.log.info("lifecycle: removed noncurrent version {s}/{s} {s}", .{ bucket, v.key, v.vid });
+                }
+                removeEmptyVersionDirs(ctx, allocator, bucket, vdir);
+            }
+        }
+    }
+
+    // Abandoned multipart uploads.
+    if (rule.abort_mpu_days) |days| {
+        const uploads = try std.fs.path.join(allocator, &.{ ctx.data_dir, ".uploads" });
+        var udir = std.Io.Dir.cwd().openDir(app_io, uploads, .{ .iterate = true }) catch return;
+        defer udir.close(app_io);
+        var uit = udir.iterate();
+        while (try uit.next(app_io)) |entry| {
+            if (entry.kind != .directory) continue;
+            const upload_id = try allocator.dupe(u8, entry.name);
+            const meta = readUploadMeta(ctx, allocator, upload_id) orelse continue;
+            var lines = std.mem.splitScalar(u8, meta, '\n');
+            const ub = lines.next() orelse continue;
+            const uk = lines.next() orelse continue;
+            if (!std.mem.eql(u8, ub, bucket) or !std.mem.startsWith(u8, uk, rule.prefix)) continue;
+            const st = udir.statFile(app_io, entry.name, .{}) catch continue;
+            const initiated: i64 = @intCast(st.mtime.toSeconds());
+            if (now - initiated < @as(i64, days) * 86400) continue;
+            const dir_path = try std.fs.path.join(allocator, &.{ uploads, upload_id });
+            std.Io.Dir.cwd().deleteTree(app_io, dir_path) catch continue;
+            std.log.info("lifecycle: aborted stale upload {s} ({s}/{s})", .{ upload_id, ub, uk });
+        }
+    }
 }

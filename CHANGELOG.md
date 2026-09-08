@@ -4,6 +4,46 @@ All notable changes to zs3 are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and versioning
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-09-09
+
+### Added
+
+- **Bucket versioning.** `?versioning` Enabled/Suspended; every write on a
+  versioned bucket returns `x-amz-version-id`, the previous object moves to
+  `.zs3versions/<key>.v/`, DELETE adds a delete marker, `?versionId=` on
+  GET/HEAD/DELETE/copy-source, ListObjectVersions with pagination and
+  delimiters, versioned multi-delete. Pre-versioning objects are the `null`
+  version. Standalone mode only.
+- **Lifecycle rules.** `?lifecycle` with Expiration (Days/Date/
+  ExpiredObjectDeleteMarker), NoncurrentVersionExpiration and
+  AbortIncompleteMultipartUpload, filtered by Prefix/Tag/And. A background
+  thread applies them every `--lifecycle-interval-s` (default 3600).
+- **Object and bucket tagging.** `?tagging` on both, `x-amz-tagging` on
+  PUT/Copy/initiate, `x-amz-tagging-directive`, `x-amz-tagging-count`.
+- **Canned ACLs.** `x-amz-acl` and `?acl` on buckets and objects.
+  `public-read` / `public-read-write` let unsigned requests read (and
+  write) objects; configuration stays owner-only. Private deployments keep
+  the pre-parse 403 for unsigned requests.
+- **Server-side encryption.** SSE-S3 (`AES256` header or bucket default via
+  `?encryption`) and SSE-C, as chunked AES-256-GCM files with HKDF
+  per-object keys. Plaintext ETags and sizes everywhere, ranges work,
+  multipart parts are encrypted on upload. Master key from
+  `--sse-key-file`, `ZS3_SSE_KEY`, or generated at `<data-dir>/.zs3/sse.key`.
+- **TLS in the snapshot client.** `zs3 snapshot` / `clone` / `snapshots`
+  accept `https://` endpoints, verifying against the system CA store, with
+  `--ca-file` and `--insecure`. Chunked transfer encoding is decoded and
+  S3 error codes are printed, so AWS, MinIO, R2 and friends work as the
+  snapshot store. `-Dtls=false` builds without it.
+- `test_features.py` (100 checks) and 9 new unit tests.
+
+### Changed
+
+- Multipart uploads now store Content-Type, metadata, tags and ACL from
+  CreateMultipartUpload (as S3 does) instead of from CompleteMultipartUpload.
+- DeleteObjects honours `<Quiet>` and reports per-object errors.
+- The static binary grew from ~450KB to ~840KB (aarch64 musl): ~150KB for
+  the features above, ~240KB for the TLS client and X.509 verification.
+
 ## [0.2.0] - 2026-09-09
 
 ### Added
