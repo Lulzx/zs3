@@ -1,83 +1,63 @@
 # Configuration
 
-zs3 is configured by editing `main.zig` and rebuilding.
+zs3 is configured with command-line flags. `zs3 --help` prints the full list.
 
-## Server Settings
+## Server flags
 
-```zig
-const address = net.Address.parseIp4("0.0.0.0", 9000)
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--port=PORT` | 9000 | HTTP port |
+| `--data-dir=PATH` | `data` | Directory holding buckets and objects |
+| `--acl=LIST` | `admin:minioadmin:minioadmin` | Credentials, see below |
+| `--fsync` / `--no-fsync`, `--fast` | fsync on | Durability of acknowledged writes |
+| `--distributed`, `-d` | off | Peer-to-peer mode, see [distributed.md](distributed.md) |
+| `--bootstrap=PEERS` | none | Comma-separated bootstrap peers |
+| `--gossip-interval-ms=N` | 30000 | Peer gossip interval |
+| `--help`, `-h` | | Print usage |
+
+The listen address is `0.0.0.0`. To bind localhost only, change
+`net.Address.parseIp4` in `main.zig` and rebuild.
+
+## Credentials and roles
+
+Pass credentials at runtime with `--acl=`, or bake them in at build time with
+`-Dacl-list=`:
+
+```bash
+zs3 --acl="admin:akey:asec,reader:rkey:rsec,writer:wkey:wsec"
 ```
 
-- `0.0.0.0` - Listen on all interfaces (use `127.0.0.1` for localhost only)
-- `9000` - Port number
+Each entry is `role:access_key:secret_key`, comma-separated.
 
-## Authentication
+| Role | Allowed methods |
+|------|-----------------|
+| admin | all |
+| writer | GET, HEAD, OPTIONS, PUT, POST, DELETE |
+| reader | GET, HEAD, OPTIONS |
+
+The default `minioadmin:minioadmin` admin key exists so `aws --endpoint-url`
+works out of the box. Replace it anywhere real.
+
+## Snapshot flags
+
+`zs3 snapshot`, `zs3 clone`, and `zs3 snapshots` take `--endpoint=URL` (or
+`ZS3_ENDPOINT`), `--bucket=NAME`, `--name=NAME`, `--dest=DIR`, `--cache=DIR`,
+`--access-key=K` (or `AWS_ACCESS_KEY_ID`), `--secret-key=S` (or
+`AWS_SECRET_ACCESS_KEY`), `--region=R` (default `us-east-1`), and
+`--chunk-bytes=N` (default 4MB). See [snapshots.md](snapshots.md).
+
+## Compile-time limits
+
+Constants at the top of `main.zig`:
 
 ```zig
-const ctx = S3Context{
-    .allocator = allocator,
-    .data_dir = "data",
-    .access_key = "minioadmin",
-    .secret_key = "minioadmin",
-};
-```
-
-- `data_dir` - Directory for storing buckets and objects
-- `access_key` - AWS access key ID
-- `secret_key` - AWS secret access key
-
-## Limits
-
-Edit constants at top of `main.zig`:
-
-```zig
-const MAX_HEADER_SIZE = 8 * 1024;          // 8 KB
+const MAX_HEADER_SIZE = 8 * 1024;              // 8 KB
 const MAX_BODY_SIZE = 5 * 1024 * 1024 * 1024;  // 5 GB
-const MAX_KEY_LENGTH = 1024;               // bytes
-const MAX_BUCKET_LENGTH = 63;              // characters
+const MAX_KEY_LENGTH = 1024;                   // bytes
+const MAX_BUCKET_LENGTH = 63;                  // characters
 ```
 
-## TLS/HTTPS
+## TLS
 
-zs3 does not include TLS. Use a reverse proxy:
-
-### nginx
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name s3.example.com;
-
-    ssl_certificate /path/to/cert.pem;
-    ssl_certificate_key /path/to/key.pem;
-
-    location / {
-        proxy_pass http://127.0.0.1:9000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-}
-```
-
-### Caddy
-
-```
-s3.example.com {
-    reverse_proxy localhost:9000
-}
-```
-
-## Environment Variables
-
-zs3 does not read environment variables. All configuration is compile-time.
-
-For dynamic configuration, modify `main.zig` to read from environment:
-
-```zig
-const access_key = std.posix.getenv("ZS3_ACCESS_KEY") orelse "minioadmin";
-const secret_key = std.posix.getenv("ZS3_SECRET_KEY") orelse "minioadmin";
-```
-
-## Multiple Users
-
-zs3 supports only one set of credentials. For multiple users, run multiple instances or add user lookup to `SigV4.verify()`.
+zs3 serves plain HTTP. Terminate TLS in a reverse proxy; [deployment.md](deployment.md)
+has Caddy and nginx configs.
