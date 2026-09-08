@@ -152,9 +152,10 @@ function renderBuckets() {
   $("deleteBucket").disabled = !curBucket;
 }
 function selectBucket(name) {
-  curBucket = name; curPrefix = ""; selected = null;
+  curBucket = name; curPrefix = ""; selected = null; entries = [];
   pageTokens = [undefined]; pageIndex = 0; nextToken = null;
-  hideInspector(); renderBuckets(); updateToolbar(); renderCrumb();
+  $("filter").value = "";
+  hideInspector(); renderBuckets(); updateToolbar(); renderCrumb(); filterAndRender();
   generation++;
   if (name) loadObjects();
 }
@@ -190,7 +191,7 @@ function renderCrumb() {
     c.append(b);
   });
 }
-function setPrefix(p) { curPrefix = p; selected = null; pageTokens = [undefined]; pageIndex = 0; nextToken = null; hideInspector(); updateToolbar(); renderCrumb(); generation++; filterAndRender(); loadObjects(); }
+function setPrefix(p) { curPrefix = p; selected = null; entries = []; pageTokens = [undefined]; pageIndex = 0; nextToken = null; hideInspector(); updateToolbar(); renderCrumb(); generation++; filterAndRender(); loadObjects(); }
 $("up").onclick = () => { const parts = curPrefix.split("/").filter(Boolean); parts.pop(); setPrefix(parts.length ? parts.join("/") + "/" : ""); };
 $("refreshObjects").onclick = () => { generation++; loadObjects(); };
 function objectPath(key) { return "/" + curBucket + "/" + key; }

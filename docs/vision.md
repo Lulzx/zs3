@@ -5,7 +5,7 @@ local development, CI, agents, and the edge.
 
 The category sentence is:
 
-> Local, dev, and edge object storage should be a 360KB binary.
+> Local, dev, and edge object storage should be a 500KB binary.
 
 This is not “smaller MinIO.” MinIO is a production storage platform with the
 operational surface that implies. zs3 takes the SQLite-shaped position: a

@@ -21,7 +21,7 @@ zig build -Dtarget=x86_64-linux-musl \
 cp zig-out/bin/zs3 ./zs3
 ```
 
-The resulting executable is statically linked and under 360KB. For an ARM64
+The resulting executable is statically linked and under 500KB. For an ARM64
 image, change the target to `aarch64-linux-musl`.
 
 Add a two-line `Dockerfile.zs3` next to your Compose file:

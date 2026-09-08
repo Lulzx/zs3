@@ -48,6 +48,7 @@ jobs:
       - run: python3 test_client.py
       - run: python3 test_comprehensive.py
       - run: python3 test_new.py
+      - run: python3 test_foreign.py
       - run: python3 test_bootstrap.py
       - run: kill $(cat /tmp/zs3.pid) || true
 

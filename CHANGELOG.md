@@ -80,6 +80,11 @@ follows [Semantic Versioning](https://semver.org/).
   sidecar (files zs3 did not write) get a Content-Type from a small extension
   table instead of `binary/octet-stream`. Explicitly stored types always win.
 - **Sidecar/attrs files no longer leak into LIST responses.**
+- **Replication origin-death test fixed.** It used the PUT ETag as the blob
+  address, which stopped working when single-object ETags became MD5 (the
+  mesh addresses blobs by truncated BLAKE3, not MD5), failing
+  deterministically. The test now resolves the true content address from
+  the origin's CAS dir; replication itself was never broken (113/113 pass).
 - **Snapshot system objects hidden** from normal LIST (visible with
   `prefix=.zs3snapshots/`).
 

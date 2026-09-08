@@ -71,7 +71,8 @@ Request headers honored:
   AWS chunked transfer decoding, including checksum-trailer variants
 
 Response headers:
-- `ETag` - hash of object content
+- `ETag` - quoted lowercase hex MD5 of the object content (so `md5sum`,
+  `aws s3 sync`, and `rclone check` agree)
 
 ### CopyObject
 
@@ -153,7 +154,7 @@ PUT /{bucket}/{key}?uploadId={id}&partNumber={n}
 Uploads a part. Part numbers start at 1.
 
 Response headers:
-- `ETag` - hash of part content
+- `ETag` - quoted lowercase hex MD5 of the part content
 
 ### UploadPartCopy
 

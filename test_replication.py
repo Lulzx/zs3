@@ -519,17 +519,30 @@ def scenario_bucket_lifecycle(c):
 
 def scenario_origin_death(c, replicated_body):
     print("\n[origin death: blob survives via replicas]")
-    status, _, headers = s3(c.port("a"), "PUT", "/demo-bucket/final/replicated.bin", replicated_body)
+    status, _, _ = s3(c.port("a"), "PUT", "/demo-bucket/final/replicated.bin", replicated_body)
     check("PUT replicated blob on A", status == 200, f"status {status}")
 
     # Blob replication is asynchronous: wait until the replication target is
     # met on other nodes before killing the origin
-    blob_hash = (headers.get("ETag") or "").strip('"')
+    def blob_hash():
+        """True content address of the blob, read from A's CAS dir. The ETag
+        is MD5 (S3 interop) and is NOT the blob address, so match by content.
+        On-disk layout is .cas/{hh}/{rest}.blob for 40-hex-char hash hh+rest."""
+        cas = c.root / "a" / ".cas"
+        if not cas.is_dir():
+            return None
+        for p in cas.rglob("*.blob"):
+            if p.stat().st_size == len(replicated_body) and p.read_bytes() == replicated_body:
+                return p.parent.name + p.stem
+        return None
 
     def replicas_ready():
+        h = blob_hash()
+        if h is None:
+            return False
         holders = sum(
             1 for node in ("b", "c", "d")
-            if raw(c.port(node), "GET", f"/_zs3/blob/{blob_hash}")[0] == 200
+            if raw(c.port(node), "GET", f"/_zs3/blob/{h}")[0] == 200
         )
         return holders >= 2
 

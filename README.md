@@ -23,7 +23,7 @@ storage platform.
 | | zs3 | RustFS | MinIO |
 |---|-----|--------|-------|
 | Lines (server: `wc -l main.zig acl.zig build.zig`) | ~7,050 | ~80,000 | 200,000 |
-| Binary (static Linux musl, `ReleaseSmall`) | ~440KB x86-64 / ~400KB aarch64 | ~50MB | 100MB |
+| Binary (static Linux musl, `ReleaseSmall`) | ~500KB x86-64 / ~450KB aarch64 | ~50MB | 100MB |
 | RAM idle | 3MB | ~100MB | 200MB+ |
 | Dependencies | 0 | ~200 crates | many |
 
@@ -315,7 +315,7 @@ Drop-in replacement for a MinIO service in `docker-compose.yml`:
 services:
   object-storage:
     image: ghcr.io/lulzx/zs3
-    command: ["--data-dir=/data", "--acl=admin:local-access:local-secret"]
+    command: ["--acl=admin:local-access:local-secret"]
     ports:
       - "9000:9000"
     volumes:
@@ -330,13 +330,15 @@ Full migration guide: [docs/replace-minio.md](docs/replace-minio.md).
 ## Testing
 
 ```bash
-zig build test                  # ~30 unit tests
+zig build test                  # 51 unit tests
 python3 test_bootstrap.py       # two-node bootstrap discovery
 python3 test_replication.py     # four-node replication suite (stdlib only)
 python3 test_client.py          # 28/28 integration tests (stdlib only)
-python3 test_comprehensive.py   # 67/67 boto3 tests (standalone)
+python3 test_comprehensive.py   # 87/87 boto3 tests (standalone)
+python3 test_new.py             # ETags, checksums, trailers, presigned URLs, snapshot/clone
+python3 test_foreign.py         # foreign-tree test: LIST/GET/HEAD/range + rclone check
 ./zs3 --distributed && \
-python3 test_comprehensive.py   # 72/72 boto3 tests (distributed)
+python3 test_comprehensive.py   # 92/92 boto3 tests (distributed)
 ```
 
 Requires `pip install boto3` for comprehensive tests.

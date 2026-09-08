@@ -116,20 +116,25 @@ def main():
             s3.get_object(Bucket="photos-2024", Key="raw/img001.bin", Range="bytes=100-199")["Body"].read() == raw[100:200])
 
         # rclone sync + check: rclone compares MD5s, so this proves ETag
-        # agreement against a tree zs3 did not write.
-        rclone_conf = os.path.join(tree, "rclone.conf")
-        subprocess.run(["rclone", "--config", rclone_conf, "config", "create", "zs3f", "s3",
-            "provider", "Other", "env_auth", "false", "access_key_id", "minioadmin",
-            "secret_access_key", "minioadmin", "endpoint", ENDPOINT,
-            "region", "us-east-1", "force_path_style", "true", "--non-interactive"],
-            check=True, capture_output=True)
-        mirror = os.path.join(tree, "mirror")
-        r = subprocess.run(["rclone", "--config", rclone_conf, "sync", "zs3f:photos-2024", mirror],
-            capture_output=True, text=True)
-        check("rclone sync from foreign tree", r.returncode == 0, r.stderr[-300:])
-        r = subprocess.run(["rclone", "--config", rclone_conf, "check", "zs3f:photos-2024", mirror],
-            capture_output=True, text=True)
-        check("rclone check (MD5 agreement)", r.returncode == 0, r.stderr[-300:])
+        # agreement against a tree zs3 did not write. Skipped (not failed)
+        # where rclone is not installed, e.g. minimal CI images.
+        if shutil.which("rclone") is None:
+            print("  [SKIP] rclone sync from foreign tree (rclone not installed)")
+            print("  [SKIP] rclone check (MD5 agreement) (rclone not installed)")
+        else:
+            rclone_conf = os.path.join(tree, "rclone.conf")
+            subprocess.run(["rclone", "--config", rclone_conf, "config", "create", "zs3f", "s3",
+                "provider", "Other", "env_auth", "false", "access_key_id", "minioadmin",
+                "secret_access_key", "minioadmin", "endpoint", ENDPOINT,
+                "region", "us-east-1", "force_path_style", "true", "--non-interactive"],
+                check=True, capture_output=True)
+            mirror = os.path.join(tree, "mirror")
+            r = subprocess.run(["rclone", "--config", rclone_conf, "sync", "zs3f:photos-2024", mirror],
+                capture_output=True, text=True)
+            check("rclone sync from foreign tree", r.returncode == 0, r.stderr[-300:])
+            r = subprocess.run(["rclone", "--config", rclone_conf, "check", "zs3f:photos-2024", mirror],
+                capture_output=True, text=True)
+            check("rclone check (MD5 agreement)", r.returncode == 0, r.stderr[-300:])
     finally:
         server.terminate()
         try:
